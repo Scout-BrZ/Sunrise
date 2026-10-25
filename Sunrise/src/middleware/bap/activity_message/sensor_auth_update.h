@@ -8,6 +8,7 @@
 #include "../../encoding/bit_writer.h"
 #include "activity_patch_epoch_parser.h"
 #include "definition.h"
+#include "scoreboard_record.h"
 #include "sensor_message.h"
 #include "squad_auth_body.h"
 #include "squad_sense_state.h"
@@ -85,6 +86,8 @@ valid_authored_scene_dependencies(const AuthoredSceneDependencies& value) noexce
                                               std::uint32_t& generation) noexcept;
 /** The widest statically bounded Auth body is type 19, at 53,150 bits. */
 inline constexpr std::size_t kAuthOverrideByteCapacity = (53'150U + 7U) / 8U;
+/** Lifetime states that pass the player-spawn gate. */
+inline constexpr std::array<std::uint8_t, 3> kSpawnGateLifetimeStates = {3, 6, 10};
 /** Highest lifetime state inside the client's jump table. */
 inline constexpr std::uint8_t kMaximumLifetimeState = 10;
 /** The lifetime field stores its value plus one in four bits. */
@@ -193,11 +196,22 @@ struct Roster final {
     std::span<const BubbleSubBlock> bubbleSubBlocks{};
 };
 
+/** A joined character assigned to an actual registered participation slot. */
+struct ParticipationSeat final {
+    std::uint64_t playerKey{};
+    std::uint16_t slotIndex{};
+};
+
 /** Everything one `sensor_auth_update` carries. */
 struct Snapshot final {
     /** Message 52's payload, echoed exactly. A wrong epoch skips phase 2 and reports nothing. */
     patch_epoch::PatchEpoch patchEpoch{};
     Roster roster{};
+    std::array<ParticipationSeat, scoreboard_record::kElementCount> participationSeats{};
+    std::size_t participationSeatCount{};
+    scoreboard_record::Record scoreboard{};
+    bool perMemberParticipation{};
+    bool hasScoreboard{};
     /** Exact typed bodies for slots already present in `roster`. */
     std::span<const AuthOverride> authOverrides{};
     std::span<const SenseOverride> senseOverrides{};
@@ -282,7 +296,6 @@ inline constexpr std::uint16_t kMaximumSlotIndex = 32767;
  */
 inline constexpr std::array<std::uint8_t, 5> kWireFaultSlotTypes = {1, 8, 17, 38, 68};
 
-// TODO: apply as the fail-closed backstop on natively produced Auth overrides; no caller yet.
 /**
  * @param slotType Slot type an Auth override names.
  * @return True when no schema-compiled Auth body may carry that slot type.
@@ -295,6 +308,9 @@ inline constexpr std::array<std::uint8_t, 5> kWireFaultSlotTypes = {1, 8, 17, 38
     }
     return false;
 }
+
+/** Elements in the slot-type-1 requested-count array. Its wire count lane is wider. */
+inline constexpr std::size_t kSquadRequestedCountArrayLength = 8;
 
 /** The per-entry state byte is stored biased, so the wire value never goes negative. */
 inline constexpr std::uint32_t kStateByteBias = 0x80;
@@ -400,7 +416,8 @@ auth_body_bits(const Snapshot& snapshot, std::uint8_t slotType, bool carriesPlay
 [[nodiscard]] bool write_auth_body(encoding::bits::Writer& writer,
                                    const Snapshot& snapshot,
                                    std::uint8_t slotType,
-                                   bool carriesPlayerKey) noexcept;
+                                   bool carriesPlayerKey,
+                                   std::uint64_t playerKey = 0) noexcept;
 
 /**
  * Writes one per-object state block.
@@ -411,7 +428,7 @@ auth_body_bits(const Snapshot& snapshot, std::uint8_t slotType, bool carriesPlay
  * @param objectTag Package object tag of the owning group.
  * @param key Registry key of the owning group.
  * @param slotType Slot type from the group's slot array.
- * @param slotIndex Slot index from the group's descriptor, not its ordinal.
+ * @param slotIndex Slot ordinal, which is also the slot's index.
  * @param flags Sense and auth emit bits for that slot type.
  * @param missionSeedOnly True to suppress the authored typed body unless an override matches.
  * @param carriesPlayerKey True for the one type-13 block that binds the player.
@@ -425,6 +442,7 @@ auth_body_bits(const Snapshot& snapshot, std::uint8_t slotType, bool carriesPlay
                                       std::uint16_t slotIndex,
                                       std::uint8_t flags,
                                       bool missionSeedOnly,
-                                      bool carriesPlayerKey) noexcept;
+                                      bool carriesPlayerKey,
+                                      std::uint64_t playerKey = 0) noexcept;
 
 } // namespace sunrise::middleware::bap::activity_message::sensor_auth_update

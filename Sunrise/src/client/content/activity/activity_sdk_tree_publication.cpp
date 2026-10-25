@@ -53,29 +53,31 @@ struct Marker final {
     }
 }
 
-/** Requires one existing ordinary directory. */
-[[nodiscard]] bool is_directory(const wchar_t* path) noexcept {
+/** Requires one existing ordinary directory and rejects a reparse-backed leaf. */
+[[nodiscard]] bool ordinary_directory(const wchar_t* path) noexcept {
     const DWORD attributes = GetFileAttributesW(path);
-    return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0
+           && (attributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0;
 }
 
-/** Requires one existing ordinary file. */
-[[nodiscard]] bool is_file(const wchar_t* path) noexcept {
+/** Requires one existing ordinary file and rejects a reparse-backed leaf. */
+[[nodiscard]] bool ordinary_file(const wchar_t* path) noexcept {
     const DWORD attributes = GetFileAttributesW(path);
-    return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
+    return attributes != INVALID_FILE_ATTRIBUTES
+           && (attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) == 0;
 }
 
 /** Requires every existing drive-path directory component to be ordinary. */
 [[nodiscard]] bool ordinary_ancestry(const std::wstring& directory) noexcept {
     if (directory.size() < 3U || directory[1] != L':' || directory[2] != L'\\'
-        || !is_directory(directory.substr(0, 3U).c_str())) {
+        || !ordinary_directory(directory.substr(0, 3U).c_str())) {
         return false;
     }
     std::size_t cursor = 3U;
     while (cursor < directory.size()) {
         const std::size_t separator = directory.find(L'\\', cursor);
         const std::size_t end = separator == std::wstring::npos ? directory.size() : separator;
-        if (!is_directory(directory.substr(0, end).c_str())) {
+        if (!ordinary_directory(directory.substr(0, end).c_str())) {
             return false;
         }
         if (separator == std::wstring::npos) {
@@ -190,7 +192,7 @@ sibling_path(std::wstring_view output, std::wstring_view suffix, std::wstring& s
 /** Reads one exact marker without accepting trailing bytes or noncanonical fields. */
 [[nodiscard]] bool read_marker(const std::wstring& path, Marker& output) noexcept {
     output = {};
-    if (!is_file(path.c_str())) {
+    if (!ordinary_file(path.c_str())) {
         return false;
     }
     const HANDLE file = CreateFileW(path.c_str(),
@@ -223,7 +225,8 @@ sibling_path(std::wstring_view output, std::wstring_view suffix, std::wstring& s
         return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND;
     }
     exists = true;
-    return (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    return (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0
+           && (attributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0;
 }
 
 /** Restores or finalizes one interrupted transaction before any new publication begins. */
@@ -321,7 +324,7 @@ Status publish(const wchar_t* stage,
     } catch (...) {
         return Status::invalidInput;
     }
-    if (!ordinary_ancestry(parent) || !is_directory(canonicalStage.c_str())) {
+    if (!ordinary_ancestry(parent) || !ordinary_directory(canonicalStage.c_str())) {
         return Status::invalidInput;
     }
     std::wstring backup;
@@ -362,9 +365,8 @@ Status publish(const wchar_t* stage,
         }
         return Status::rollbackFailure;
     }
-    // The commit is done. A leftover backup or marker is finished by `recover` next time.
-    if (!hadOutput || remove_tree(backup)) {
-        (void)DeleteFileW(committed.c_str());
+    if ((!hadOutput || remove_tree(backup)) && DeleteFileW(committed.c_str()) != FALSE) {
+        return Status::ready;
     }
     return Status::ready;
 }

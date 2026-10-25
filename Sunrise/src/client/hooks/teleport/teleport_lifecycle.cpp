@@ -12,7 +12,6 @@
 #include <string_view>
 
 #include "../../../core/logging/log.h"
-#include "../../diagnostics/studio/studio_link.h"
 #include "../../hooking/detour.h"
 #include "../../player/player_position.h"
 #include "../bootflow/bootflow_hook_lifecycle.h"
@@ -25,16 +24,10 @@
 namespace sunrise::client::hooks::teleport {
 namespace {
 
-/**
- * Runs per frame on the thread owning the camera and the player, and writes the camera pose.
- * The match runs on through the call to the camera singleton getter.
- */
+/** Runs per frame on the thread owning the camera and the player, and writes the camera pose. */
 constexpr std::string_view kCameraTransformText =
     "48 89 5C 24 10 48 89 74 24 18 48 89 7C 24 20 55 48 8D 6C 24 E0 48 81 EC 20 01 00 00 "
-    "48 8B 05 ? ? ? ? 48 33 C4 48 89 45 10 0F 57 C0 48 63 F9 0F 57 ED 66 0F 76 C0 66 0F 72 D0 "
-    "19 0F 57 DB 66 0F 72 F0 17 0F 14 D8 0F 28 D0 0F 14 D5 0F 28 CB 0F 28 E2 0F 16 CD 0F 57 C0 "
-    "0F 16 E5 0F 16 C2 0F 16 EB 0F 29 65 D0 0F 29 4D E0 0F 29 45 F0 0F 29 6D 00 E8 ? ? ? ? "
-    "48 69 DF 50 0C 00 00";
+    "48 8B 05 ? ? ? ? 48 33 C4 48 89 45 10 0F 57 C0 48 63 F9";
 /** Compiled pattern bytes of the camera transform signature. */
 constexpr auto kCameraTransform =
     signature<signature_length(kCameraTransformText)>(kCameraTransformText);
@@ -42,7 +35,7 @@ constexpr auto kCameraTransform =
 /** Writes the local player's biped object handle, or the invalid handle value. */
 constexpr std::string_view kControlledHandleText =
     "40 53 48 83 EC 20 48 8B D9 C7 01 FF FF FF FF 48 8D 4C 24 30 E8 ? ? ? ? 8B 44 24 30 "
-    "83 F8 FF 74 ? 25 FF 1F 00 00 0F AF 05";
+    "83 F8 FF 74 18 25 FF 1F 00 00 0F AF 05";
 /** Compiled pattern bytes of the controlled-handle signature. */
 constexpr auto kControlledHandlePattern =
     signature<signature_length(kControlledHandleText)>(kControlledHandleText);
@@ -54,9 +47,10 @@ constexpr std::string_view kPhysicsSyncText =
 /** Compiled pattern bytes of the physics sync signature. */
 constexpr auto kPhysicsSync = signature<signature_length(kPhysicsSyncText)>(kPhysicsSyncText);
 
-/** The call to the camera singleton getter inside the camera transform match. */
+/** The call to the camera singleton getter, measured from the camera transform's own base. */
 constexpr std::size_t kSingletonCallOffset = 0x72;
 /** A near call is one opcode byte and a signed displacement. */
+constexpr std::byte kNearCallOpcode{0xE8};
 constexpr std::size_t kNearCallOperand = 1;
 constexpr std::size_t kNearCallLength = 5;
 
@@ -70,10 +64,31 @@ using PhysicsSync = std::int64_t(__fastcall*)(std::byte*, std::byte*);
 
 std::array<hooking::detour::Handle, kHandleCount> g_handles{};
 std::atomic_bool g_installed{false};
+SRWLOCK g_lifecycleLock = SRWLOCK_INIT;
+std::atomic<CameraTransform> g_cameraOriginal{};
+std::atomic<PhysicsSync> g_physicsOriginal{};
+std::atomic_uint32_t g_calls{};
 
-/** @return The trampoline for a handle slot, or null. */
-template <typename T> [[nodiscard]] T original(std::size_t slot) noexcept {
-    return reinterpret_cast<T>(g_handles[slot].original);
+struct Call final {
+    Call() noexcept {
+        g_calls.fetch_add(1, std::memory_order_acq_rel);
+    }
+    ~Call() {
+        g_calls.fetch_sub(1, std::memory_order_acq_rel);
+    }
+};
+
+template <typename T> [[nodiscard]] T published(std::atomic<T>& slot) noexcept {
+    auto next = slot.load(std::memory_order_acquire);
+    while (next == nullptr) {
+        slot.wait(nullptr, std::memory_order_acquire);
+        next = slot.load(std::memory_order_acquire);
+    }
+    return next;
+}
+
+bool idle() noexcept {
+    return g_calls.load(std::memory_order_acquire) == 0;
 }
 
 /**
@@ -81,9 +96,10 @@ template <typename T> [[nodiscard]] T original(std::size_t slot) noexcept {
  * @param playerIndex Player whose camera was transformed.
  * @return Whatever the original returns.
  */
-std::int64_t __fastcall camera_transform(std::uint32_t playerIndex) noexcept {
-    const CameraTransform next = original<CameraTransform>(kCameraSlot);
-    const std::int64_t result = next != nullptr ? next(playerIndex) : 0;
+__declspec(noinline) std::int64_t __fastcall camera_transform(std::uint32_t playerIndex) noexcept {
+    const Call call;
+    const CameraTransform next = published(g_cameraOriginal);
+    const std::int64_t result = next(playerIndex);
     capture_camera_pose(playerIndex);
     poll_request();
     force_pending();
@@ -92,7 +108,6 @@ std::int64_t __fastcall camera_transform(std::uint32_t playerIndex) noexcept {
     client::player::position::poll();
     hooks::bootflow::poll_world_step();
     hooks::bootflow::poll_current_slice_set();
-    client::diagnostics::studio::poll();
     return result;
 }
 
@@ -103,7 +118,10 @@ std::int64_t __fastcall camera_transform(std::uint32_t playerIndex) noexcept {
  * @param outFlags The original's second argument, untouched.
  * @return Whatever the original returns.
  */
-std::int64_t __fastcall physics_sync(std::byte* component, std::byte* outFlags) noexcept {
+__declspec(noinline) std::int64_t __fastcall physics_sync(std::byte* component,
+                                                          std::byte* outFlags) noexcept {
+    const Call call;
+    const PhysicsSync next = published(g_physicsOriginal);
     apply_pending(component);
     // Shares this detour rather than adding a second one to the same function. The flag it clears
     // is written and read inside this tick, so it has to run here and not on a frame poll.
@@ -111,8 +129,10 @@ std::int64_t __fastcall physics_sync(std::byte* component, std::byte* outFlags) 
     hooks::fly::apply(component);
     // This tick is the only one that sees every component, so it is where the player's is found.
     client::player::position::observe(component);
-    const PhysicsSync next = original<PhysicsSync>(kPhysicsSlot);
-    return next != nullptr ? next(component, outFlags) : 0;
+    // Mantém a chamada original e observa a posição resultante, sem escrever movimento.
+    const auto result = next(component, outFlags);
+    trace_ship_physics(component);
+    return result;
 }
 
 /**
@@ -123,11 +143,14 @@ constexpr std::size_t kSyncFlagsCapacity = 256;
 
 /**
  * Decodes the camera singleton getter from the call inside the camera transform.
- * @param transform Base of the camera transform match.
- * @return The getter.
+ * @param transform Base of the camera transform.
+ * @return The getter, or null when the expected call is not there.
  */
 [[nodiscard]] CameraSingleton singleton_from(std::byte* transform) noexcept {
     std::byte* const site = transform + kSingletonCallOffset;
+    if (*site != kNearCallOpcode) {
+        return nullptr;
+    }
     return reinterpret_cast<CameraSingleton>(
         resolve_relative(site + kNearCallOperand, site + kNearCallLength));
 }
@@ -148,7 +171,7 @@ constexpr std::size_t kSyncFlagsCapacity = 256;
 } // namespace
 
 /** Attaches the camera and physics hooks that carry the teleport. */
-bool install() noexcept {
+bool install_locked() noexcept {
     if (g_installed.load(std::memory_order_acquire)) {
         return true;
     }
@@ -165,6 +188,9 @@ bool install() noexcept {
         return fail("sync");
     }
     const CameraSingleton singleton = singleton_from(transform);
+    if (singleton == nullptr) {
+        return fail("singleton");
+    }
 
     const std::array<hooking::detour::Spec, kHandleCount> specs{
         hooking::detour::Spec{transform, reinterpret_cast<void*>(&camera_transform)},
@@ -174,12 +200,17 @@ bool install() noexcept {
         return fail("attach");
     }
     publish_targets(reinterpret_cast<ControlledHandle>(handle), singleton);
-    client::diagnostics::studio::initialize();
     // The injected press needs the game's key tables. Without them the move still lands, it just
     // stays invisible until the player moves, so we log instead of failing.
     if (!resolve_action_keys()) {
         (void)fail("action_keys");
     }
+    g_cameraOriginal.store(reinterpret_cast<CameraTransform>(g_handles[kCameraSlot].original),
+                           std::memory_order_release);
+    g_physicsOriginal.store(reinterpret_cast<PhysicsSync>(g_handles[kPhysicsSlot].original),
+                            std::memory_order_release);
+    g_cameraOriginal.notify_all();
+    g_physicsOriginal.notify_all();
     g_installed.store(true, std::memory_order_release);
     core::log::write(
         core::log::Channel::client, core::log::Level::info, "ev=teleport stage=install result=ok");
@@ -187,8 +218,12 @@ bool install() noexcept {
 }
 
 /** Calls the physics sync for one component through the installed trampoline. */
-void invoke_sync(void* component) noexcept {
-    const PhysicsSync next = original<PhysicsSync>(kPhysicsSlot);
+__declspec(noinline) void invoke_sync(void* component) noexcept {
+    const Call call;
+    if (!g_installed.load(std::memory_order_acquire)) {
+        return;
+    }
+    const PhysicsSync next = g_physicsOriginal.load(std::memory_order_acquire);
     if (next == nullptr || component == nullptr) {
         return;
     }
@@ -196,32 +231,52 @@ void invoke_sync(void* component) noexcept {
     (void)next(static_cast<std::byte*>(component), flags.data());
 }
 
-/** Retained hooks remain tracked and block shutdown until a later detach succeeds. */
-bool uninstall() noexcept {
-    if (!client::diagnostics::studio::close()) {
-        return false;
-    }
-    g_installed.store(false, std::memory_order_release);
-    if (!g_handles[kCameraSlot].attached) {
+/** Detaches both teleport hooks. */
+bool uninstall_locked() noexcept {
+    if (!g_installed.exchange(false, std::memory_order_acq_rel)) {
         return true;
     }
+    const std::array entries{
+        hooking::detour::ProtectedCodeEntry{reinterpret_cast<void*>(&camera_transform)},
+        hooking::detour::ProtectedCodeEntry{reinterpret_cast<void*>(&physics_sync)},
+        hooking::detour::ProtectedCodeEntry{reinterpret_cast<void*>(&invoke_sync)},
+    };
+    if (hooking::detour::uninstall(g_handles, entries, &idle)
+        != hooking::detour::UninstallResult::removed) {
+        g_installed.store(true, std::memory_order_release);
+        return false;
+    }
+    g_cameraOriginal.store(nullptr, std::memory_order_release);
+    g_physicsOriginal.store(nullptr, std::memory_order_release);
     clear_targets();
     clear_action_keys();
     hooks::fly::reset();
     client::player::position::reset();
     polled_input::release_key();
-    // A thread still inside a replacement keeps the detours; the cleared targets make them inert.
-    bool replacementActive = false;
-    if (!hooking::detour::uninstall(g_handles, replacementActive)) {
-        core::log::write(core::log::Channel::client,
-                         core::log::Level::warn,
-                         replacementActive
-                             ? "ev=teleport stage=uninstall result=fail reason=active"
-                             : "ev=teleport stage=uninstall result=fail reason=detach");
-        return false;
-    }
     g_handles = {};
     return true;
+}
+
+bool install() noexcept {
+    if (!TryAcquireSRWLockExclusive(&g_lifecycleLock)) {
+        return false;
+    }
+    __try {
+        return install_locked();
+    } __finally {
+        ReleaseSRWLockExclusive(&g_lifecycleLock);
+    }
+}
+
+bool uninstall() noexcept {
+    if (!TryAcquireSRWLockExclusive(&g_lifecycleLock)) {
+        return false;
+    }
+    __try {
+        return uninstall_locked();
+    } __finally {
+        ReleaseSRWLockExclusive(&g_lifecycleLock);
+    }
 }
 
 } // namespace sunrise::client::hooks::teleport

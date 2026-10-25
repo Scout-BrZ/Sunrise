@@ -19,18 +19,12 @@ inline constexpr std::size_t kResetIntervalOffset = 20;
 /** Raw reset phase, paired with the interval. */
 inline constexpr std::size_t kResetPhaseOffset = 24;
 
-/** Sale row cost array descriptor, which is what the row charges. */
+/** Sale row price-override array descriptor, which is what the row charges. */
 inline constexpr std::size_t kSaleCostArrayDescriptor = 32;
-/** Cost entry item-definition index. */
+/** Cost item-definition index inside one price-override row. */
 inline constexpr std::size_t kSaleCostItemIndexOffset = 0;
-/** Cost entry static quantity. */
+/** Units the price-override row charges. */
 inline constexpr std::size_t kSaleCostQuantityOffset = 4;
-/** Cost entry descriptor of its first expression array. An entry carrying one is not static. */
-inline constexpr std::size_t kSaleCostFirstProgramDescriptor = 8;
-/** Cost entry descriptor of its second expression array. An entry carrying one is not static. */
-inline constexpr std::size_t kSaleCostSecondProgramDescriptor = 24;
-/** Cost entry trailing word, which every expression-free entry carries as `kPlainCostWord`. */
-inline constexpr std::size_t kSaleCostWordOffset = 40;
 /** Sale row main item-definition index. */
 inline constexpr std::size_t kSaleItemIndexOffset = 70;
 /** Sale row vendor category index. */

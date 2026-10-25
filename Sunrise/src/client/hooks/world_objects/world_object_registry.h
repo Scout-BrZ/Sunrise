@@ -29,24 +29,13 @@ struct Diagnostics final {
     bool installed{};
 };
 
-enum class SnapshotStatus : std::uint8_t { ready, busy, unavailable };
-struct SnapshotResult final {
-    SnapshotStatus status{SnapshotStatus::unavailable};
-    std::size_t written{};
-    std::size_t total{};
-    std::uint64_t overflow{};
-};
-
-/** Copies candidates without native calls; each consumer must revalidate their generation. */
-[[nodiscard]] SnapshotResult try_snapshot(std::span<Instance> output) noexcept;
-
 /** Installs the placed-object lifetime capture. */
 [[nodiscard]] bool install() noexcept;
 
 /** Removes the capture after every replacement and trampoline call is idle. */
 [[nodiscard]] bool uninstall() noexcept;
 
-/** @return True while every world hook is attached and accepting observations. */
+/** @return True while both lifetime hooks are attached and accepting observations. */
 [[nodiscard]] bool is_installed() noexcept;
 
 /**
@@ -58,6 +47,12 @@ struct SnapshotResult final {
  */
 [[nodiscard]] std::size_t
 find(std::uint32_t objectListTag, std::uint32_t entryIndex, std::span<Instance> output) noexcept;
+
+/**
+ * Identifica uma criação dinâmica ainda retida pelo registro de vida dos objetos.
+ * Retorna zero quando o handle não está nesse registro. Não resolve um corpo físico.
+ */
+[[nodiscard]] std::uint64_t dynamic_ordinal(std::uint32_t handle) noexcept;
 
 /** @return Current bounded-registry counters. */
 [[nodiscard]] Diagnostics diagnostics() noexcept;

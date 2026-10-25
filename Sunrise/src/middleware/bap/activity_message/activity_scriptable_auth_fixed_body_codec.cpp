@@ -5,7 +5,6 @@
 #include <limits>
 
 #include "scriptable_auth_internal.h"
-#include "volume_toggle_auth.h"
 
 // The fixed-width scriptable-auth bodies that drive device state: authored objects, device
 // channels, configured-action pulses, triggers and timers. Each family has one encoder and one
@@ -73,11 +72,11 @@ constexpr std::uint64_t kReservedGeneration = std::numeric_limits<std::uint64_t>
     return true;
 }
 
-/** @return True when one type-31 generation is not older than the host's last one. */
+/** @return Aceita somente geracoes posteriores a ultima, como na V1. */
 [[nodiscard]] bool valid_type31(const Type31Preset& preset,
                                 const Type31GenerationGuard& guard) noexcept {
     return preset.generation != kReservedGeneration
-           && (!guard.hasLast || preset.generation >= guard.last);
+           && (!guard.hasLast || preset.generation > guard.last);
 }
 
 /** Writes the complete fixed-width 0x808099C4 child layout. */
@@ -253,10 +252,9 @@ bool next_type31_generation(const Type31GenerationGuard& guard, std::uint64_t& n
     return true;
 }
 
-/** A fresh trigger takes generation zero; every later arm or disarm takes the largest one. */
+/** Gatilhos tipo 31: incrementa a geracao ao ativar ou desativar, como na V1. */
 bool type31_arm_generation(const Type31GenerationGuard& guard, std::uint64_t& next) noexcept {
-    next = guard.hasLast ? kReservedGeneration - 1 : 0;
-    return true;
+    return next_type31_generation(guard, next);
 }
 
 /** Encodes one canonical type-31 configured-action pulse. */
@@ -452,48 +450,6 @@ bool encode_type24(const Type24Body& body,
         return false;
     }
     writtenBits = bits;
-    return true;
-}
-
-/** Encodes one schema-0x8080955A body: the volume's ClientRef, then its on or off state. */
-bool encode_type32_volume(const Type32VolumeBody& body,
-                          std::span<std::byte> output,
-                          std::size_t& written) noexcept {
-    written = 0;
-    if (body.registryKey == 0 || body.registryKey == (std::numeric_limits<std::uint32_t>::max)()
-        || body.slotIndex < 0 || output.size() < kType32ByteCount) {
-        return false;
-    }
-    bits::Writer writer(output.first(kType32ByteCount));
-    return auth_fields::write_client_ref(writer,
-                                         body.registryKey,
-                                         kVolumeSlotType,
-                                         static_cast<std::uint16_t>(body.slotIndex))
-           && writer.write(body.active ? kType32StateOn : kType32StateOff, kType32StateWidth)
-           && auth_fields::finish_exact(writer, kType32BitCount, kType32ByteCount, written);
-}
-
-/** Decodes one volume toggle; the no-op state, a non-volume target and nonzero padding fail. */
-bool decode_type32_volume(std::span<const std::byte> input,
-                          std::size_t bitCount,
-                          Type32VolumeBody& body) noexcept {
-    if (bitCount != kType32BitCount || input.size() != kType32ByteCount) {
-        return false;
-    }
-    bits::Reader reader(input);
-    std::uint64_t key = 0, type = 0, index = 0, state = 0;
-    if (!reader.read(auth_fields::kClientRefKeyWidth, key) || key == 0
-        || key == (std::numeric_limits<std::uint32_t>::max)()
-        || !reader.read(kClientRefTypeWidth, type)
-        || type != kVolumeSlotType + auth_fields::kClientRefTypeBias
-        || !reader.read(kClientRefIndexWidth, index) || index < kClientRefIndexBias
-        || !reader.read(kType32StateWidth, state)
-        || (state != kType32StateOff && state != kType32StateOn) || !finish_padding(reader)) {
-        return false;
-    }
-    body = {static_cast<std::uint32_t>(key),
-            static_cast<std::int16_t>(index - kClientRefIndexBias),
-            state == kType32StateOn};
     return true;
 }
 

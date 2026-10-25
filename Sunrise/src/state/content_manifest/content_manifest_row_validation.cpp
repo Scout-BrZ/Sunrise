@@ -6,12 +6,15 @@
 #include "scanner/package/content_manifest_package_name.h"
 
 namespace sunrise::state::content_manifest {
+namespace {
 
 /** @param first Package row. @param second Package row. @return Lexical name ordering. */
-bool row_less(const Row& first, const Row& second) noexcept {
+[[nodiscard]] bool row_less(const Row& first, const Row& second) noexcept {
     return std::string_view(first.name.data(), first.nameLength)
            < std::string_view(second.name.data(), second.nameLength);
 }
+
+} // namespace
 
 /** @param row Candidate public package row. @return True when its disk fields are canonical. */
 bool valid(const Row& row) noexcept {

@@ -3,10 +3,10 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 
 #include "../../core/logging/log.h"
-#include "../../core/runtime/server_clock.h"
 #include "../../middleware/web_service/messages/opcode1801.h"
 #include "../../middleware/web_service/messages/opcode1821.h"
 #include "../../middleware/web_service/messages/opcode1901.h"
@@ -14,7 +14,6 @@
 #include "../../middleware/web_service/messages/opcode206.h"
 #include "../../middleware/web_service/messages/opcode2400.h"
 #include "../../middleware/web_service/messages/opcode501_codec.h"
-#include "../../middleware/web_service/messages/opcode502.h"
 #include "../../middleware/web_service/messages/opcode503.h"
 #include "../../middleware/web_service/messages/opcode504.h"
 #include "../../middleware/web_service/messages/opcode601/opcode601_codec.h"
@@ -26,7 +25,6 @@
 #include "../../middleware/web_service/messages/opcode904/opcode904_codec.h"
 #include "../../middleware/web_service/web_service_envelope.h"
 #include "../../state/account/account_state.h"
-#include "../../state/activity/membership/activity_membership_query.h"
 #include "../../state/build_data/runtime.h"
 #include "../../state/runtime/runtime.h"
 #include "opcode_routes.h"
@@ -44,8 +42,12 @@ constexpr std::uint16_t kItemStateOpcode = 406;
 constexpr std::uint16_t kItemDismantleOpcode = 402;
 /** Web Service opcode used by Collections to create one item instance. */
 constexpr std::uint16_t kItemAcquisitionOpcode = 1820;
-/** One refusal code covers every reason; the log line names the actual one. */
-constexpr std::int32_t kRefusedStatus = middleware::web_service::kRefusedStatusCode;
+/**
+ * Logical status of a refused action. The descriptor biases logical zero to the wire success the
+ * Client expects, so any other logical value reports a refusal. Its five bits hold no error
+ * taxonomy, so one code covers every reason and the log line names the actual one.
+ */
+constexpr std::int32_t kRefusedStatus = 1;
 
 /**
  * Opcodes whose reply may name a resident the client no longer holds.
@@ -64,49 +66,26 @@ constexpr std::int32_t kArtifactResetGlimmerCost = 20'000;
 /** The artifact vendor's reset row. Every lower row unlocks one mod tier. */
 constexpr std::uint16_t kArtifactResetSaleIndex = 5;
 
+/**
+ * Reads the server's own clock for the purchase clock rule.
+ * The system clock counts from the Unix epoch, which is the same base the request field uses.
+ * @return Current time in Unix seconds.
+ */
+[[nodiscard]] std::int64_t server_clock_seconds() noexcept {
+    const auto sinceEpoch = std::chrono::system_clock::now().time_since_epoch();
+    return std::chrono::duration_cast<std::chrono::seconds>(sinceEpoch).count();
+}
+
 /** Issues a strictly increasing family-5 clock, including multiple requests in one second. */
 std::uint64_t next_family5_clock() noexcept {
     static std::atomic<std::uint64_t> issued{0};
-    const auto wall = static_cast<std::uint64_t>(core::runtime::server_clock_seconds());
+    const auto wall = static_cast<std::uint64_t>(server_clock_seconds());
     std::uint64_t previous = issued.load(std::memory_order_relaxed);
     std::uint64_t next = 0;
     do {
         next = wall > previous ? wall : previous + 1;
     } while (!issued.compare_exchange_weak(previous, next, std::memory_order_relaxed));
     return next;
-}
-
-/** Records the authoritative world state carried by the client's character write-back. */
-bool note_character_writeback(
-    const middleware::web_service::Message& message,
-    std::span<const state::account::inventory::PresentedItemRow> presentation) noexcept {
-    namespace writeback = middleware::web_service::messages::opcode702;
-    writeback::Request request{};
-    const bool parsed = writeback::parse_request(message, request);
-    std::array<char, core::log::kLineCapacity> line{};
-    const int written = std::snprintf(line.data(),
-                                      line.size(),
-                                      "ev=activity stage=writeback result=%s world_state=%u "
-                                      "activity=%d/%d/%d selector=%d",
-                                      parsed ? "ok" : "unparsed",
-                                      static_cast<unsigned>(request.worldState),
-                                      static_cast<int>(request.activityBytes[0]),
-                                      static_cast<int>(request.activityBytes[1]),
-                                      static_cast<int>(request.activityBytes[2]),
-                                      static_cast<int>(request.activitySelector));
-    if (written > 0) {
-        core::log::write(core::log::Channel::server,
-                         parsed ? core::log::Level::info : core::log::Level::warn,
-                         {line.data(), static_cast<std::size_t>(written)});
-    }
-    if (parsed && request.hasWorldState) {
-        state::activity::membership::note_client_writeback(request.worldState
-                                                           == writeback::kInWorld);
-    }
-    return parsed
-           && (!request.newItems
-               || state::account::inventory::record_character_seen(*request.newItems,
-                                                                   presentation));
 }
 
 /** @return True when a purchase names the seasonal artifact vendor, which is answered here. */
@@ -281,44 +260,13 @@ bool encode_resident_dependent_refusal(std::span<const std::byte> request,
 }
 
 /**
- * Encodes the reply to an opcode-501 create or 502 delete, a refusal when nothing changed.
- * @param message Parsed request; its opcode picks the reply shape.
- * @param family4Version Revision carrying the change, or kNoFamily4Publication.
- * @param outcome The roster change and created id, empty for a refusal.
- * @param response Svc-11 response-body storage owned by the caller.
- * @param written Gets the encoded response-body size.
- * @return False when the reply does not fit.
- */
-bool encode_roster_reply(const middleware::web_service::Message& message,
-                         std::int32_t family4Version,
-                         const Outcome& outcome,
-                         std::span<std::byte> response,
-                         std::size_t& written) noexcept {
-    namespace ws = middleware::web_service;
-    ws::StatusResponse status{};
-    status.value = family4Version;
-    if (!outcome.hasRosterChange) {
-        // A refusal stages nothing, so the version wait must not wait.
-        status.code = kRefusedStatus;
-        status.value = ws::kNoFamily4Publication;
-    }
-    if (message.opcode == ws::messages::opcode501::kOpcode) {
-        // The 501 shape always carries the id field, zero on a refusal.
-        return ws::messages::opcode501::encode_response(
-            message, status, outcome.createdCharacterSoid, response, written);
-    }
-    return ws::encode_response(message, ws::ResponseShape::statusPair, status, response, written);
-}
-
-/**
  * Parses one request, prepares any action it names, and encodes the reply that reports it.
  * @param request Whole decrypted svc-10 body.
  * @param response Svc-11 response-body storage owned by the caller.
  * @param written Gets the encoded response-body size, or zero when the header does not parse.
  * @param outcome Gets the prepared action for the caller to publish, and is left empty when
  * the action was refused or the reply could not be encoded.
- * @return False when the envelope header does not parse, or a saved roster change has no
- *         reply; the caller's save transaction must then drop the change.
+ * @return False only when the envelope header does not parse.
  */
 bool consume(std::span<const std::byte> request,
              std::span<std::byte> response,
@@ -335,7 +283,7 @@ bool consume(std::span<const std::byte> request,
     }
     if (message.opcode == middleware::web_service::messages::opcode702::kOpcode) {
         // A write-back the server cannot read is still answered; no reply drops the connection.
-        static_cast<void>(note_character_writeback(message, presentation));
+        static_cast<void>(note_character_writeback(message, presentation, outcome));
     }
     if (message.opcode == middleware::web_service::messages::opcode205::kOpcode) {
         state::InvestmentState investment{};
@@ -352,7 +300,7 @@ bool consume(std::span<const std::byte> request,
         // The request's own key is echoed and adopted. An authored id here costs the ship and the
         // banner.
         if (!bootstrap.hasPrimarySoid) {
-            bootstrap.primarySoid = state::account_snapshot().primarySoid;
+            bootstrap.primarySoid = state::bound_account_snapshot().primarySoid;
         }
         state::InvestmentState investment{};
         if (!parsed || !state::investment_snapshot(investment)
@@ -368,23 +316,13 @@ bool consume(std::span<const std::byte> request,
         return true;
     }
 
-    if (message.opcode == middleware::web_service::messages::opcode501::kOpcode
-        || message.opcode == middleware::web_service::messages::opcode502::kOpcode) {
-        if (message.opcode == middleware::web_service::messages::opcode501::kOpcode) {
-            create_character(message, outcome);
-        } else {
-            delete_character(message, outcome);
-        }
-        // The caller re-encodes a change with the revision that publishes it.
-        if (encode_roster_reply(message,
-                                middleware::web_service::kNoFamily4Publication,
-                                outcome,
-                                response,
-                                written)) {
-            return true;
-        }
-        // A saved change must not outlive a missing reply; false makes the caller drop it.
-        return !outcome.hasRosterChange && encode_echo(message, response, written);
+    if (message.opcode == middleware::web_service::messages::opcode501::kOpcode) {
+        // Returns a SOID family three already publishes. The request body is not parsed.
+        const std::uint64_t characterSoid =
+            state::account::selected_character_soid(state::bound_account_snapshot());
+        return middleware::web_service::messages::opcode501::encode_response(
+                   message, characterSoid, response, written)
+               || encode_echo(message, response, written);
     }
 
     // The artifact vendor is answered here. Every other vendor purchase falls through to the

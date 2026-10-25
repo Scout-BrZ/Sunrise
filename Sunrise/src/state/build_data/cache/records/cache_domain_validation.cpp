@@ -13,7 +13,6 @@
 #include "../../nodes/node_catalog.h"
 #include "../../progressions/progression_catalog.h"
 #include "../../records/record_catalog.h"
-#include "../../rewards/reward_catalog.h"
 #include "../../scenarios/scenario_catalog.h"
 #include "../../season_pass/season_pass_catalog.h"
 #include "../../sobjects/sobject_catalog.h"
@@ -170,13 +169,8 @@ template <typename Value, typename Less>
            && counts.recordRewards <= domains.recordRewards.size()
            && counts.progressionSteps <= domains.progressionSteps.size()
            && counts.seasonPassRewards <= domains.seasonPassRewards.size()
-           && counts.bounties <= domains.bounties.size()
-           && counts.rewardPools <= domains.rewardPools.size()
-           && counts.rewardEntries <= domains.rewardEntries.size()
-           && counts.rewardItems <= domains.rewardItems.size()
-           && counts.rewardInstructions <= domains.rewardInstructions.size()
-           && counts.rewardModifiers <= domains.rewardModifiers.size()
-           && counts.rewardSockets <= domains.rewardSockets.size();
+           && counts.seasonPassPackages <= domains.seasonPassPackages.size()
+           && counts.bounties <= domains.bounties.size();
 }
 
 } // namespace
@@ -242,12 +236,6 @@ bool valid_domains(const BuildIdentity& build, Domains domains) noexcept {
         || !strictly_ordered(domains.named, named_less) || !items::valid(domains.items)
         || !collectibles::valid(domains.collectibles)
         || !strictly_ordered(domains.collectibles, collectible_less)
-        || !rewards::valid({domains.rewardPools,
-                            domains.rewardEntries,
-                            domains.rewardItems,
-                            domains.rewardInstructions,
-                            domains.rewardModifiers,
-                            domains.rewardSockets})
         || !material_requirements::valid(domains.materialRequirementSets)
         || !strictly_ordered(domains.materialRequirementSets, material_requirement_less)
         || !inventory::buckets::valid(domains.inventoryBuckets)
@@ -261,7 +249,8 @@ bool valid_domains(const BuildIdentity& build, Domains domains) noexcept {
         || !strictly_ordered(domains.abilityBuckets, ability_less)
         || !progressions::valid(domains.progressions, domains.progressionSteps)
         // An empty catalog is complete: a build with no installed pass declares no reward.
-        || (!domains.seasonPassRewards.empty() && !season_pass::valid(domains.seasonPassRewards))
+        || (!domains.seasonPassRewards.empty()
+            && !season_pass::valid(domains.seasonPassRewards, domains.seasonPassPackages))
         || !bounties::valid(domains.bounties)
         || !build_data::records::valid(domains.records,
                                        domains.recordObjectives,
@@ -287,30 +276,9 @@ bool valid_domains(const BuildIdentity& build, Domains domains) noexcept {
         || !hash_names::valid(domains.hashNames)) {
         return false;
     }
-    // Reward rows are dense by item index, so each must name its item or be unavailable.
-    if (domains.rewardItems.size() != domains.items.size()) {
-        return false;
-    }
     for (std::size_t index = 0; index < domains.items.size(); ++index) {
-        if (domains.items[index].definitionIndex != index
-            || (domains.rewardItems[index].definitionHash != 0
-                && domains.rewardItems[index].definitionHash
-                       != domains.items[index].definitionHash)) {
+        if (domains.items[index].definitionIndex != index) {
             return false;
-        }
-    }
-    for (const auto& reward : domains.seasonPassRewards) {
-        if (reward.itemHash == 0) {
-            continue;
-        }
-        if (reward.itemIndex >= domains.items.size()
-            || domains.items[reward.itemIndex].definitionHash != reward.itemHash) {
-            return false;
-        }
-        for (std::size_t i = 0; i < reward.socketCount; ++i) {
-            if (!rewards::valid_socket(reward.sockets[i], domains.items.size())) {
-                return false;
-            }
         }
     }
     for (const material_requirements::Definition& definition : domains.materialRequirementSets) {

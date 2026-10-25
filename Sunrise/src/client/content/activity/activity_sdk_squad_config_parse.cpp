@@ -43,8 +43,20 @@ namespace tables = middleware::content::packages::tables;
 
 /** Compares two parsed candidate lanes exactly. */
 [[nodiscard]] bool same_member(const MemberFact& left, const MemberFact& right) noexcept {
-    return left.memberKey == right.memberKey && left.reservedU32 == right.reservedU32
-           && left.candidates == right.candidates;
+    if (left.memberKey != right.memberKey || left.reservedU32 != right.reservedU32) {
+        return false;
+    }
+    for (std::size_t lane = 0; lane < left.candidates.size(); ++lane) {
+        if (left.candidates[lane].size() != right.candidates[lane].size()) {
+            return false;
+        }
+        for (std::size_t row = 0; row < left.candidates[lane].size(); ++row) {
+            if (left.candidates[lane][row] != right.candidates[lane][row]) {
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 } // namespace
@@ -59,7 +71,6 @@ namespace tables = middleware::content::packages::tables;
         || left.secondaryComponentClass != right.secondaryComponentClass
         || left.members.size() != right.members.size()
         || left.hasInlinePointSet != right.hasInlinePointSet
-        || left.inlinePointSetInspected != right.inlinePointSetInspected
         || left.inlinePointSetOffset != right.inlinePointSetOffset
         || left.inlinePlacementComponentOffset != right.inlinePlacementComponentOffset
         || left.inlineInitialPointIndex != right.inlineInitialPointIndex
@@ -77,12 +88,20 @@ namespace tables = middleware::content::packages::tables;
 
 /** Compares repeated spawn-rule definitions from different placed paths. */
 [[nodiscard]] bool same_rule(const RuleFact& left, const RuleFact& right) noexcept {
-    return left.configTag == right.configTag && left.complete == right.complete
-           && left.primaryComponentOffset == right.primaryComponentOffset
-           && left.secondaryComponentOffset == right.secondaryComponentOffset
-           && left.primaryComponentClass == right.primaryComponentClass
-           && left.secondaryComponentClass == right.secondaryComponentClass
-           && left.inlineForm == right.inlineForm && left.points == right.points;
+    if (left.configTag != right.configTag || left.complete != right.complete
+        || left.primaryComponentOffset != right.primaryComponentOffset
+        || left.secondaryComponentOffset != right.secondaryComponentOffset
+        || left.primaryComponentClass != right.primaryComponentClass
+        || left.secondaryComponentClass != right.secondaryComponentClass
+        || left.inlineForm != right.inlineForm || left.points.size() != right.points.size()) {
+        return false;
+    }
+    for (std::size_t index = 0; index < left.points.size(); ++index) {
+        if (left.points[index] != right.points[index]) {
+            return false;
+        }
+    }
+    return true;
 }
 
 /** Parses one exact authored type-1 config. */
@@ -133,7 +152,6 @@ parse_spawner(std::uint32_t tag, std::span<const std::byte> blob, SpawnerFact& o
         if (!tables::authored_squad_inline_point_set(blob, tag, source, inlinePresent, inlineSet)) {
             return false;
         }
-        output.inlinePointSetInspected = true;
         if (inlinePresent) {
             if (inlineSet.points.count >= format::kAbsentIndex) {
                 return false;

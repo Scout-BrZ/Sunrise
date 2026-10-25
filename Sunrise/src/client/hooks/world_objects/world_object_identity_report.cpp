@@ -12,7 +12,6 @@
 
 #include "../../../core/logging/log.h"
 #include "../../memory/current_process_memory.h"
-#include "dynamic_object_registry.h"
 #include "internal.h"
 #include "world_object_registry.h"
 
@@ -276,7 +275,6 @@ __declspec(noinline) std::uint32_t* __fastcall instantiate(std::uint32_t* output
     t_inInstantiate = false;
     if (result != nullptr) {
         if (objectListTag == -1 || entryIndex == -1) {
-            observe_dynamic(*result, entry);
             report_dynamic(*result, entry, reinterpret_cast<std::uintptr_t>(_ReturnAddress()));
         } else {
             observe_instance(*result,
@@ -300,9 +298,6 @@ __declspec(noinline) std::uint32_t* __fastcall allocate(std::uint32_t* output,
         original != nullptr ? original(output, entry, objectListTag, entryIndex) : output;
     if (!t_inInstantiate && result != nullptr && *result != kNone
         && g_accepting.load(std::memory_order_acquire)) {
-        if (objectListTag == -1) {
-            observe_dynamic(*result, entry);
-        }
         report_allocation(*result, reinterpret_cast<std::uintptr_t>(_ReturnAddress()));
     }
     return result;
@@ -341,7 +336,6 @@ __declspec(noinline) std::uintptr_t __fastcall logical_destroy(std::uint32_t han
 __declspec(noinline) std::uintptr_t __fastcall destroy(std::uint32_t handle) noexcept {
     ActiveCall active;
     if (g_accepting.load(std::memory_order_acquire)) {
-        erase_dynamic(handle);
         AcquireSRWLockExclusive(&g_lock);
         erase(handle);
         ReleaseSRWLockExclusive(&g_lock);

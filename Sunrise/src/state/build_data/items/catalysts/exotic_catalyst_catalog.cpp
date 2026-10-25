@@ -169,7 +169,8 @@ bool valid(std::span<const Definition> definitions) noexcept {
         const bool hasEffect = definition.effectDefinitionIndex != details::kUnavailableItemIndex;
         const bool hasProgress =
             definition.progressPlugDefinitionIndex != details::kUnavailableItemIndex;
-        const bool hasAcquisition = definition.acquisitionFlag != kUnavailableAcquisitionIndex;
+        const bool hasAcquisition =
+            definition.acquisitionDefinitionIndex != kUnavailableAcquisitionIndex;
         const bool hasObjective =
             definition.objective.definitionIndex != kUnavailableObjectiveIndex;
         const bool directEffect =
@@ -234,7 +235,7 @@ Result resolve(std::uint16_t itemDefinitionIndex) noexcept {
              definition->completedPlugDefinitionIndex,
              definition->progressPlugDefinitionIndex,
              definition->effectDefinitionIndex,
-             definition->acquisitionFlag,
+             definition->acquisitionDefinitionIndex,
              definition->completion,
              definition->objective}};
 }
@@ -313,7 +314,7 @@ bool append_investment_overrides(state::Family5State& family) noexcept {
         if (definition.availability != Availability::released) {
             continue;
         }
-        if (!upsert_flag(candidate, definition.acquisitionFlag, true)) {
+        if (!upsert_flag(candidate, definition.acquisitionDefinitionIndex, true)) {
             return false;
         }
         for (std::size_t flag = 0; flag < definition.completion.flagCount; ++flag) {

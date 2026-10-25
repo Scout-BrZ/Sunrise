@@ -1,8 +1,12 @@
 #include <Windows.h>
 
 #include <array>
+#include <cstdio>
 #include <limits>
+#include <span>
 
+#include "../../core/logging/log.h"
+#include "../../core/settings/settings.h"
 #include "../../middleware/bap/activity_message/sensor_auth_update.h"
 #include "../../state/activity/runtime.h"
 #include "activity_sdk_behavior_scope.h"
@@ -105,6 +109,8 @@ plan_from(const sdk::MissionSeedSummary& summary) noexcept {
 
 namespace {
 
+/** Materializes into static lock-owned storage so UI stack size stays bounded. */
+
 /** Checks the exact enabled and published mission-seed lease for one scene state. */
 [[nodiscard]] SceneStatus scene_lease_status(const sdk::BoundView& view,
                                              const server::bap::ActivityLinkView& link,
@@ -132,74 +138,23 @@ namespace {
     if (!lease.configured || lease.revision == 0 || lease.plan.scenarioRow != view.scenarioRow) {
         return SceneStatus::missionSeedUnavailable;
     }
+    // A sibling state of the live bubble counts as well: its objects are loaded with the bubble.
     if (lease.plan.stateRow != stateRow
         && !behavior_scope::live_state(view.catalog->states(),
                                        view.catalog->bubbles(),
                                        view.scenarioRow,
                                        stateRow,
-                                       link.effectiveRegion)) {
+                                       link.effectiveRegion)
+        && !behavior_scope::sibling_state(view.catalog->states(),
+                                          view.catalog->bubbles(),
+                                          view.scenarioRow,
+                                          stateRow,
+                                          link.effectiveRegion)) {
         return SceneStatus::wrongState;
     }
     if (lease.publicationPending || lease.publishedRevision != lease.revision) {
         return SceneStatus::missionSeedPending;
     }
-    return SceneStatus::ready;
-}
-
-/**
- * Checks the state's lease, then routes one validated slot to its live state-local target.
- * @param expectedSlotType Slot type the routed target must carry.
- * @param expectedAuthSchema Auth schema the routed target must carry.
- * @param output Receives the target and its route; other fields are left as they are.
- * @return ready, or the refusal that stopped the lease or the route.
- */
-[[nodiscard]] SceneStatus route_prepared(const sdk::BoundView& view,
-                                         const server::bap::ActivityLinkView& link,
-                                         const sdk::format::Scenario& scenario,
-                                         const sdk::format::Object& object,
-                                         const sdk::format::Occurrence& occurrence,
-                                         const sdk::format::Slot& slot,
-                                         std::uint32_t expectedSlotType,
-                                         std::uint32_t expectedAuthSchema,
-                                         PreparedScene& output) noexcept {
-    const SceneStatus lease = scene_lease_status(view, link, occurrence.stateIndex);
-    if (lease != SceneStatus::ready) {
-        return lease;
-    }
-    sdk_route::SourceIdentity source{};
-    source.scenarioTag = scenario.tag;
-    source.objectTag = object.objectTag;
-    source.registryKey = object.objectKey;
-    source.authSchema = slot.authSchema;
-    source.objectRow = occurrence.objectIndex;
-    source.stateRow = occurrence.stateIndex;
-    source.slotIndex = static_cast<std::uint16_t>(slot.slotIndex);
-    source.slotType = static_cast<std::uint8_t>(slot.slotType);
-    sdk_route::Resolution resolved{};
-    switch (sdk_route::resolve(view, source, link.effectiveRegion, resolved)) {
-    case sdk_route::Status::ready:
-        break;
-    case sdk_route::Status::invalidView:
-        return SceneStatus::invalidView;
-    case sdk_route::Status::invalidSource:
-        return SceneStatus::invalidSlot;
-    case sdk_route::Status::missingSource:
-        return SceneStatus::targetUnavailable;
-    case sdk_route::Status::ambiguousSource:
-        return SceneStatus::ambiguousTarget;
-    }
-    if (resolved.scenarioRow != view.scenarioRow || resolved.stateRow != occurrence.stateIndex
-        || resolved.region != link.effectiveRegion || !resolved.target.stateLocalRoster
-        || resolved.target.slotType != expectedSlotType
-        || resolved.target.authSchema != expectedAuthSchema) {
-        return SceneStatus::invalidSlot;
-    }
-    output.target = resolved.target;
-    output.rosterGroup = resolved.rosterGroup;
-    output.activityClientGeneration = link.activityClientGeneration;
-    output.scenarioRow = resolved.scenarioRow;
-    output.stateRow = resolved.stateRow;
-    output.effectiveRegion = resolved.region;
     return SceneStatus::ready;
 }
 
@@ -247,7 +202,7 @@ namespace {
     if (!state::activity::binding_matches(view.binding)) {
         return Status::staleBinding;
     }
-    (void)server::bap::activity_link_view(view.binding, link);
+    (void)server::bap::activity_link_view(view.binding, view.activityClientGeneration, link);
     switch (
         sdk::revalidate(view, view.binding, link.matchingLinks, link.activityClientGeneration)) {
     case sdk::Status::ready:
@@ -329,7 +284,7 @@ namespace {
 }
 
 /** Resolves one exact generated scene without changing transport state. */
-[[nodiscard]] SceneStatus prepare_scene(const sdk::BoundView& view,
+[[nodiscard]] SceneStatus prepare_scene_on(const sdk::BoundView& view,
                                         std::uint32_t occurrenceRow,
                                         std::uint32_t slotRow,
                                         PreparedScene& output) noexcept {
@@ -413,23 +368,54 @@ namespace {
     if (collected != SceneStatus::ready) {
         return collected;
     }
-    if (!scene_dependencies(cast, output.sceneDependencies)) {
-        return SceneStatus::dependencyCapacity;
+    scene_dependencies(catalog, slotRow, cast, output.sceneDependencies);
+
+    const SceneStatus lease = scene_lease_status(view, link, occurrence.stateIndex);
+    if (lease != SceneStatus::ready) {
+        return lease;
     }
-    output.omittedParticipants = cast.omitted;
-    return route_prepared(view,
-                          link,
-                          *scenario,
-                          object,
-                          occurrence,
-                          slot,
-                          sdk::format::kAuthoredSceneSlotType,
-                          sdk::format::kAuthoredSceneAuthSchema,
-                          output);
+
+    sdk_route::SourceIdentity source{};
+    source.scenarioTag = scenario->tag;
+    source.objectTag = object.objectTag;
+    source.registryKey = object.objectKey;
+    source.authSchema = slot.authSchema;
+    source.objectRow = occurrence.objectIndex;
+    source.stateRow = occurrence.stateIndex;
+    source.slotIndex = static_cast<std::uint16_t>(slot.slotIndex);
+    source.slotType = static_cast<std::uint8_t>(slot.slotType);
+
+    sdk_route::Resolution resolved{};
+    switch (sdk_route::resolve(view, source, link.effectiveRegion, resolved)) {
+    case sdk_route::Status::ready:
+        break;
+    case sdk_route::Status::invalidView:
+        return SceneStatus::invalidView;
+    case sdk_route::Status::invalidSource:
+        return SceneStatus::invalidSlot;
+    case sdk_route::Status::missingSource:
+        return SceneStatus::targetUnavailable;
+    case sdk_route::Status::ambiguousSource:
+        return SceneStatus::ambiguousTarget;
+    }
+    if (resolved.scenarioRow != view.scenarioRow || resolved.stateRow != occurrence.stateIndex
+        || resolved.region != link.effectiveRegion || !resolved.target.stateLocalRoster
+        || resolved.target.slotType != sdk::format::kAuthoredSceneSlotType
+        || resolved.target.authSchema != sdk::format::kAuthoredSceneAuthSchema) {
+        return SceneStatus::invalidSlot;
+    }
+
+    output.target = resolved.target;
+    output.rosterGroup = resolved.rosterGroup;
+    output.activityClientGeneration = link.activityClientGeneration;
+    output.scenarioRow = resolved.scenarioRow;
+    output.stateRow = resolved.stateRow;
+    output.effectiveRegion = resolved.region;
+    return SceneStatus::ready;
 }
 
 /** Resolves one exact SDK-bounded type-53 cue without changing transport state. */
-[[nodiscard]] SceneStatus prepare_dialogue(const sdk::BoundView& view,
+[[nodiscard]] SceneStatus prepare_dialogue_on(const sdk::BoundView& view,
                                            std::uint32_t occurrenceRow,
                                            std::uint32_t slotRow,
                                            std::uint16_t cueIndex,
@@ -481,19 +467,49 @@ namespace {
         return SceneStatus::invalidSlot;
     }
     authoredCueCount = static_cast<std::uint16_t>(slot.reserved);
-    return route_prepared(view,
-                          link,
-                          *scenario,
-                          object,
-                          occurrence,
-                          slot,
-                          sdk::format::kDialogueSlotType,
-                          sdk::format::kDialogueAuthSchema,
-                          output);
+    const SceneStatus lease = scene_lease_status(view, link, occurrence.stateIndex);
+    if (lease != SceneStatus::ready) {
+        return lease;
+    }
+    sdk_route::SourceIdentity source{};
+    source.scenarioTag = scenario->tag;
+    source.objectTag = object.objectTag;
+    source.registryKey = object.objectKey;
+    source.authSchema = slot.authSchema;
+    source.objectRow = occurrence.objectIndex;
+    source.stateRow = occurrence.stateIndex;
+    source.slotIndex = static_cast<std::uint16_t>(slot.slotIndex);
+    source.slotType = static_cast<std::uint8_t>(slot.slotType);
+    sdk_route::Resolution resolved{};
+    switch (sdk_route::resolve(view, source, link.effectiveRegion, resolved)) {
+    case sdk_route::Status::ready:
+        break;
+    case sdk_route::Status::invalidView:
+        return SceneStatus::invalidView;
+    case sdk_route::Status::invalidSource:
+        return SceneStatus::invalidSlot;
+    case sdk_route::Status::missingSource:
+        return SceneStatus::targetUnavailable;
+    case sdk_route::Status::ambiguousSource:
+        return SceneStatus::ambiguousTarget;
+    }
+    if (resolved.scenarioRow != view.scenarioRow || resolved.stateRow != occurrence.stateIndex
+        || resolved.region != link.effectiveRegion || !resolved.target.stateLocalRoster
+        || resolved.target.slotType != sdk::format::kDialogueSlotType
+        || resolved.target.authSchema != sdk::format::kDialogueAuthSchema) {
+        return SceneStatus::invalidSlot;
+    }
+    output.target = resolved.target;
+    output.rosterGroup = resolved.rosterGroup;
+    output.activityClientGeneration = link.activityClientGeneration;
+    output.scenarioRow = resolved.scenarioRow;
+    output.stateRow = resolved.stateRow;
+    output.effectiveRegion = resolved.region;
+    return SceneStatus::ready;
 }
 
 /** Resolves one exact fixed-schema behavior slot without changing transport state. */
-[[nodiscard]] SceneStatus prepare_typed_behavior(const sdk::BoundView& view,
+[[nodiscard]] SceneStatus prepare_typed_behavior_on(const sdk::BoundView& view,
                                                  std::uint32_t occurrenceRow,
                                                  std::uint32_t slotRow,
                                                  std::uint32_t expectedSlotType,
@@ -543,15 +559,45 @@ namespace {
         || slot.slotIndex > (std::numeric_limits<std::uint16_t>::max)()) {
         return SceneStatus::invalidSlot;
     }
-    return route_prepared(view,
-                          link,
-                          *scenario,
-                          object,
-                          occurrence,
-                          slot,
-                          expectedSlotType,
-                          expectedAuthSchema,
-                          output);
+    const SceneStatus lease = scene_lease_status(view, link, occurrence.stateIndex);
+    if (lease != SceneStatus::ready) {
+        return lease;
+    }
+    sdk_route::SourceIdentity source{};
+    source.scenarioTag = scenario->tag;
+    source.objectTag = object.objectTag;
+    source.registryKey = object.objectKey;
+    source.authSchema = slot.authSchema;
+    source.objectRow = occurrence.objectIndex;
+    source.stateRow = occurrence.stateIndex;
+    source.slotIndex = static_cast<std::uint16_t>(slot.slotIndex);
+    source.slotType = static_cast<std::uint8_t>(slot.slotType);
+    sdk_route::Resolution resolved{};
+    switch (sdk_route::resolve(view, source, link.effectiveRegion, resolved)) {
+    case sdk_route::Status::ready:
+        break;
+    case sdk_route::Status::invalidView:
+        return SceneStatus::invalidView;
+    case sdk_route::Status::invalidSource:
+        return SceneStatus::invalidSlot;
+    case sdk_route::Status::missingSource:
+        return SceneStatus::targetUnavailable;
+    case sdk_route::Status::ambiguousSource:
+        return SceneStatus::ambiguousTarget;
+    }
+    if (resolved.scenarioRow != view.scenarioRow || resolved.stateRow != occurrence.stateIndex
+        || resolved.region != link.effectiveRegion || !resolved.target.stateLocalRoster
+        || resolved.target.slotType != expectedSlotType
+        || resolved.target.authSchema != expectedAuthSchema) {
+        return SceneStatus::invalidSlot;
+    }
+    output.target = resolved.target;
+    output.rosterGroup = resolved.rosterGroup;
+    output.activityClientGeneration = link.activityClientGeneration;
+    output.scenarioRow = resolved.scenarioRow;
+    output.stateRow = resolved.stateRow;
+    output.effectiveRegion = resolved.region;
+    return SceneStatus::ready;
 }
 
 /** Resolves one exact SDK-linked type-38 task without changing transport state. */
@@ -587,14 +633,14 @@ namespace {
     if (status != SceneStatus::ready) {
         return status;
     }
-    // Validation keeps one row per (slot, name hash, element), so the slot's range decides.
-    for (const sdk::format::DirectiveElement& row :
-         sdk::slot_directive_elements(*view.catalog, view.catalog->slots()[slotRow])) {
-        if (row.nameHash == nameHash && row.elementIndex == elementIndex) {
-            return SceneStatus::ready;
-        }
+    std::size_t matches = 0;
+    for (const sdk::format::DirectiveElement& row : view.catalog->directive_elements()) {
+        matches +=
+            row.slotIndex == slotRow && row.nameHash == nameHash && row.elementIndex == elementIndex
+                ? 1U
+                : 0U;
     }
-    return SceneStatus::invalidSlot;
+    return matches == 1 ? SceneStatus::ready : SceneStatus::invalidSlot;
 }
 
 /** Resolves one exact type-3 objective sensor without changing transport state. */
@@ -610,6 +656,105 @@ namespace {
                                   sdk::format::kObjectiveAuthSchema,
                                   false,
                                   output);
+}
+
+namespace {
+
+/** Most members a shared activity routes a scene, cue or behavior between. */
+constexpr std::size_t kRouteLinkCapacity = 8;
+
+/**
+ * Prepares one authored scene, cue or behavior on the link that can carry it.
+ * A state-local target is live only for a member standing in its state. The owner's link tries
+ * first. When the owner stands in another state, every other member's link is tried, and the
+ * first one standing there carries it; that link's own mission seed publishes the target.
+ * @param attempt Prepares on the link the view it is handed names; writes the caller's output.
+ * @param what Log name of the prepared kind.
+ */
+template <class Attempt>
+[[nodiscard]] SceneStatus
+prepare_on_member_link(const sdk::BoundView& view, const char* what, Attempt&& attempt) noexcept {
+    const SceneStatus owner = attempt(view);
+    if (owner != SceneStatus::wrongState
+        || !core::settings::get().server.activation.singlePrivateAmbassador) {
+        return owner;
+    }
+    std::array<server::bap::ActivityMemberLink, kRouteLinkCapacity> links{};
+    const std::size_t count = server::bap::activity_member_links(view.binding, std::span(links));
+    std::uint64_t routedGeneration = 0;
+    SceneStatus status = owner;
+    for (std::size_t index = 0; index < count; ++index) {
+        if (links[index].activityClientGeneration == view.activityClientGeneration) {
+            continue;
+        }
+        sdk::BoundView routed = view;
+        routed.activityClientGeneration = links[index].activityClientGeneration;
+        status = attempt(routed);
+        if (status == SceneStatus::ready) {
+            routedGeneration = routed.activityClientGeneration;
+            break;
+        }
+    }
+    if (count > 1) {
+        std::array<char, core::log::kLineCapacity> line{};
+        const int written = std::snprintf(line.data(),
+                                          line.size(),
+                                          "ev=activity stage=scene_route result=%s kind=%s "
+                                          "owner_gen=%llu gen=%llu",
+                                          routedGeneration != 0 ? "routed" : "unrouted",
+                                          what,
+                                          static_cast<unsigned long long>(
+                                              view.activityClientGeneration),
+                                          static_cast<unsigned long long>(routedGeneration));
+        if (written > 0) {
+            core::log::write(core::log::Channel::server,
+                             core::log::Level::info,
+                             {line.data(), static_cast<std::size_t>(written)});
+        }
+    }
+    return routedGeneration != 0 ? SceneStatus::ready : owner;
+}
+
+} // namespace
+
+[[nodiscard]] SceneStatus prepare_scene(const sdk::BoundView& view,
+                                        std::uint32_t occurrenceRow,
+                                        std::uint32_t slotRow,
+                                        PreparedScene& output) noexcept {
+    return prepare_on_member_link(view, "scene", [&](const sdk::BoundView& on) noexcept {
+        return prepare_scene_on(on, occurrenceRow, slotRow, output);
+    });
+}
+
+[[nodiscard]] SceneStatus prepare_dialogue(const sdk::BoundView& view,
+                                           std::uint32_t occurrenceRow,
+                                           std::uint32_t slotRow,
+                                           std::uint16_t cueIndex,
+                                           PreparedScene& output,
+                                           std::uint16_t& authoredCueCount) noexcept {
+    return prepare_on_member_link(view, "dialogue", [&](const sdk::BoundView& on) noexcept {
+        return prepare_dialogue_on(on, occurrenceRow, slotRow, cueIndex, output, authoredCueCount);
+    });
+}
+
+[[nodiscard]] SceneStatus prepare_typed_behavior(const sdk::BoundView& view,
+                                                 std::uint32_t occurrenceRow,
+                                                 std::uint32_t slotRow,
+                                                 std::uint32_t expectedSlotType,
+                                                 std::uint32_t expectedComponentClass,
+                                                 std::uint32_t expectedAuthSchema,
+                                                 bool requireTaskTarget,
+                                                 PreparedScene& output) noexcept {
+    return prepare_on_member_link(view, "behavior", [&](const sdk::BoundView& on) noexcept {
+        return prepare_typed_behavior_on(on,
+                                         occurrenceRow,
+                                         slotRow,
+                                         expectedSlotType,
+                                         expectedComponentClass,
+                                         expectedAuthSchema,
+                                         requireTaskTarget,
+                                         output);
+    });
 }
 
 } // namespace sunrise::server::activity::activity_sdk_mission::detail

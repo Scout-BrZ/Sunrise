@@ -8,16 +8,13 @@
 #include <cstdio>
 #include <imgui.h>
 #include <span>
-#include <string>
 #include <string_view>
-#include <utility>
 #include <vector>
 
 #include "../../../core/ui/components/section/ui_section_component.h"
 #include "../../activity/activity_sdk_mission_runtime.h"
 #include "activity_host_sdk_behavior_view.h"
 #include "activity_host_sdk_mission_text.h"
-#include "activity_host_sdk_scene_inputs.h"
 #include "activity_host_table_layout.h"
 
 namespace sunrise::server::ui::activity_host::sdk_mission_view {
@@ -52,43 +49,6 @@ struct SceneBrowserRow final {
 };
 
 std::vector<SceneBrowserRow> g_visibleScenes{};
-
-/**
- * Everything the scene rows are computed from. Resolving one row prepares its whole cast, so
- * the rows are rebuilt when this changes or after kSceneRefreshSeconds, not every frame.
- */
-struct SceneBrowserKey final {
-    const sdk::Catalog* catalog{};
-    std::uint32_t scenarioRow{sdk::format::kAbsentIndex};
-    std::uint32_t stateRow{sdk::format::kAbsentIndex};
-    std::uint64_t activityClientGeneration{};
-    std::uint64_t revision{};
-    std::uint64_t publishedRevision{};
-    std::int32_t effectiveRegion{-1};
-    bool configured{};
-    bool publicationPending{};
-    bool regionArrivalPending{};
-    std::string query{};
-
-    [[nodiscard]] bool operator==(const SceneBrowserKey&) const noexcept = default;
-};
-
-/** Bounds how stale a row's availability can be when nothing observable changed. */
-constexpr double kSceneRefreshSeconds = 0.25;
-SceneBrowserKey g_visibleScenesKey{};
-double g_visibleScenesTime{-1.0};
-bool g_visibleScenesReady{};
-
-/** Records one scene action's result and forces the rows to refresh. */
-void note_scene_action(std::uint32_t occurrence,
-                       std::uint32_t slot,
-                       mission::SceneStatus status) noexcept {
-    g_sceneActionOccurrence = occurrence;
-    g_sceneActionSlot = slot;
-    g_sceneActionStatus = status;
-    g_hasSceneActionStatus = true;
-    g_visibleScenesTime = -1.0;
-}
 
 /** @return The global row of one borrowed slot or the absent marker. */
 [[nodiscard]] std::uint32_t global_slot_row(const sdk::Catalog& catalog,
@@ -186,28 +146,8 @@ void note_scene_action(std::uint32_t occurrence,
 
 /** Builds type-43 rows from only the selected state-ordinal-0 occurrence set. */
 [[nodiscard]] bool materialize_visible_scenes(const sdk::BoundView& view,
-                                              const mission::Snapshot& snapshot) noexcept {
-    const std::uint32_t stateRow = snapshot.plan.stateRow;
+                                              std::uint32_t stateRow) noexcept {
     try {
-        SceneBrowserKey key{.catalog = view.catalog.get(),
-                            .scenarioRow = view.scenarioRow,
-                            .stateRow = stateRow,
-                            .activityClientGeneration = snapshot.activityClientGeneration,
-                            .revision = snapshot.revision,
-                            .publishedRevision = snapshot.publishedRevision,
-                            .effectiveRegion = snapshot.effectiveRegion,
-                            .configured = snapshot.configured,
-                            .publicationPending = snapshot.publicationPending,
-                            .regionArrivalPending = snapshot.regionArrivalPending,
-                            .query = std::string(search_text())};
-        const double now = ImGui::GetTime();
-        if (key == g_visibleScenesKey && g_visibleScenesTime >= 0.0
-            && now - g_visibleScenesTime < kSceneRefreshSeconds) {
-            return g_visibleScenesReady;
-        }
-        g_visibleScenesKey = std::move(key);
-        g_visibleScenesTime = now;
-        g_visibleScenesReady = false;
         g_visibleScenes.clear();
         if (view.catalog == nullptr || stateRow >= view.catalog->states().size()) {
             return false;
@@ -245,19 +185,16 @@ void note_scene_action(std::uint32_t occurrence,
                 }
             }
         }
-        g_visibleScenesReady = true;
         return true;
     } catch (...) {
         g_visibleScenes.clear();
-        g_visibleScenesKey = {};
-        g_visibleScenesTime = -1.0;
         return false;
     }
 }
 
 /** Draws searchable exact type-43 rows and their manual one-generation action. */
 void draw_authored_scenes(const sdk::BoundView& view, const mission::Snapshot& snapshot) noexcept {
-    if (!materialize_visible_scenes(view, snapshot)) {
+    if (!materialize_visible_scenes(view, snapshot.plan.stateRow)) {
         ImGui::TextDisabled("No scene in this state.");
         return;
     }
@@ -386,24 +323,15 @@ void draw_authored_scenes(const sdk::BoundView& view, const mission::Snapshot& s
             ImGui::TableNextColumn();
             ImGui::BeginDisabled(available != mission::SceneStatus::ready);
             if (ImGui::Button("Advance")) {
-                note_scene_action(
-                    row.occurrenceRow,
-                    row.slotRow,
-                    mission::activate_authored_scene(view, row.occurrenceRow, row.slotRow));
+                g_sceneActionOccurrence = row.occurrenceRow;
+                g_sceneActionSlot = row.slotRow;
+                g_sceneActionStatus =
+                    mission::activate_authored_scene(view, row.occurrenceRow, row.slotRow);
+                g_hasSceneActionStatus = true;
             }
             ImGui::EndDisabled();
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
                 ImGui::SetTooltip("%s", mission::status_name(available));
-            }
-            bool sent = false;
-            const mission::SceneStatus inputStatus =
-                draw_scene_inputs(view,
-                                  row.occurrenceRow,
-                                  row.slotRow,
-                                  available == mission::SceneStatus::ready,
-                                  sent);
-            if (sent) {
-                note_scene_action(row.occurrenceRow, row.slotRow, inputStatus);
             }
             ImGui::PopID();
             ImGui::PopID();
@@ -462,14 +390,12 @@ void draw_dialogues(const sdk::BoundView& view, const mission::Snapshot& snapsho
                                     static_cast<unsigned>(occurrenceRow),
                                     static_cast<unsigned>(slot.slotIndex));
                 const auto cueRows = sdk::slot_dialogue_cues(catalog, slot);
-                // The check reads the cue only against the slot's cue count, which every cue
-                // drawn here satisfies, so one resolution per sensor answers for all of them.
-                const mission::SceneStatus available =
-                    mission::dialogue_cue_availability(view, occurrenceRow, slotRow, 0);
                 for (std::uint32_t cueRow = 0; cueRow < slot.reserved; ++cueRow) {
                     // The cue index is a 16-bit wire field, so the row is narrowed once here.
                     const auto cue = static_cast<std::uint16_t>(cueRow);
                     ImGui::PushID(static_cast<int>(cueRow));
+                    const mission::SceneStatus available =
+                        mission::dialogue_cue_availability(view, occurrenceRow, slotRow, cue);
                     ImGui::BeginDisabled(available != mission::SceneStatus::ready);
                     if (ImGui::Button("Play cue")) {
                         g_dialogueActionOccurrence = occurrenceRow;
@@ -483,7 +409,7 @@ void draw_dialogues(const sdk::BoundView& view, const mission::Snapshot& snapsho
                     ImGui::SameLine();
                     if (cueRow < cueRows.size()) {
                         const sdk::format::DialogueCue& definition = cueRows[cueRow];
-                        ImGui::Text("Cue %u  definition %08X  window %.3f s  %u lines",
+                        ImGui::Text("Cue %u  definition %08X  %.3f s  %u lines",
                                     static_cast<unsigned>(cue),
                                     static_cast<unsigned>(definition.definitionHash),
                                     static_cast<double>(definition.authoredWindowSeconds),
@@ -493,17 +419,21 @@ void draw_dialogues(const sdk::BoundView& view, const mission::Snapshot& snapsho
                     }
                     ImGui::Indent();
                     bool hasCandidate = false;
-                    const auto dialogueRows = sdk::cue_dialogue_texts(catalog, slot, cueRow);
+                    const auto dialogueRows = catalog.dialogue_cue_texts();
                     for (std::size_t rowIndex = 0; rowIndex < dialogueRows.size(); ++rowIndex) {
-                        const std::string_view candidate =
-                            catalog.string(dialogueRows[rowIndex].text);
+                        const sdk::format::DialogueCueText& row = dialogueRows[rowIndex];
+                        if (row.slotIndex != slotRow || row.cueIndex != cue) {
+                            continue;
+                        }
+                        const std::string_view candidate = catalog.string(row.text);
                         if (candidate.empty()) {
                             continue;
                         }
-                        // The two takes of a line usually share their text; show it once.
                         bool duplicate = false;
                         for (std::size_t previous = 0; previous < rowIndex; ++previous) {
-                            if (catalog.string(dialogueRows[previous].text) == candidate) {
+                            const sdk::format::DialogueCueText& prior = dialogueRows[previous];
+                            if (prior.slotIndex == slotRow && prior.cueIndex == cue
+                                && catalog.string(prior.text) == candidate) {
                                 duplicate = true;
                                 break;
                             }
@@ -547,6 +477,7 @@ void draw_directives(const sdk::BoundView& view, const mission::Snapshot& snapsh
     const sdk::Catalog& catalog = *view.catalog;
     const auto occurrences = catalog.occurrences();
     const auto objects = catalog.objects();
+    const auto slots = catalog.slots();
     const std::string_view query = search_text();
     std::size_t rows = 0;
     for (std::uint32_t occurrenceRow = 0; occurrenceRow < occurrences.size(); ++occurrenceRow) {
@@ -556,93 +487,85 @@ void draw_directives(const sdk::BoundView& view, const mission::Snapshot& snapsh
             || occurrence.objectIndex >= objects.size()) {
             continue;
         }
-        for (const sdk::format::Slot& slot :
-             sdk::object_slots(catalog, objects[occurrence.objectIndex])) {
-            if (slot.slotType != sdk::format::kDirectiveSlotType) {
+        for (const sdk::format::DirectiveElement& directive : catalog.directive_elements()) {
+            if (directive.slotIndex >= slots.size()
+                || slots[directive.slotIndex].objectIndex != occurrence.objectIndex) {
                 continue;
             }
-            const auto elements = sdk::slot_directive_elements(catalog, slot);
-            if (elements.empty()) {
+            const std::string_view title = display_text(catalog, directive.title);
+            const std::string_view description = display_text(catalog, directive.description);
+            const std::string_view progress = display_text(catalog, directive.progress);
+            const std::string_view id = display_text(catalog, directive.id);
+            if (!query.empty() && !contains_folded(title, query)
+                && !contains_folded(description, query) && !contains_folded(progress, query)
+                && !contains_folded(id, query)) {
                 continue;
             }
-            const std::uint32_t slotRow = global_slot_row(catalog, slot);
-            if (slotRow == sdk::format::kAbsentIndex) {
-                continue;
-            }
-            // The slot resolves once; validation keeps every element row unique inside it.
+            ++rows;
             const mission::SceneStatus available =
-                mission::directives_availability(view, occurrenceRow, slotRow);
-            for (const sdk::format::DirectiveElement& directive : elements) {
-                const std::string_view title = display_text(catalog, directive.title);
-                const std::string_view description = catalog.string(directive.description);
-                const std::string_view progress = catalog.string(directive.progress);
-                const std::string_view id = display_text(catalog, directive.id);
-                if (!query.empty() && !contains_folded(title, query)
-                    && !contains_folded(description, query) && !contains_folded(progress, query)
-                    && !contains_folded(id, query)) {
-                    continue;
-                }
-                ++rows;
-                ImGui::PushID(static_cast<int>(occurrenceRow));
-                ImGui::PushID(static_cast<int>(slotRow));
-                ImGui::PushID(static_cast<int>(directive.nameHash));
-                ImGui::PushID(directive.elementIndex);
-                ImGui::Text("%.*s", print_length(title), title.data());
-                if (!description.empty()) {
-                    ImGui::TextWrapped("%.*s", print_length(description), description.data());
-                }
-                if (!progress.empty()) {
-                    ImGui::TextWrapped("%.*s%s",
-                                       print_length(progress),
-                                       progress.data(),
-                                       (directive.flags & sdk::format::kDirectiveElementCounter)
-                                               != 0
-                                           ? " (counter)"
-                                           : "");
-                }
-                ImGui::TextDisabled("hash %08X  element %d  slot %u",
-                                    static_cast<unsigned>(directive.nameHash),
-                                    directive.elementIndex,
-                                    static_cast<unsigned>(slotRow));
-                ImGui::BeginDisabled(available != mission::SceneStatus::ready);
-                const auto apply = [&](const char* label, std::int8_t state, bool visible) {
-                    if (ImGui::Button(label)) {
-                        g_directiveActionOccurrence = occurrenceRow;
-                        g_directiveActionSlot = slotRow;
-                        g_directiveActionHash = directive.nameHash;
-                        g_directiveActionElement = directive.elementIndex;
-                        g_directiveActionStatus = mission::set_directive(view,
-                                                                         occurrenceRow,
-                                                                         slotRow,
-                                                                         directive.nameHash,
-                                                                         directive.elementIndex,
-                                                                         state,
-                                                                         visible);
-                        g_hasDirectiveActionStatus = true;
-                    }
-                };
-                apply("Show", 0, true);
-                ImGui::SameLine();
-                apply("Complete", 1, true);
-                ImGui::SameLine();
-                apply("Alternate exit", 2, true);
-                ImGui::SameLine();
-                apply("Hide", 0, false);
-                ImGui::EndDisabled();
-                ImGui::SameLine();
-                ImGui::TextDisabled("%s", mission::status_name(available));
-                if (g_hasDirectiveActionStatus && g_directiveActionOccurrence == occurrenceRow
-                    && g_directiveActionSlot == slotRow
-                    && g_directiveActionHash == directive.nameHash
-                    && g_directiveActionElement == directive.elementIndex) {
-                    ImGui::TextDisabled("last: %s", mission::status_name(g_directiveActionStatus));
-                }
-                ImGui::Separator();
-                ImGui::PopID();
-                ImGui::PopID();
-                ImGui::PopID();
-                ImGui::PopID();
+                mission::directive_availability(view,
+                                                occurrenceRow,
+                                                directive.slotIndex,
+                                                directive.nameHash,
+                                                directive.elementIndex);
+            ImGui::PushID(static_cast<int>(occurrenceRow));
+            ImGui::PushID(static_cast<int>(directive.slotIndex));
+            ImGui::PushID(static_cast<int>(directive.nameHash));
+            ImGui::PushID(directive.elementIndex);
+            ImGui::Text("%.*s", print_length(title), title.data());
+            if (!description.empty()) {
+                ImGui::TextWrapped("%.*s", print_length(description), description.data());
             }
+            if (!progress.empty()) {
+                ImGui::TextWrapped("%.*s%s",
+                                   print_length(progress),
+                                   progress.data(),
+                                   (directive.flags & sdk::format::kDirectiveElementCounter) != 0
+                                       ? " (counter)"
+                                       : "");
+            }
+            ImGui::TextDisabled("hash %08X  element %d  slot %u",
+                                static_cast<unsigned>(directive.nameHash),
+                                directive.elementIndex,
+                                static_cast<unsigned>(directive.slotIndex));
+            ImGui::BeginDisabled(available != mission::SceneStatus::ready);
+            const auto apply = [&](const char* label, std::int8_t state, bool visible) {
+                if (ImGui::Button(label)) {
+                    g_directiveActionOccurrence = occurrenceRow;
+                    g_directiveActionSlot = directive.slotIndex;
+                    g_directiveActionHash = directive.nameHash;
+                    g_directiveActionElement = directive.elementIndex;
+                    g_directiveActionStatus = mission::set_directive(view,
+                                                                     occurrenceRow,
+                                                                     directive.slotIndex,
+                                                                     directive.nameHash,
+                                                                     directive.elementIndex,
+                                                                     state,
+                                                                     visible);
+                    g_hasDirectiveActionStatus = true;
+                }
+            };
+            apply("Show", 0, true);
+            ImGui::SameLine();
+            apply("Complete", 1, true);
+            ImGui::SameLine();
+            apply("Alternate exit", 2, true);
+            ImGui::SameLine();
+            apply("Hide", 0, false);
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            ImGui::TextDisabled("%s", mission::status_name(available));
+            if (g_hasDirectiveActionStatus && g_directiveActionOccurrence == occurrenceRow
+                && g_directiveActionSlot == directive.slotIndex
+                && g_directiveActionHash == directive.nameHash
+                && g_directiveActionElement == directive.elementIndex) {
+                ImGui::TextDisabled("last: %s", mission::status_name(g_directiveActionStatus));
+            }
+            ImGui::Separator();
+            ImGui::PopID();
+            ImGui::PopID();
+            ImGui::PopID();
+            ImGui::PopID();
         }
     }
     if (rows == 0) {

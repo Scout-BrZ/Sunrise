@@ -1,6 +1,8 @@
 /**
  * Turns the descriptors one placed object declares into the slots activity message 5 publishes.
- * Reads no package; the descriptor-chain walk owns that.
+ * Nothing here reads a package: the walk that follows a descriptor chain owns that, and this owns
+ * what the descriptors already say. Keeping the two apart is what lets the classification be
+ * checked without an installed content tree.
  */
 
 #include <algorithm>
@@ -46,7 +48,8 @@ bool fill_slots(RosterStorage& storage,
         return false;
     }
     const auto last = storage.slots.begin() + static_cast<std::ptrdiff_t>(storage.slotCount);
-    // Slots go out in ascending index order; the client reads each block independently.
+    // The client reads each block independently, but ascending order is what the captured bodies
+    // carry and it keeps a body diffable against them.
     std::sort(storage.slots.begin(), last, [](const SlotRecord& first, const SlotRecord& second) {
         return first.index < second.index;
     });

@@ -21,6 +21,9 @@ void present_result(IDXGISwapChain* swapChain, HRESULT result) noexcept;
 /** @return True only after every renderer and window resource is freed. */
 [[nodiscard]] bool shutdown() noexcept;
 
+/** @return True once a chosen swap chain has started all UI resources. */
+[[nodiscard]] bool active() noexcept;
+
 /**
  * Feeds one window message into the live Dear ImGui context.
  * @param message Win32 message ID.

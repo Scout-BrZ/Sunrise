@@ -8,16 +8,26 @@ namespace sunrise::state::activity::bubble_authority {
 
 /**
  * Renews released authority only when the client enters that bubble again.
+ * A named requester in a shared activity is granted a bubble only while it is that bubble's
+ * ambassador, and an ambassador whose bubble is held by another member's grant is granted it anew.
+ * A bubble the client gave up in the last `kReleaseSettleMs` is granted again only when the
+ * client arrives in it.
  * @param sessionId Joined activity session.
  * @param sliceSetIndex Slice set the client is in, or the destination's own.
- * @param grant Gets the bubble and its token.
- * @param enteringBubble Whether this snapshot enters a different held bubble.
+ * @param grant Gets the bubble, its token and the requester as its holder.
+ * @param enteringBubble Whether a bubble given up may be granted again now.
+ * @param requesterKey Member key of the link asking, or zero to grant as a lone client would.
+ * @param withheld Optional; set when the bubble is owed to another member's link.
+ * @param arriving Whether this snapshot is the one that enters the bubble.
  * @return True when a bubble is owed.
  */
 [[nodiscard]] bool select_grant(std::uint64_t sessionId,
                                 std::int32_t sliceSetIndex,
                                 Grant& grant,
-                                bool enteringBubble = false) noexcept;
+                                bool enteringBubble = false,
+                                std::uint64_t requesterKey = 0,
+                                bool* withheld = nullptr,
+                                bool arriving = false) noexcept;
 
 /**
  * Records a bubble as granted so it is not granted twice.
@@ -35,6 +45,15 @@ void record_grant(std::uint64_t sessionId, const Grant& grant) noexcept;
 void record_abdication(std::uint64_t sessionId,
                        std::uint8_t bubble,
                        const EntitySlotMask* mask = nullptr) noexcept;
+
+/**
+ * Keeps the entities a client abandoned in a bubble it left for the next client granted it.
+ * The bubble's grant is left as it is; the abdication that comes with it releases that.
+ * @param sessionId Joined activity session.
+ * @param bubble Bubble named by the accepted abandon.
+ * @param mask Abandoned entities, merged with earlier reports.
+ */
+void record_abandon(std::uint64_t sessionId, std::uint8_t bubble, const EntitySlotMask& mask) noexcept;
 
 /**
  * Copies the released entities awaiting a claim in one bubble.

@@ -54,6 +54,9 @@ void push_player_trigger(RuntimeInstance& instance, const host::Event& incident)
                          : std::string_view{});
     host::Event event = incident;
     event.kind = host::EventKind::playerTrigger;
+    // A fireteam member's crossing reaches the owner's program; like every derived edge, it
+    // carries the owner's generation from here on.
+    event.sourceGeneration = instance.view.activityClientGeneration;
     event.firstRegistryKey = source.registryKey;
     event.slotObjectTag = source.objectTag;
     event.firstSlotIndex = source.slotIndex;
@@ -123,6 +126,14 @@ void push_cinematic(RuntimeInstance& instance, const host::Event& incident) noex
     event.firstSlotIndex = source.slotIndex;
     event.firstSlotType = source.slotType;
     event.slotSenseSchema = 0;
+    auto& ending=instance.adieuEnding;
+    if(ending.matches(source.registryKey, source.slotType, source.slotIndex)) {
+        if(ending.attempt!=instance.attempt.generation || ending.generation!=instance.view.activityClientGeneration) return;
+        const unsigned code=signal==Signal::started ? 0U : signal==Signal::skipRequested ? 1U : 2U;
+        ending.incident(code,incident.tick);
+        // O controlador gera um unico termino final apos parar a segunda cinematic.
+        if(signal==Signal::terminated) return;
+    }
     push_script_event(instance, event);
 }
 

@@ -14,6 +14,25 @@
 
 namespace sunrise::server::bap::encrypted::push::snapshot {
 
+/** Builds the family-seven join descriptor naming this account's directory key. */
+[[nodiscard]] bool prepare_join_descriptor(Scratch& scratch,
+                                           const middleware::queuez::Subscription& subscription,
+                                           const Reservation& reservation,
+                                           Prepared& prepared) noexcept;
+
+/** Builds the family-six fireteam snapshot naming this account's fireteam directory key. */
+[[nodiscard]] bool prepare_fireteam(Scratch& scratch,
+                                    const middleware::queuez::Subscription& subscription,
+                                    const Reservation& reservation,
+                                    Prepared& prepared) noexcept;
+
+/** Builds the family-one equipment inspection snapshot for the subscribed root account, not
+    the connection's own. */
+[[nodiscard]] bool prepare_inspection(Scratch& scratch,
+                                      const middleware::queuez::Subscription& subscription,
+                                      const Reservation& reservation,
+                                      Prepared& prepared) noexcept;
+
 /** Initial family snapshots start at version zero. */
 inline constexpr std::int32_t kInitialFamilyVersion = 0;
 /** Family three carries the account roster selected by Web Service subscription. */
@@ -233,6 +252,15 @@ prepare_profile_item_acquisition(Scratch& scratch,
     const queuez::SessionState& before,
     std::int32_t amount,
     std::int32_t mutationSerial,
+    std::span<const queuez::AcquisitionPresentationRow> acquisitionPresentationRows,
+    Prepared& prepared) noexcept;
+
+/** Builds one package increment containing its new instances, character, and account objects. */
+[[nodiscard]] bool prepare_season_pass_package(
+    Scratch& scratch,
+    const queuez::SessionState& before,
+    const state::PendingDirectItemBundle& mutation,
+    std::uint16_t rewardIndex,
     std::span<const queuez::AcquisitionPresentationRow> acquisitionPresentationRows,
     Prepared& prepared) noexcept;
 

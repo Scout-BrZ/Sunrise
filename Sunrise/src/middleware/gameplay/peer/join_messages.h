@@ -16,7 +16,8 @@ enum class JoinId : std::uint8_t {
     refuse = 14,
 };
 
-/** Declared decoded size the registry holds for the refuse id. Each header must carry its own. */
+/** Declared decoded sizes the registry holds for those ids. Each header must carry its own. */
+inline constexpr std::uint32_t kJoinRequestSize = 6144;
 inline constexpr std::uint32_t kJoinRefuseSize = 24;
 
 /** Protocol version the host requires. A mismatch is dropped with no reply at all. */

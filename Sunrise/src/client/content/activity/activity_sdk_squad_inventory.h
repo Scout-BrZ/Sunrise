@@ -10,7 +10,6 @@
 
 #include "../../../state/activity_sdk/format.h"
 #include "activity_sdk_external_placements.h"
-#include "activity_sdk_spawn_reference.h"
 #include "activity_sdk_topology_inventory.h"
 
 namespace sunrise::client::content::activity::sdk_generation::squad_inventory {
@@ -23,16 +22,10 @@ using TagReader = bool (*)(void* context,
                            std::vector<std::byte>& bytes,
                            std::uint32_t& classId) noexcept;
 
-/** One validated actor definition supplies its identity and native spawn profile. */
-struct ResolvedActor final {
-    std::uint32_t actorClassIndex{format::kAbsentIndex};
-    std::array<std::int8_t, 4> authoredSpawnProfile{};
-};
-
-/** The actor inventory closes one exact definition tag to its validated row. */
+/** The actor inventory may close one exact definition tag to its final row index. */
 using ActorResolver = bool (*)(void* context,
                                std::uint32_t definitionTag,
-                               ResolvedActor& output) noexcept;
+                               std::uint32_t& actorClassIndex) noexcept;
 
 enum class CandidateState : std::uint8_t {
     nullPlacement,
@@ -91,8 +84,6 @@ struct SpawnerFact final {
     std::uint32_t secondaryComponentClass{};
     /** Set when the spawner carries its own point set instead of a type-66 reference. */
     bool hasInlinePointSet{};
-    /** Successful canonical parsing distinguishes absent from unread inline data. */
-    bool inlinePointSetInspected{};
     std::uint64_t inlinePointSetOffset{};
     std::uint64_t inlinePlacementComponentOffset{};
     std::uint32_t inlineInitialPointIndex{};
@@ -223,7 +214,6 @@ struct SquadMember final {
     std::uint32_t flags{};
     std::array<std::uint16_t, format::kSquadCandidateCountLaneCount> candidateCounts{};
     std::int32_t defaultCount{-1};
-    std::array<std::int8_t, 4> authoredSpawnProfile{};
     ActorLink actorLink{ActorLink::absent};
 };
 
@@ -281,5 +271,14 @@ struct GraphSnapshot;
                         ActorResolver actorResolver,
                         void* actorContext,
                         Snapshot& output) noexcept;
+
+/** Runs package extraction and linking without retaining an intermediate copy. */
+[[nodiscard]] bool build(const topology_inventory::Snapshot& topology,
+                         TagReader reader,
+                         void* readerContext,
+                         std::span<const SlotSchemaFact> slotSchemas,
+                         ActorResolver actorResolver,
+                         void* actorContext,
+                         Snapshot& output) noexcept;
 
 } // namespace sunrise::client::content::activity::sdk_generation::squad_inventory

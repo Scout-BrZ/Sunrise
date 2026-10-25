@@ -108,9 +108,7 @@ bool uninstall() noexcept {
     }
     ReleaseSRWLockExclusive(&g_lock);
 
-    if (!external_server::uninstall()) {
-        return false;
-    }
+    external_server::uninstall();
     investment::restore_lore_visibility();
     investment::restore_socket_menu_routing();
     if (!content_config::uninstall() || !wait_for_base_idle()) {

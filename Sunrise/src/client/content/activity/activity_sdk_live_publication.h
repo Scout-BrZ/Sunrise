@@ -38,7 +38,10 @@ using FinalizeOperation = bool (*)(void* context) noexcept;
 /** Allocates one writer-owned isolated stage beside the live pack. */
 [[nodiscard]] Status allocate(const wchar_t* finalPackPath, Stage& output) noexcept;
 
-/** Publishes Lua, pack, decoder pair, then catalog, retaining all backups through finalization. */
+/**
+ * Replaces only the owned Lua subtree, pack file, and catalog file, in that order. The catalog
+ * rename is the commit point. Any failure before finalization restores all previous owned paths.
+ */
 [[nodiscard]] Status publish(const Stage& stage,
                              const wchar_t* finalSdkDirectory,
                              const wchar_t* finalPackPath,

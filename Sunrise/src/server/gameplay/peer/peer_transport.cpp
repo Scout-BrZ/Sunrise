@@ -19,6 +19,26 @@ namespace wire = middleware::gameplay::peer;
 /** Bit position of the payload marker inside its first byte. */
 constexpr unsigned kMarkerShift = 7;
 
+/**
+ * Resolves the session a message that does not name one belongs to.
+ * A link carrying more than one session leaves it unresolved rather than guessing.
+ * @param peer Link the message arrived on.
+ * @return The session id, or zero when the link carries none or several.
+ */
+[[nodiscard]] std::uint64_t sole_session_locked(const gp::PeerLink& peer) noexcept {
+    std::uint64_t only = 0;
+    for (const std::uint64_t held : peer.sessions) {
+        if (held == 0) {
+            continue;
+        }
+        if (only != 0) {
+            return 0;
+        }
+        only = held;
+    }
+    return only;
+}
+
 } // namespace
 
 SRWLOCK g_lock{SRWLOCK_INIT};
@@ -76,7 +96,18 @@ void notify_external_outcomes(const DisplacedExternals& completed, std::size_t c
 void reset_transports(const std::uint64_t* sessions, std::size_t count) noexcept {
     if (g_lane0Transport.reset != nullptr) {
         for (std::size_t index = 0; index < count; ++index) {
-            g_lane0Transport.reset(g_lane0Transport.context, sessions[index]);
+            bool held = false;
+            AcquireSRWLockShared(&g_lock);
+            for (const auto& peer : g_peers) {
+                held = held
+                       || (peer.stage != gp::PeerStage::absent
+                           && (carries_locked(peer, sessions[index])
+                               || peer.externalGroupSessionId == sessions[index]));
+            }
+            ReleaseSRWLockShared(&g_lock);
+            if (!held) {
+                g_lane0Transport.reset(g_lane0Transport.context, sessions[index]);
+            }
         }
     }
 }
@@ -107,7 +138,8 @@ void reset_entity_source(const gp::entity_identity::Source& source) noexcept {
 
 /**
  * Copies the admitted source while its peer is locked.
- * @param peer Peer whose lifecycle is being read or changed.
+ * @param peer Peer whose lifecycle is
+ * being read or changed.
  * @return Exact current entity source.
  */
 gp::entity_identity::Source entity_source(const gp::PeerLink& peer) noexcept {
@@ -152,12 +184,16 @@ gp::PeerLink* find_session_locked(std::uint64_t sessionId) noexcept {
     if (sessionId == 0) {
         return nullptr;
     }
+    gp::PeerLink* found = nullptr;
     for (gp::PeerLink& peer : g_peers) {
         if (peer.stage != gp::PeerStage::absent && carries_locked(peer, sessionId)) {
-            return &peer;
+            if (found != nullptr) {
+                return nullptr;
+            }
+            found = &peer;
         }
     }
-    return nullptr;
+    return found;
 }
 
 /** @return Link whose authenticated external view names one group, or null. */
@@ -165,12 +201,25 @@ gp::PeerLink* find_external_group_locked(std::uint64_t groupSessionId) noexcept 
     if (groupSessionId == 0) {
         return nullptr;
     }
+    gp::PeerLink* found = nullptr;
     for (gp::PeerLink& peer : g_peers) {
         if (peer.stage != gp::PeerStage::absent && peer.externalGroupSessionId == groupSessionId) {
-            return &peer;
+            if (found != nullptr) {
+                return nullptr;
+            }
+            found = &peer;
         }
     }
-    return nullptr;
+    return found;
+}
+
+/** Resolves the session an out-of-band message at one endpoint belongs to. */
+std::uint64_t session_for_endpoint(const gp::Endpoint& from) noexcept {
+    AcquireSRWLockShared(&g_lock);
+    const gp::PeerLink* const peer = find_locked(from);
+    const std::uint64_t only = peer == nullptr ? 0 : sole_session_locked(*peer);
+    ReleaseSRWLockShared(&g_lock);
+    return only;
 }
 
 /** @return A free peer slot, or null. Callers already hold the lock. */
@@ -257,13 +306,11 @@ bool enqueue_reliable(std::uint64_t sessionId,
                       std::size_t bodyBits) noexcept {
     AcquireSRWLockExclusive(&g_lock);
     gp::PeerLink* peer = find_session_locked(sessionId);
-    const bool queued =
-        peer != nullptr && wire::enqueue_message(peer->outbound, id, declaredSize, body, bodyBits);
+    const bool queued = peer != nullptr && peer->establishQueued
+                        && wire::enqueue_message(peer->outbound, id, declaredSize, body, bodyBits);
     if (queued) {
         // The next service slice carries it, so the acknowledgement path also flushes sends.
         peer->acknowledgementOwed = true;
-        // The queue changed, so the packet it was stamped against no longer carries all of it.
-        peer->outbound.awaitingAcknowledgement = false;
     }
     ReleaseSRWLockExclusive(&g_lock);
     return queued;
@@ -277,11 +324,10 @@ bool enqueue_reliable(const gp::Endpoint& endpoint,
                       std::size_t bodyBits) noexcept {
     AcquireSRWLockExclusive(&g_lock);
     gp::PeerLink* peer = find_locked(endpoint);
-    const bool queued =
-        peer != nullptr && wire::enqueue_message(peer->outbound, id, declaredSize, body, bodyBits);
+    const bool queued = peer != nullptr && peer->establishQueued
+                        && wire::enqueue_message(peer->outbound, id, declaredSize, body, bodyBits);
     if (queued) {
         peer->acknowledgementOwed = true;
-        peer->outbound.awaitingAcknowledgement = false;
     }
     ReleaseSRWLockExclusive(&g_lock);
     return queued;
@@ -293,6 +339,20 @@ bool remote_address(std::uint64_t sessionId,
     AcquireSRWLockShared(&g_lock);
     const gp::PeerLink* peer = find_session_locked(sessionId);
     const bool present = peer != nullptr && peer->remoteAddressPresent;
+    if (present) {
+        output = peer->remoteAddress;
+    }
+    ReleaseSRWLockShared(&g_lock);
+    return present;
+}
+
+bool remote_address(const gp::Endpoint& endpoint,
+                    std::uint64_t sessionId,
+                    std::array<std::byte, gp::kNetAddrBlobSize>& output) noexcept {
+    AcquireSRWLockShared(&g_lock);
+    const auto* peer = find_locked(endpoint);
+    const bool present =
+        peer != nullptr && carries_locked(*peer, sessionId) && peer->remoteAddressPresent;
     if (present) {
         output = peer->remoteAddress;
     }
@@ -591,14 +651,15 @@ bool link_identity(std::uint64_t sessionId, LinkIdentity& output) noexcept {
     return present;
 }
 
-/** Drops one group session, leaving the link and its other sessions alone. */
-void drop(std::uint64_t sessionId) noexcept {
+namespace {
+void drop_link(const gp::Endpoint* endpoint, std::uint64_t sessionId) noexcept {
     DisplacedExternals displaced{};
     std::size_t displacedCount = 0;
     gp::entity_identity::Source resetSource{};
     AcquireSRWLockExclusive(&g_lock);
-    gp::PeerLink* const peer = find_session_locked(sessionId);
-    if (peer != nullptr) {
+    gp::PeerLink* const peer =
+        endpoint != nullptr ? find_locked(*endpoint) : find_session_locked(sessionId);
+    if (peer != nullptr && carries_locked(*peer, sessionId)) {
         if (peer->externalGroupSessionId == sessionId) {
             resetSource = entity_source(*peer);
             invalidate_entity_identity_locked(resetSource);
@@ -624,6 +685,16 @@ void drop(std::uint64_t sessionId) noexcept {
     notify_external_outcomes(displaced, displacedCount);
     reset_transports(sessionId);
     reset_entity_source(resetSource);
+}
+} // namespace
+
+/** Drops one unambiguously owned group, leaving other groups on its link alone. */
+void drop(std::uint64_t sessionId) noexcept {
+    drop_link(nullptr, sessionId);
+}
+
+void drop(const gp::Endpoint& endpoint, std::uint64_t sessionId) noexcept {
+    drop_link(&endpoint, sessionId);
 }
 
 /** Drops every link at one endpoint, which is what a connect-closed names. */

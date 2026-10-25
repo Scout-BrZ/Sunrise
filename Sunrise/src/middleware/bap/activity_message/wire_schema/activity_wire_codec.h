@@ -21,13 +21,6 @@ namespace runtime {
 
 /** Row index meaning "no row"; the SDK never numbers a real row this high. */
 inline constexpr std::uint32_t kAbsentRuntimeRow = 0xFFFFFFFFU;
-/** Field type 1 walks one nested schema row. */
-inline constexpr std::uint8_t kNestedType = 1;
-/** Field type 34 carries its schema handle and reads through the selected-schema reader. */
-inline constexpr std::uint8_t kSelectedType = 34;
-/** Field types 12 and 35 are raw 64-bit words, read and written whole. */
-inline constexpr std::uint8_t kRaw64AliasType = 12;
-inline constexpr std::uint8_t kRaw64Type = 35;
 
 /** One runtime schema row supplied by the generated Activity SDK. */
 struct SchemaView final {
@@ -316,5 +309,7 @@ edit(PacketDraft& draft, std::uint16_t fieldIndex, std::uint32_t element, ValueR
                                         std::uint32_t schemaRow,
                                         std::uint32_t fieldRow,
                                         std::uint32_t occurrence) noexcept;
+
+[[nodiscard]] const char* codec_status_name(CodecStatus status) noexcept;
 
 } // namespace sunrise::middleware::bap::activity_message::wire_schema

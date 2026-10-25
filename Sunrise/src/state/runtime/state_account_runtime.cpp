@@ -8,6 +8,7 @@
 
 #include "../../core/logging/log.h"
 #include "../../middleware/datagen/family4/loadout/loadout_resolver.h"
+#include "../account/public_profiles.h"
 #include "../build_data/runtime.h"
 #include "../investment/store_internal.h"
 #include "runtime.h"
@@ -147,6 +148,7 @@ namespace socket_lists = build_data::socket_entry_lists;
     mutation.accountSoid = snapshot.primarySoid;
     mutation.characterSoid = before.soid;
     mutation.subclassInstanceSoid = subclassInstanceSoid;
+    mutation.subclassDefinitionHash = subclassDefinition.definitionHash;
     mutation.characterIndex = characterIndex;
     mutation.subclassDefinitionIndex = subclassDefinition.definitionIndex;
     mutation.socketEntryListIndex = detail.socketEntryListIndex;
@@ -228,6 +230,7 @@ bool set_selected_character(std::uint64_t characterSoid) noexcept {
         return false;
     }
 
+    const bool alreadySelected = candidate.characters[picked].selected;
     for (CharacterState& character : candidate.characters) {
         character.selected = false;
     }
@@ -242,6 +245,9 @@ bool set_selected_character(std::uint64_t characterSoid) noexcept {
     }
     investment::store::g_mutex.unlock();
     (void)seed_seasonal_progression();
+    if (!alreadySelected) {
+        account::profiles::local_changed();
+    }
     return true;
 }
 
@@ -286,7 +292,7 @@ bool set_selected_title(std::uint16_t recordIndex,
 bool prepare_equipment_swap(std::uint64_t requestedInstanceSoid,
                             PendingEquipmentSwap& mutation) noexcept {
     mutation = {};
-    const AccountState account = account_snapshot();
+    const AccountState account = bound_account_snapshot();
     if (requestedInstanceSoid == 0 || !account::valid(account)) {
         return false;
     }
@@ -400,6 +406,7 @@ bool prepare_equipment_swap(std::uint64_t requestedInstanceSoid,
     mutation.characterIndex = characterIndex;
     mutation.equipmentSlotIndex = equipmentSlotIndex;
     mutation.inventoryIndex = inventoryIndex;
+    mutation.movedItemCount = movedItemCount;
     mutation.nativeEquipmentSlot = requestedNativeSlot;
     mutation.kind = EquipmentMutationKind::equip;
     mutation.prepared = true;
@@ -410,7 +417,7 @@ bool prepare_equipment_swap(std::uint64_t requestedInstanceSoid,
 bool prepare_equipment_unequip(std::uint64_t requestedInstanceSoid,
                                PendingEquipmentSwap& mutation) noexcept {
     mutation = {};
-    const AccountState account = account_snapshot();
+    const AccountState account = bound_account_snapshot();
     if (requestedInstanceSoid == 0 || !account::valid(account)) {
         return false;
     }
@@ -504,6 +511,7 @@ bool prepare_equipment_unequip(std::uint64_t requestedInstanceSoid,
     mutation.characterIndex = characterIndex;
     mutation.equipmentSlotIndex = equipmentSlotIndex;
     mutation.inventoryIndex = inventoryIndex;
+    mutation.movedItemCount = movedItemCount;
     mutation.nativeEquipmentSlot = requestedNativeSlot;
     mutation.kind = EquipmentMutationKind::unequip;
     mutation.prepared = true;
@@ -565,12 +573,10 @@ bool commit_equipment_swap(PendingEquipmentSwap& mutation) noexcept {
     return true;
 }
 
-/** @return A copy of the active account state, read under the lock. */
-AccountState account_snapshot() noexcept {
-    investment::store::g_mutex.lock();
-    const AccountState snapshot = investment::store::account();
-    investment::store::g_mutex.unlock();
-    return snapshot;
+AccountState bound_account_snapshot() noexcept {
+    AccountState output{};
+    (void)bound_account_snapshot(output);
+    return output;
 }
 
 /** Grants each character the other 2 subclasses of its equipped subclass's class. */

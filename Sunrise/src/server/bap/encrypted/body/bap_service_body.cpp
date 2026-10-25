@@ -4,6 +4,7 @@
 #include <limits>
 
 #include "../../../../core/logging/log.h"
+#include "../../../../core/settings/settings.h"
 #include "../../../../middleware/bap/account_translation/account_translation_response.h"
 #include "../../../../middleware/bap/activity_host/activity_host_response.h"
 #include "../../../../middleware/bap/certificate.h"
@@ -18,7 +19,6 @@
 #include "../../../gameplay/group/group_host_sessions.h"
 #include "../../../web_service/opcode_routes.h"
 #include "../../../web_service/web_service_runtime.h"
-#include "../../runtime.h"
 #include "../activity_host_manager/activity_host_manager_route.h"
 #include "../activity_message/activity_message_route.h"
 #include "../internal.h"
@@ -41,7 +41,6 @@ std::atomic<std::uint64_t> g_translatedIdentity{0};
     sunrise::server::web_service::resolve_response_shape(message.opcode, shape);
     middleware::web_service::StatusResponse status{};
     status.code = 1;
-    status.value = middleware::web_service::kNoFamily4Publication;
     return middleware::web_service::encode_response(message, shape, status, output, written);
 }
 
@@ -83,8 +82,19 @@ bool process(const ServiceRoute& route,
     case BodyCodec::empty:
         written = 0;
         return true;
+    case BodyCodec::registerRelayClient:
+        outcome.hasRelayRegistration = true;
+        written = 0;
+        return true;
+    case BodyCodec::initiateRelayConnection: {
+        written = 0;
+        middleware::bap::nat_relay::InitiateRelayConnection request{};
+        if (middleware::bap::nat_relay::decode_initiate(requestBody, request)) {
+            outcome.relayInitiate = request;
+        }
+        return true;
+    }
     case BodyCodec::accountTranslationResponse: {
-        const state::AccountState account = state::account_snapshot();
         std::uint64_t identity = 0;
         server::gameplay::group::HostSessionBinding host{};
         const bool parsed =
@@ -99,11 +109,18 @@ bool process(const ServiceRoute& route,
             parsed && identity != 0
             && server::gameplay::group::host_session_for_activity(identity, host)
             && host.target.sessionId == identity;
+        state::AccountHandle identityAccount = state::kInvalidAccount;
+        const bool legacyPairing = core::settings::role() == core::settings::Role::embedded
+                                   && !core::settings::get().server.upstream.enabled;
         const bool accountIdentity =
-            parsed && identity != 0 && !logicalHost && pairs_identity(identity);
+            parsed && identity != 0 && !logicalHost
+            && (legacyPairing
+                    ? pairs_identity(identity)
+                          && (identityAccount = state::bound_account()) != state::kInvalidAccount
+                    : state::account_handle_for_identity(identity, identityAccount));
         const std::uint64_t soid = zeroHandle        ? liveSession
                                    : logicalHost     ? host.target.sessionId
-                                   : accountIdentity ? account.primarySoid
+                                   : accountIdentity ? state::account_primary_soid(identityAccount)
                                                      : 0;
         std::array<char, core::log::kLineCapacity> line{};
         const int count = std::snprintf(line.data(),
@@ -131,7 +148,7 @@ bool process(const ServiceRoute& route,
         }
         bool hasAllocation = false;
         const bool encoded = activity_host_manager::encode_response(
-            requestBody, output, written, *allocation, hasAllocation);
+            requestBody, output, written, *allocation, hasAllocation, outcome.startupReservations);
         if (!encoded || !hasAllocation) {
             clear_transaction(outcome);
         }
@@ -146,6 +163,7 @@ bool process(const ServiceRoute& route,
         bool hasTransaction = false;
         const bool processed =
             activity_message::process(activity, rosterDecode, requestBody, *plan, hasTransaction);
+        outcome.hasRelayConnectivityFailure = processed && plan->hasRelayConnectivityFailure;
         if (!processed || !hasTransaction) {
             clear_transaction(outcome);
         }
@@ -204,6 +222,9 @@ bool process(const ServiceRoute& route,
                 return refuse_web_action(message, output, written);
             }
             outcome.hasChangeCharacter = true;
+            // Character selection clears the native cache without another WS702 report.
+            // Withdraw the old report only when this transition's response commits.
+            outcome.nativePresence = state::social::NativePresence{};
             return true;
         }
         state::investment::store::Transaction investmentTransaction;
@@ -235,25 +256,8 @@ bool process(const ServiceRoute& route,
             }
             sunrise::server::bap::arm_account_resync_everywhere();
         }
-        if (webOutcome.hasRosterChange) {
-            // Name the revision the account resync below publishes; it carries the new roster.
-            if (queuezState.family4Active
-                && queuezState.family4Version != (std::numeric_limits<std::int32_t>::max)()
-                && !sunrise::server::web_service::encode_roster_reply(
-                    message, queuezState.family4Version + 1, webOutcome, output, written)) {
-                core::log::write(core::log::Channel::server,
-                                 core::log::Level::warn,
-                                 "ev=roster stage=response result=fail");
-                // Returning before the commit drops the change with this transaction.
-                return false;
-            }
-            sunrise::server::bap::arm_account_resync_everywhere();
-            if (webOutcome.createdCharacterSoid != 0) {
-                // One more refresh slice builds the ability rows of the new character's subclass.
-                sunrise::server::bap::request_investment_slice();
-            }
-        }
         outcome.hasSubscription = webOutcome.hasSubscription;
+        outcome.nativePresence = webOutcome.nativePresence;
         outcome.hasRecordClaim = webOutcome.hasRecordClaim;
         outcome.hasArtifactReset = webOutcome.hasArtifactReset;
         outcome.artifactReset = webOutcome.artifactReset;
@@ -549,9 +553,22 @@ bool process(const ServiceRoute& route,
         }
         if (recordRewardGrant != nullptr) {
             auto* transaction = emplace_transaction<RecordRewardGrantTransaction>(outcome);
-            const bool staged = transaction != nullptr
-                                && queuez::stage_record_reward_grant(
-                                    queuezState, *recordRewardGrant, transaction->update);
+            std::array<std::uint64_t, state::kRecordRewardGrantCapacity> residents{};
+            std::size_t residentCount = 0;
+            for (std::size_t index = 0; index < recordRewardGrant->rewardCount; ++index) {
+                const auto& reward = recordRewardGrant->rewards[index];
+                if (reward.kind == state::RecordRewardKind::characterInstance
+                    || reward.appendedProfileResident) {
+                    residents[residentCount++] = reward.instanceSoid;
+                }
+            }
+            const bool staged =
+                transaction != nullptr
+                && queuez::stage_record_reward_grant(queuezState,
+                                                     recordRewardGrant->accountSoid,
+                                                     recordRewardGrant->characterSoid,
+                                                     std::span(residents).first(residentCount),
+                                                     transaction->update);
             if (!staged) {
                 core::log::write(core::log::Channel::server,
                                  core::log::Level::warn,
@@ -584,9 +601,43 @@ bool process(const ServiceRoute& route,
                                  "ev=ws2400 stage=reward_preflight result=fail");
                 return refuse_web_action(message, output, written);
             }
-            const bool staged = queuez::stage_record_reward_grant(
-                queuezState, seasonPassReward->grant, transaction->update);
-            const auto stagedVersion = transaction->update.after.family4Version;
+            bool staged = false;
+            std::int32_t stagedVersion = 0;
+            if (const auto* itemGrant =
+                    std::get_if<state::PendingItemAcquisition>(&seasonPassReward->grant)) {
+                auto& update = transaction->update.emplace<queuez::ItemAcquisition>();
+                staged = queuez::stage_item_acquisition(queuezState,
+                                                        itemGrant->accountSoid,
+                                                        itemGrant->characterSoid,
+                                                        itemGrant->acquiredInstanceSoid,
+                                                        true,
+                                                        update);
+                stagedVersion = update.after.family4Version;
+            } else if (const auto* profileGrant = std::get_if<state::PendingProfileItemAcquisition>(
+                           &seasonPassReward->grant)) {
+                auto& update = transaction->update.emplace<queuez::ProfileItemAcquisition>();
+                staged = queuez::stage_profile_item_acquisition(queuezState,
+                                                                profileGrant->accountSoid,
+                                                                profileGrant->acquiredInstanceSoid,
+                                                                profileGrant->actionSource,
+                                                                profileGrant->appended,
+                                                                update);
+                stagedVersion = update.after.family4Version;
+            } else if (const auto* bundle =
+                           std::get_if<state::PendingDirectItemBundle>(&seasonPassReward->grant)) {
+                staged = queuez::stage_direct_item_bundle(queuezState,
+                                                          bundle->accountSoid,
+                                                          bundle->characterSoid,
+                                                          bundle->firstInstanceSoid,
+                                                          bundle->itemCount,
+                                                          stagedVersion);
+            } else if (const auto* resources =
+                           std::get_if<state::PendingRecordRewardGrant>(&seasonPassReward->grant)) {
+                auto& update = transaction->update.emplace<queuez::RecordRewardGrant>();
+                staged = queuez::stage_record_reward_grant(
+                    queuezState, resources->accountSoid, resources->characterSoid, {}, update);
+                stagedVersion = update.after.family4Version;
+            }
             if (!staged) {
                 core::log::write(core::log::Channel::server,
                                  core::log::Level::warn,

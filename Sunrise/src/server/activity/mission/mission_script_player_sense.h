@@ -47,16 +47,61 @@ struct PlayerLifeObservation final {
     bool loaded{};
     bool settled{};
     bool ghost{};
+    std::uint64_t lifeRevision{}; // Ordem do ultimo informe explicito de Ghost.
 
-    /** Dead means loaded, settled and showing the Ghost. Anything incomplete is unknown. */
+    // A vida usa identidade, carregamento e Ghost; a regiao pode nao vir no delta.
+    // O host valida separadamente a regiao antes de autorizar restart_checkpoint.
+    // Settled continua obrigatorio para vivo, mas nao bloqueia uma morte confirmada.
     [[nodiscard]] PlayerLife life() const noexcept {
-        if (seen != kLifeSeenAll || playerKey == 0 || playerKey == kInvalidPlayerKey || region < 0
-            || region > kMaximumLifeRegion || !loaded || !settled) {
+        constexpr std::uint8_t required =
+            kLifeSeenKey | kLifeSeenLoaded | kLifeSeenGhost;
+        if ((seen & required) != required || playerKey == 0 || playerKey == kInvalidPlayerKey
+            || !loaded) {
             return PlayerLife::unknown;
         }
-        return ghost ? PlayerLife::dead : PlayerLife::alive;
+        if (ghost) {
+            return PlayerLife::dead;
+        }
+        if ((seen & kLifeSeenSettled) == 0 || !settled) {
+            return PlayerLife::unknown;
+        }
+        return PlayerLife::alive;
     }
 };
+
+// Usa o informe de Ghost mais recente; registros anteriores podem conservar a morte.
+// Um empate conflitante ou um informe recente incompleto continua desconhecido.
+[[nodiscard]] inline PlayerLife
+resolve_player_life(std::span<const PlayerLifeObservation> levels, std::uint64_t playerKey) noexcept {
+    if (playerKey == 0 || playerKey == kInvalidPlayerKey) {
+        return PlayerLife::unknown;
+    }
+    std::uint64_t latest = 0;
+    for (const auto& level : levels) {
+        if (level.playerKey == playerKey && level.lifeRevision > latest) {
+            latest = level.lifeRevision;
+        }
+    }
+    PlayerLife result = PlayerLife::unknown;
+    bool found = false;
+    for (const auto& level : levels) {
+        if (level.playerKey != playerKey || level.lifeRevision != latest) {
+            continue;
+        }
+        const PlayerLife observed = level.life();
+        if (observed == PlayerLife::unknown) {
+            // Sem uma ordem recebida, registros vazios nao ocultam registros completos.
+            if (latest == 0) { continue; }
+            return PlayerLife::unknown;
+        }
+        if (found && result != observed) {
+            return PlayerLife::unknown;
+        }
+        result = observed;
+        found = true;
+    }
+    return result;
+}
 
 /** State fields a participation report carries besides the key. */
 inline constexpr std::uint8_t kLifeSeenState =

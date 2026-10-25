@@ -12,6 +12,11 @@ constexpr std::uint8_t kSlotTypeParticipation = 13;
 /** The participation region rides a signed field, so this is the widest index it accepts. */
 constexpr std::uint32_t kMaximumRegion = 0x7FFFFFFF;
 
+/** @return True when the packed counts and body width close one complete type-43 shape. */
+/**
+ * @return True when an SDK-compiled body has one exact, non-truncated physical extent.
+ * This arm pins no slot type and no schema, so it refuses every slot type with a faulting lane.
+ */
 /**
  * Checks the per-bubble sub-blocks against what the client's own arrays hold.
  * An empty sub-block would publish a zero count and a zero mask, which registers nothing and
@@ -166,7 +171,9 @@ constexpr std::uint32_t kMaximumRegion = 0x7FFFFFFF;
     for (std::size_t index = 0; index < snapshot.authOverrides.size(); ++index) {
         const AuthOverride& value = snapshot.authOverrides[index];
         const std::size_t requiredBytes = (value.bitCount + 7U) / 8U;
-        // The body's own encoder owns its shape. Check only the row's own consistency.
+        // A body's shape is not re-derived here: its own encoder owns it, and a second copy of
+        // that sum drifted once and refused every squad body Sunrise sent. Only the row's own
+        // consistency is checked, which no encoder owns.
         if (!value.present || value.byteCount != requiredBytes
             || requiredBytes > value.body.size()) {
             return false;
@@ -230,6 +237,39 @@ constexpr std::uint32_t kMaximumRegion = 0x7FFFFFFF;
             return false;
         }
     }
+    if (snapshot.participationSeatCount > snapshot.participationSeats.size()
+        || (snapshot.hasScoreboard && !scoreboard_record::valid(snapshot.scoreboard))) {
+        return false;
+    }
+    for (std::size_t seat = 0; seat < snapshot.participationSeatCount; ++seat) {
+        const auto& value = snapshot.participationSeats[seat];
+        if (!snapshot.perMemberParticipation || value.playerKey == 0) {
+            return false;
+        }
+        std::size_t matches = 0;
+        for (std::size_t group = 0; group < snapshot.roster.groupCount; ++group) {
+            const auto& row = snapshot.roster.groups[group];
+            if (row.retired || row.key != snapshot.roster.playerKeyGroup) {
+                continue;
+            }
+            for (std::size_t slot = 0; slot < row.slotTypes.size(); ++slot) {
+                if (row.slotTypes[slot] == kSlotTypeParticipation
+                    && row.slotIndices[slot] == value.slotIndex
+                    && (row.slotFlags[slot] & kSlotAuthFlag) != 0) {
+                    ++matches;
+                }
+            }
+        }
+        if (matches != 1) {
+            return false;
+        }
+        for (std::size_t prior = 0; prior < seat; ++prior) {
+            if (snapshot.participationSeats[prior].playerKey == value.playerKey
+                || snapshot.participationSeats[prior].slotIndex == value.slotIndex) {
+                return false;
+            }
+        }
+    }
     return valid_client_sets(snapshot.roster);
 }
 
@@ -255,9 +295,21 @@ constexpr std::uint32_t kMaximumRegion = 0x7FFFFFFF;
         for (std::size_t slot = 0; encoded && slot < row.slotTypes.size(); ++slot) {
             const std::uint8_t slotType = row.slotTypes[slot];
             const bool firstOrEvery = !keyPlaced || snapshot.keyOnEveryParticipationSlot;
-            const bool carriesPlayerKey = slotType == kSlotTypeParticipation
-                                          && row.key == snapshot.roster.playerKeyGroup
-                                          && firstOrEvery;
+            bool carriesPlayerKey = slotType == kSlotTypeParticipation
+                                    && row.key == snapshot.roster.playerKeyGroup && firstOrEvery;
+            std::uint64_t playerKey = snapshot.playerKey;
+            if (snapshot.perMemberParticipation) {
+                playerKey = 0;
+                if (slotType == kSlotTypeParticipation
+                    && row.key == snapshot.roster.playerKeyGroup) {
+                    for (std::size_t seat = 0; seat < snapshot.participationSeatCount; ++seat) {
+                        if (snapshot.participationSeats[seat].slotIndex == row.slotIndices[slot]) {
+                            playerKey = snapshot.participationSeats[seat].playerKey;
+                        }
+                    }
+                }
+                carriesPlayerKey = playerKey != 0;
+            }
             keyPlaced = keyPlaced || carriesPlayerKey;
             encoded = write_object_block(writer,
                                          snapshot,
@@ -267,7 +319,8 @@ constexpr std::uint32_t kMaximumRegion = 0x7FFFFFFF;
                                          row.slotIndices[slot],
                                          row.slotFlags[slot],
                                          row.missionSeedOnly,
-                                         carriesPlayerKey);
+                                         carriesPlayerKey,
+                                         playerKey);
         }
         encoded = encoded && writer.write(0, kPresenceWidth);
     }

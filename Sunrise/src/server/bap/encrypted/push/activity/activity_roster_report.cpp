@@ -147,7 +147,7 @@ void report_roster_push(Session& session,
                       "sceneempty=%zu engageempty=%zu "
                       "keygroup=0x%X grant=%d region=%u slice=%u spawn=0x%X join=0x%llX "
                       "player=0x%llX pending_region=%d current_region=%d client_bubble=%d held=%d "
-                      "entered=%d selected=%d hash=0x%016llX force=0x%02X",
+                      "selected=%d hash=0x%016llX force=0x%02X",
                       kOutcomeNames[static_cast<std::size_t>(outcome)],
                       static_cast<unsigned long long>(session.activity.session.sessionId),
                       session.activity.role == ActivityClientRole::publicTarget ? 1U : 0U,
@@ -183,8 +183,6 @@ void report_roster_push(Session& session,
                       placement.currentRegion,
                       placement.bubble,
                       state::activity::membership::instantiated_region(placement),
-                      // Entry is both reports together: the write-back, and a held region.
-                      placement.clientInWorld && placement.currentRegion >= 0 ? 1 : 0,
                       session.activityMissionSeed.scriptSelected ? 1 : 0,
                       static_cast<unsigned long long>(bodyHash),
                       static_cast<unsigned>(forced));
@@ -212,7 +210,7 @@ void report_roster_push(Session& session,
                           group.hasStateSequence ? 1U : 0U);
         if (groupWritten > 0) {
             core::log::write(core::log::Channel::server,
-                             core::log::Level::trace,
+                             core::log::Level::debug,
                              {line.data(), static_cast<std::size_t>(groupWritten)});
         }
     }
@@ -226,7 +224,7 @@ void report_roster_push(Session& session,
                               key);
             if (keyWritten > 0) {
                 core::log::write(core::log::Channel::server,
-                                 core::log::Level::trace,
+                                 core::log::Level::debug,
                                  {line.data(), static_cast<std::size_t>(keyWritten)});
             }
         }
@@ -248,7 +246,7 @@ void report_roster_push(Session& session,
                           static_cast<unsigned long long>(body_hash(body)));
         if (authWritten > 0) {
             core::log::write(core::log::Channel::server,
-                             core::log::Level::trace,
+                             core::log::Level::debug,
                              {line.data(), static_cast<std::size_t>(authWritten)});
         }
     }

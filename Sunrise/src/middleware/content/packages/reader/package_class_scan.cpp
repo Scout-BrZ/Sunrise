@@ -6,7 +6,6 @@
 #include <span>
 
 #include "internal.h"
-#include "overlay.h"
 
 namespace sunrise::middleware::content::packages::reader {
 namespace {
@@ -53,7 +52,7 @@ using SeenSet = std::array<std::uint64_t, kSeenWords>;
 
 /**
  * Reports the matching entries of one package's highest patch.
- * @param source Installed packages directory and read mode.
+ * @param directory Installed packages directory.
  * @param packageId Package id to scan.
  * @param classId Tag class to report.
  * @param visitor Tag consumer.
@@ -61,7 +60,7 @@ using SeenSet = std::array<std::uint64_t, kSeenWords>;
  * @param result Receives this package's totals.
  * @return True when the header, the whole entry table and every visitor call work.
  */
-[[nodiscard]] bool scan_package(const Source& source,
+[[nodiscard]] bool scan_package(std::wstring_view directory,
                                 std::uint16_t packageId,
                                 std::uint32_t classId,
                                 ClassEntryVisitor visitor,
@@ -69,7 +68,7 @@ using SeenSet = std::array<std::uint64_t, kSeenWords>;
                                 ScanResult& result) noexcept {
     Path stem{};
     std::uint32_t patchIndex = 0;
-    if (!find_latest(source.directory, source.installedOnly, packageId, stem, patchIndex)) {
+    if (!find_latest(directory, packageId, stem, patchIndex)) {
         return false;
     }
     const std::wstring_view fullStem(stem.chars.data());
@@ -82,8 +81,8 @@ using SeenSet = std::array<std::uint64_t, kSeenWords>;
     Path path{};
     std::array<std::byte, layout::kHeaderSize> headerBytes{};
     Header header{};
-    if (!build_path(stem, packageId, patchIndex, source.installedOnly, path)
-        || !read_at(path, 0, headerBytes) || !parse_header(headerBytes, header)) {
+    if (!build_path(stem, patchIndex, path) || !read_at(path, 0, headerBytes)
+        || !parse_header(headerBytes, header)) {
         return false;
     }
     // A larger table would produce entry indices that no tag handle can address.
@@ -121,21 +120,21 @@ using SeenSet = std::array<std::uint64_t, kSeenWords>;
 }
 
 /** Adapts a tag-only visitor to the detailed entry callback. */
-struct TagOnlyVisitor {
+struct LegacyVisitor {
     ClassVisitor visitor{};
     void* context{};
 };
 
 /** @param context Tag-only visitor. @param entry Detailed match. @return Visitor outcome. */
-[[nodiscard]] bool visit_tag_only(void* context, const ClassEntry& entry) noexcept {
-    const auto& adapter = *static_cast<const TagOnlyVisitor*>(context);
-    return adapter.visitor(adapter.context, entry.tag);
+[[nodiscard]] bool visit_legacy(void* context, const ClassEntry& entry) noexcept {
+    const auto& legacy = *static_cast<const LegacyVisitor*>(context);
+    return legacy.visitor(legacy.context, entry.tag);
 }
 
 } // namespace
 
 /** Reports every installed entry of one tag class. */
-bool scan_class(const Source& source,
+bool scan_class(std::wstring_view directory,
                 std::uint32_t classId,
                 ClassVisitor visitor,
                 void* context,
@@ -144,22 +143,22 @@ bool scan_class(const Source& source,
     if (visitor == nullptr) {
         return false;
     }
-    TagOnlyVisitor adapter{visitor, context};
-    return scan_class_entries(source, classId, &visit_tag_only, &adapter, result);
+    LegacyVisitor legacy{visitor, context};
+    return scan_class_entries(directory, classId, &visit_legacy, &legacy, result);
 }
 
 /** Reports every installed entry of one tag class with its package family. */
-bool scan_class_entries(const Source& source,
+bool scan_class_entries(std::wstring_view directory,
                         std::uint32_t classId,
                         ClassEntryVisitor visitor,
                         void* context,
                         ScanResult& result) noexcept {
     result = {};
-    if (source.directory.empty() || visitor == nullptr) {
+    if (directory.empty() || visitor == nullptr) {
         return false;
     }
     Path search{};
-    if (!search_pattern(source.directory, search)) {
+    if (!search_pattern(directory, search)) {
         return false;
     }
     WIN32_FIND_DATAW found{};
@@ -180,7 +179,7 @@ bool scan_class_entries(const Source& source,
         if (!parse_leaf(found.cFileName, packageId, patchIndex) || !claim(seen, packageId)) {
             continue;
         }
-        if (!scan_package(source, packageId, classId, visitor, context, result)) {
+        if (!scan_package(directory, packageId, classId, visitor, context, result)) {
             complete = false;
             break;
         }
@@ -188,17 +187,7 @@ bool scan_class_entries(const Source& source,
     if (complete && GetLastError() != ERROR_NO_MORE_FILES) {
         complete = false;
     }
-    complete = FindClose(enumeration) != FALSE && complete;
-    if (source.installedOnly) {
-        return complete;
-    }
-    // A package only a mod adds has no installed file to enumerate.
-    for (const overlay::File& file : overlay::files()) {
-        if (complete && claim(seen, file.packageId)) {
-            complete = scan_package(source, file.packageId, classId, visitor, context, result);
-        }
-    }
-    return complete;
+    return FindClose(enumeration) != FALSE && complete;
 }
 
 } // namespace sunrise::middleware::content::packages::reader

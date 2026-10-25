@@ -1,15 +1,10 @@
 #include "definition_index_table.h"
 
+#include <cstring>
 #include <limits>
-
-#include "../reader/layout.h"
-#include "field_reader.h"
 
 namespace sunrise::middleware::content::packages::tables {
 namespace {
-
-/** A descriptor names a typed array header; its marker sits before it and its data after it. */
-using Header = reader::layout::TypedArrayHeader;
 
 /** The globals container names its children after its 8-byte prefix and first field. */
 constexpr std::size_t kChildTableOffset = 16;
@@ -21,7 +16,12 @@ constexpr std::size_t kChildStride = 16;
 constexpr std::size_t kContainerPrefix = 8;
 /** Array descriptors are a count and a self-relative offset pair. */
 constexpr std::size_t kDescriptorStride = 8;
-
+/** An array header is a count, an element class, then its data. */
+constexpr std::size_t kHeaderCountOffset = 0;
+constexpr std::size_t kHeaderClassOffset = 8;
+constexpr std::size_t kHeaderDataOffset = 16;
+/** The marker comes before the header count. */
+constexpr std::size_t kHeaderMarkerBack = 4;
 /** Tag-like values carry this high half word. */
 constexpr std::uint32_t kTagHighHalf = 0x8080;
 /** An index-table row is 24 bytes. */
@@ -30,6 +30,17 @@ constexpr std::size_t kIndexRowStride = 24;
 constexpr std::size_t kIndexRowTagOffset = 16;
 /** Arrays larger than this are not definition tables. */
 constexpr std::uint64_t kMaximumArrayCount = 300000;
+
+/** @param blob Source bytes. @param offset Field offset. @param value Receives the field. */
+template <typename Value>
+[[nodiscard]] bool
+read(std::span<const std::byte> blob, std::size_t offset, Value& value) noexcept {
+    if (offset > blob.size() || blob.size() - offset < sizeof value) {
+        return false;
+    }
+    std::memcpy(&value, blob.data() + offset, sizeof value);
+    return true;
+}
 
 /**
  * Checks one array header reached from a descriptor.
@@ -45,10 +56,10 @@ constexpr std::uint64_t kMaximumArrayCount = 300000;
                                 std::uint32_t& elementClass) noexcept {
     std::uint64_t headerCount = 0;
     std::uint32_t marker = 0;
-    if (headerOffset < Header::kMarkerBack
-        || !read(blob, headerOffset + Header::kCount, headerCount) || headerCount != count
-        || !read(blob, headerOffset - Header::kMarkerBack, marker)
-        || !read(blob, headerOffset + Header::kClass, elementClass)) {
+    if (headerOffset < kHeaderMarkerBack
+        || !read(blob, headerOffset + kHeaderCountOffset, headerCount) || headerCount != count
+        || !read(blob, headerOffset - kHeaderMarkerBack, marker)
+        || !read(blob, headerOffset + kHeaderClassOffset, elementClass)) {
         return false;
     }
     return (marker >> 16U) == kTagHighHalf && (elementClass >> 16U) == kTagHighHalf;
@@ -97,8 +108,8 @@ constexpr std::uint64_t kMaximumArrayCount = 300000;
         return false;
     }
     const std::int64_t header = base + relative;
-    if (header < static_cast<std::int64_t>(Header::kMarkerBack)
-        || static_cast<std::uint64_t>(header) + Header::kSize > blob.size()) {
+    if (header < static_cast<std::int64_t>(kHeaderMarkerBack)
+        || static_cast<std::uint64_t>(header) + kHeaderDataOffset > blob.size()) {
         return false;
     }
     const auto headerOffset = static_cast<std::size_t>(header);
@@ -106,7 +117,7 @@ constexpr std::uint64_t kMaximumArrayCount = 300000;
     if (!valid_header(blob, headerOffset, count, elementClass)) {
         return false;
     }
-    output = Array{count, headerOffset + Header::kSize, elementClass};
+    output = Array{count, headerOffset + kHeaderDataOffset, elementClass};
     return true;
 }
 
@@ -124,18 +135,6 @@ bool find_optional_array_at(std::span<const std::byte> blob,
                             std::size_t descriptorOffset,
                             Array& output) noexcept {
     return resolve_descriptor(blob, descriptorOffset, true, output);
-}
-
-/** Reads an optional typed array and checks every fixed-stride row lies in its blob. */
-bool read_array(std::span<const std::byte> blob,
-                std::size_t at,
-                std::uint32_t elementClass,
-                std::size_t stride,
-                Array& rows) noexcept {
-    return stride != 0 && find_optional_array_at(blob, at, rows)
-           && (rows.count == 0
-               || (rows.elementClass == elementClass && rows.dataOffset <= blob.size()
-                   && rows.count <= (blob.size() - rows.dataOffset) / stride));
 }
 
 /** Finds the first array whose header names one element class. */

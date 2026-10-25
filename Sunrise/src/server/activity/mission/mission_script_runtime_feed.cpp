@@ -16,8 +16,10 @@
 #include <vector>
 
 #include "../../../core/logging/log.h"
+#include "../../../core/settings/settings.h"
 #include "../../../state/activity/mission/runtime.h"
 #include "../../../state/activity/runtime.h"
+#include "../../bap/runtime.h"
 #include "../host_runtime.h"
 #include "mission_script_region.h"
 #include "mission_script_runtime_internal.h"
@@ -26,11 +28,14 @@
 namespace sunrise::server::activity::mission {
 namespace {
 
-/** One queued mission event, dispatched once when the drain reaches it. */
+/** One queued mission event and the retry bookkeeping the drain uses. */
 struct PendingMissionEvent final {
     host::Event event{};
     host::SenseObservationSnapshot sense{};
     host::ClientMessageSnapshot clientMessage{};
+    std::uint64_t firstAttempt{};
+    std::uint64_t nextAttempt{};
+    std::uint32_t attempts{};
     bool missionSequenceObserved{};
     bool senseAvailable{};
     bool clientMessageAvailable{};
@@ -78,13 +83,11 @@ void clear_pending_event(PendingMissionEvent& pending) noexcept {
     case host::EventKind::phaseEntered:
     case host::EventKind::triggerEntered:
     case host::EventKind::triggerExited:
-    case host::EventKind::triggerState:
     case host::EventKind::squadState:
     case host::EventKind::squadProvoked:
     case host::EventKind::entitySpawned:
     case host::EventKind::entityDied:
     case host::EventKind::sceneFinished:
-    case host::EventKind::sceneOutput:
     case host::EventKind::objectiveProgress:
     case host::EventKind::sessionJoined:
     case host::EventKind::sessionLeft:
@@ -100,11 +103,126 @@ void clear_pending_event(PendingMissionEvent& pending) noexcept {
     case host::EventKind::fireteamState:
     case host::EventKind::objectInteracted:
     case host::EventKind::ghostLinkState:
+    case host::EventKind::dialogueStaged:
+    case host::EventKind::dialogueFinished:
         return false;
     default:
         return true;
     }
 }
+
+/** Region indices the party table covers: the 64 bubbles of 8 states each. */
+constexpr std::int32_t kPartyRegionCount = 512;
+/** Regions one word of the party table covers. */
+constexpr std::int32_t kPartyRegionWordBits = 64;
+
+/** @return True when some member of the party has entered this region in the current attempt. */
+[[nodiscard]] bool party_reached(const RuntimeInstance& instance, std::int32_t region) noexcept {
+    if (region < 0 || region >= kPartyRegionCount
+        || instance.partyRegionsAttempt != instance.attempt.generation) {
+        return false;
+    }
+    const auto word = static_cast<std::size_t>(region / kPartyRegionWordBits);
+    return ((instance.partyRegions[word] >> (region % kPartyRegionWordBits)) & 1U) != 0;
+}
+
+/** Records that a member of the party entered one region. A new attempt starts a new table. */
+void note_party_region(RuntimeInstance& instance, std::int32_t region) noexcept {
+    if (region < 0 || region >= kPartyRegionCount) {
+        return;
+    }
+    if (instance.partyRegionsAttempt != instance.attempt.generation) {
+        instance.partyRegions = {};
+        instance.partyRegionsAttempt = instance.attempt.generation;
+    }
+    const auto word = static_cast<std::size_t>(region / kPartyRegionWordBits);
+    instance.partyRegions[word] |= std::uint64_t{1} << (region % kPartyRegionWordBits);
+}
+
+/**
+ * Accepts the world facts a fireteam member reports into the owner's program.
+ * Sense authority follows the client that simulates an object, which in a shared activity is often
+ * a peer rather than the program owner: the host's own interaction can arrive on a guest's report.
+ * A player-trigger crossing advances the mission whichever member made it, and so does a peer
+ * entering a region the party has not reached yet. All are taken only from a live link bound to
+ * this same activity. Spawn and client-state reports stay the owner's: they describe one client's
+ * placement, not the shared world, and the owner's arrival is the one its program waits on.
+ */
+[[nodiscard]] bool peer_input(const RuntimeInstance& instance, const host::Event& event) noexcept {
+    // Only a retained, decoded body; a peer's unsupported layout has no values to read.
+    const bool sense = event.has_sense_observations();
+    const bool crossing =
+        event.kind == host::EventKind::incidentReceived && event.hasPlayerTrigger;
+    // Only a region the party has not reached: the owner reaching it already told the program.
+    const bool frontier = event.kind == host::EventKind::regionChanged
+                          && core::settings::get().server.activation.peerRegionFacts
+                          && !party_reached(instance, event.regionIndex);
+    if ((!sense && !crossing && !frontier) || event.sourceGeneration == 0) {
+        return false;
+    }
+    server::bap::ActivityLinkView link{};
+    return server::bap::activity_link_view(instance.view.binding, event.sourceGeneration, link);
+}
+
+/**
+ * Derives the region move a peer's client-state report makes and queues it for the program.
+ * The report itself stays out of the program, as every peer client-state report does. Only its
+ * move into a region nobody in the party has reached goes on, so the mission advances when any
+ * member gets somewhere first and never hears the same region twice from a peer.
+ * @param instance Program the peer's activity feeds.
+ * @param event Client-state report from a link that is not the owner's.
+ */
+void observe_peer_region(RuntimeInstance& instance, const host::Event& event) noexcept {
+    host::Event changed{};
+    if (event.kind != host::EventKind::clientStateChanged || event.sourceGeneration == 0
+        || event.sourceGeneration == instance.view.activityClientGeneration
+        || instance.programStatus != ProgramStatus::loaded
+        || !core::settings::get().server.activation.peerRegionFacts
+        || !make_region_changed(event, changed)) {
+        return;
+    }
+    server::bap::ActivityLinkView link{};
+    const bool live =
+        server::bap::activity_link_view(instance.view.binding, event.sourceGeneration, link);
+    const bool reached = party_reached(instance, changed.regionIndex);
+    std::array<char, 96> fields{};
+    const int written = std::snprintf(fields.data(),
+                                      fields.size(),
+                                      "region=%d previous=%d source_gen=%llu",
+                                      changed.regionIndex,
+                                      changed.previousRegionIndex,
+                                      static_cast<unsigned long long>(event.sourceGeneration));
+    const std::string_view detail =
+        written > 0 ? std::string_view(fields.data(), static_cast<std::size_t>(written))
+                    : std::string_view{};
+    if (!live || reached) {
+        log_line(core::log::Level::debug,
+                 &instance,
+                 "peer_region",
+                 live ? "already_reached" : "no_live_link",
+                 detail);
+        return;
+    }
+    log_line(core::log::Level::info, &instance, "peer_region", "queued", detail);
+    push_script_event(instance, changed);
+}
+
+} // namespace
+
+bool accepts_member_sense(const RuntimeInstance& instance,
+                          std::uint64_t sourceGeneration) noexcept {
+    if (sourceGeneration == 0) {
+        return false;
+    }
+    if (sourceGeneration == instance.view.activityClientGeneration) {
+        return true;
+    }
+    server::bap::ActivityLinkView link{};
+    return core::settings::get().server.activation.singlePrivateAmbassador
+           && server::bap::activity_link_view(instance.view.binding, sourceGeneration, link);
+}
+
+namespace {
 
 /** True when the event may reach a callback for this instance's ActivityClient generation. */
 [[nodiscard]] bool eligible_event(const RuntimeInstance& instance,
@@ -112,11 +230,12 @@ void clear_pending_event(PendingMissionEvent& pending) noexcept {
     if (event.attemptGeneration != 0 && event.attemptGeneration != instance.attempt.generation) {
         return false;
     }
-    if (event.kind == host::EventKind::timerElapsed) {
+    if (event.kind == host::EventKind::timerElapsed
+        || event.kind == host::EventKind::dialogueFinished) {
         return true;
     }
     if (event.sourceGeneration != instance.view.activityClientGeneration) {
-        return false;
+        return peer_input(instance, event);
     }
     return event.kind == host::EventKind::clientStateChanged
            || event.kind == host::EventKind::incidentReceived
@@ -124,15 +243,14 @@ void clear_pending_event(PendingMissionEvent& pending) noexcept {
            || event.kind == host::EventKind::effectResult
            || event.kind == host::EventKind::phaseEntered
            || event.kind == host::EventKind::triggerEntered
-           || event.kind == host::EventKind::triggerState
            || event.kind == host::EventKind::triggerExited
            || event.kind == host::EventKind::squadState
            || event.kind == host::EventKind::squadProvoked
            || event.kind == host::EventKind::entitySpawned
            || event.kind == host::EventKind::entityDied
            || event.kind == host::EventKind::sceneFinished
-           || event.kind == host::EventKind::sceneOutput
            || event.kind == host::EventKind::objectiveProgress
+           || event.kind == host::EventKind::dialogueStaged
            || event.kind == host::EventKind::entitySlotsRequested
            || event.kind == host::EventKind::sessionJoined
            || event.kind == host::EventKind::sessionLeft
@@ -220,6 +338,7 @@ void clear_pending_event(PendingMissionEvent& pending) noexcept {
         pending->clientMessageAvailable =
             host::mission_input_client_message_snapshot(input.sequence, pending->clientMessage);
     }
+    pending->nextAttempt = 0;
     pending->event = input.event;
     pending->occupied = true;
     return true;
@@ -268,7 +387,8 @@ void drain_pending_mission_events(std::uint64_t now) noexcept {
     do {
         progressed = false;
         for (PendingMissionEvent& pending : g_pendingMissionEvents) {
-            if (!pending.occupied || has_earlier_pending_event(pending)) {
+            if (!pending.occupied || now < pending.nextAttempt
+                || has_earlier_pending_event(pending)) {
                 continue;
             }
             RuntimeInstance* const instance = find_instance(pending.event.binding);
@@ -305,6 +425,7 @@ void drain_pending_mission_events(std::uint64_t now) noexcept {
                 pending.missionSequenceObserved = true;
             }
             if (!eligible_event(*instance, pending.event)) {
+                observe_peer_region(*instance, pending.event);
                 if (!commit_mission_state(
                         *instance, instance->missionStarted, pending.event.missionSequence)) {
                     clear_pending_events(instance->view.binding);
@@ -336,6 +457,11 @@ void drain_pending_mission_events(std::uint64_t now) noexcept {
                 || lua_vm::pending_intent(instance->vm, intent)) {
                 continue;
             }
+            const bool firstAttempt = pending.attempts == 0;
+            if (firstAttempt) {
+                pending.firstAttempt = now;
+            }
+            ++pending.attempts;
             const host::SenseObservationSnapshot* const sense =
                 pending.event.kind == host::EventKind::senseUpdate && pending.senseAvailable
                     ? &pending.sense
@@ -345,7 +471,8 @@ void drain_pending_mission_events(std::uint64_t now) noexcept {
                         && pending.clientMessageAvailable
                     ? &pending.clientMessage
                     : nullptr;
-            static_cast<void>(dispatch_event(*instance, pending.event, sense, clientMessage, now));
+            static_cast<void>(
+                dispatch_event(*instance, pending.event, sense, clientMessage, firstAttempt, now));
             clear_pending_event(pending);
             progressed = true;
         }
@@ -371,7 +498,8 @@ void drain_pending_mission_events(std::uint64_t now) noexcept {
     return false;
 }
 
-/** @return True when every uncommitted sequence is in this read or the local queue. */
+/** @return True when every accepted but uncommitted sequence is present in this read or local
+ * queue. */
 [[nodiscard]] bool
 outstanding_input_interval_complete(const state::activity::SessionBinding& binding,
                                     const mission_state::InputSequenceSnapshot& state,
@@ -495,7 +623,7 @@ void clear_pending_events(const state::activity::SessionBinding& binding) noexce
     }
 }
 
-/** Retires every queued mission event of every binding and frees the queue. */
+/** Retires every queued mission event that belongs to one binding. */
 void clear_all_pending_events() noexcept {
     std::vector<PendingMissionEvent>{}.swap(g_pendingMissionEvents);
 }
@@ -506,6 +634,9 @@ void reset_pending_events_for_reattach(const state::activity::SessionBinding& bi
         if (!pending.occupied || !same_binding(pending.event.binding, binding)) {
             continue;
         }
+        pending.firstAttempt = 0;
+        pending.nextAttempt = 0;
+        pending.attempts = 0;
         pending.missionSequenceObserved = false;
     }
 }
@@ -553,16 +684,46 @@ void clear_feed_cursors() noexcept {
     g_missionInputCursor = {};
 }
 
+namespace {
+
+/** Logs a staged cue whose dispatch finds the timer table full, so no timer will finish it. */
+void log_full_dialogue_timers(RuntimeInstance& instance, const host::Event& event) noexcept {
+    lua_vm::Snapshot diagnostics{};
+    lua_vm::snapshot(instance.vm, diagnostics);
+    mission_state::StateKey key{};
+    if (diagnostics.timerCount < mission_state::kTimerCapacity
+        || !lua_vm::dialogue_timer_key(event.dialogueSlotRow, event.dialogueCue, key)
+        || lua_vm::timer_armed(instance.vm, key)) {
+        return;
+    }
+    std::array<char, 48> fields{};
+    const int written = std::snprintf(fields.data(),
+                                      fields.size(),
+                                      "slot_row=%u cue=%u",
+                                      static_cast<unsigned>(event.dialogueSlotRow),
+                                      static_cast<unsigned>(event.dialogueCue));
+    log_line(core::log::Level::warn,
+             &instance,
+             "dialogue",
+             "timer_capacity",
+             written > 0 ? std::string_view(fields.data(), static_cast<std::size_t>(written))
+                         : std::string_view{});
+}
+
+} // namespace
+
 /**
  * Runs one event through the VM, commits what it changed, and faults on a script failure.
  * @param sense Values owned by a Sense row, or null.
  * @param clientMessage Envelope snapshot owned by a client-message row, or null.
+ * @param firstAttempt True on the first delivery attempt, which is the one that counts it.
  * @return The VM call status; `inactive` when no callback could take the event.
  */
 lua_vm::CallStatus dispatch_event(RuntimeInstance& instance,
                                   const host::Event& event,
                                   const host::SenseObservationSnapshot* sense,
                                   const host::ClientMessageSnapshot* clientMessage,
+                                  bool firstAttempt,
                                   std::uint64_t now) noexcept {
     if (instance.programStatus == ProgramStatus::missing
         && event.kind == host::EventKind::senseUpdate && sense != nullptr) {
@@ -572,11 +733,14 @@ lua_vm::CallStatus dispatch_event(RuntimeInstance& instance,
     if (instance.programStatus != ProgramStatus::loaded || !eligible_event(instance, event)) {
         return lua_vm::CallStatus::inactive;
     }
-    ++instance.eventsSeen;
+    if (firstAttempt) {
+        ++instance.eventsSeen;
+        instance.lastEventSequence = event.sequence;
+    }
     // The three region numbers the script is about to read. A report restates only the leg it
     // moved, so `pending` and `current` read -1 on most reports and `held` is the one that says
     // where the client is standing.
-    if (event.kind == host::EventKind::clientStateChanged) {
+    if (firstAttempt && event.kind == host::EventKind::clientStateChanged) {
         std::array<char, 64> legs{};
         const int written =
             std::snprintf(legs.data(),
@@ -593,9 +757,15 @@ lua_vm::CallStatus dispatch_event(RuntimeInstance& instance,
                      {legs.data(), static_cast<std::size_t>(written)});
         }
     }
+    if (firstAttempt && event.kind == host::EventKind::dialogueStaged) {
+        log_full_dialogue_timers(instance, event);
+    }
     instance.dispatchAttemptGeneration = event.attemptGeneration;
     instance.dispatchInputSequence = event.missionSequence;
     const lua_vm::CallStatus status = lua_vm::dispatch(instance.vm, event, clientMessage, now);
+    if (event.kind == host::EventKind::regionChanged) {
+        note_party_region(instance, event.regionIndex);
+    }
     if (event.kind == host::EventKind::clientStateChanged) {
         // A pending-region report can name the next slice while the player still holds the old
         // one, so the held region wins.
@@ -605,17 +775,24 @@ lua_vm::CallStatus dispatch_event(RuntimeInstance& instance,
             instance.activeRegion = event.currentRegionIndex;
         }
         host::Event changed{};
-        if (make_region_changed(event, changed)) {
+        if (firstAttempt && make_region_changed(event, changed)) {
             push_script_event(instance, changed);
         }
     }
-    if (event.kind == host::EventKind::incidentReceived) {
+    if (firstAttempt && event.kind == host::EventKind::incidentReceived) {
         push_player_trigger(instance, event);
         push_cinematic(instance, event);
     }
     if (event.kind == host::EventKind::senseUpdate && sense != nullptr) {
-        observe_player_life(instance, *sense);
-        publish_fireteam_life(now);
+        // Each client reports its own player's participation: the owner's into the owner's
+        // levels, and every other member's into its own entry, so the party's life counts all.
+        if (firstAttempt && sense->sourceGeneration == instance.view.activityClientGeneration) {
+            observe_player_life(instance, *sense);
+            publish_fireteam_life(now);
+        } else if (firstAttempt && accepts_member_sense(instance, sense->sourceGeneration)) {
+            observe_member_life(instance, *sense);
+            publish_fireteam_life(now);
+        }
         push_trigger_edges(instance, *sense);
         push_ghost_edges(instance, *sense);
         push_object_interaction_edges(instance, *sense);
@@ -630,7 +807,7 @@ lua_vm::CallStatus dispatch_event(RuntimeInstance& instance,
     instance.dispatchAttemptGeneration = 0;
     instance.dispatchInputSequence = 0;
     note_vm_status(instance, "event", lua_vm::status_name(status));
-    if (instance.eventsSeen == 1) {
+    if (firstAttempt && instance.eventsSeen == 1) {
         log_line(core::log::Level::info,
                  &instance,
                  "dispatch",
@@ -640,9 +817,11 @@ lua_vm::CallStatus dispatch_event(RuntimeInstance& instance,
                  : event.kind == host::EventKind::incidentReceived   ? "detail=incident"
                  : event.kind == host::EventKind::entitySlotsRequested
                      ? "detail=entity_slots_requested"
-                 : event.kind == host::EventKind::timerElapsed ? "detail=timer"
-                 : event.kind == host::EventKind::effectResult ? "detail=effect_result"
-                                                               : "detail=client_message");
+                 : event.kind == host::EventKind::timerElapsed     ? "detail=timer"
+                 : event.kind == host::EventKind::effectResult     ? "detail=effect_result"
+                 : event.kind == host::EventKind::dialogueStaged   ? "detail=dialogue_staged"
+                 : event.kind == host::EventKind::dialogueFinished ? "detail=dialogue_finished"
+                                                                   : "detail=client_message");
     }
     const std::uint64_t nextInputSequence =
         host_feed_row(event.kind) ? event.missionSequence : instance.lastMissionSequence;
@@ -665,9 +844,11 @@ lua_vm::CallStatus dispatch_event(RuntimeInstance& instance,
                      : event.kind == host::EventKind::incidentReceived   ? "detail=incident"
                      : event.kind == host::EventKind::entitySlotsRequested
                          ? "detail=entity_slots_requested"
-                     : event.kind == host::EventKind::timerElapsed ? "detail=timer"
-                     : event.kind == host::EventKind::effectResult ? "detail=effect_result"
-                                                                   : "detail=client_message");
+                     : event.kind == host::EventKind::timerElapsed     ? "detail=timer"
+                     : event.kind == host::EventKind::effectResult     ? "detail=effect_result"
+                     : event.kind == host::EventKind::dialogueStaged   ? "detail=dialogue_staged"
+                     : event.kind == host::EventKind::dialogueFinished ? "detail=dialogue_finished"
+                                                                       : "detail=client_message");
         }
         return status;
     }

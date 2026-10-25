@@ -1,14 +1,15 @@
 #include "activity_sdk_squad_runtime.h"
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
+#include <cstdio>
 #include <limits>
 #include <string_view>
 
-#include "../../middleware/content/packages/tables/authored_squad_reader.h"
+#include "../../core/logging/log.h"
 #include "../../middleware/content/packages/tables/region_reader.h"
 #include "../../state/activity/runtime.h"
-#include "../../state/activity_sdk/squad_profiles.h"
 #include "../../state/build_data/runtime.h"
 #include "../bap/runtime.h"
 #include "host_runtime.h"
@@ -19,6 +20,9 @@ namespace {
 namespace format = state::activity_sdk::format;
 namespace layouts = state::build_data::scenarios;
 namespace sdk = state::activity_sdk;
+
+/** Spawn rules are type-66 slots; the squad Auth names one by its wire slot index. */
+constexpr std::uint32_t kSpawnRuleSlotType = 66;
 namespace squad_auth = middleware::bap::activity_message::squad_auth;
 namespace tables = middleware::content::packages::tables;
 
@@ -41,7 +45,7 @@ struct PreparedSquad final {
     if (!state::activity::binding_matches(view.binding)) {
         return Status::staleBinding;
     }
-    (void)server::bap::activity_link_view(view.binding, link);
+    (void)server::bap::activity_link_view(view.binding, view.activityClientGeneration, link);
     switch (
         sdk::revalidate(view, view.binding, link.matchingLinks, link.activityClientGeneration)) {
     case sdk::Status::ready:
@@ -94,8 +98,30 @@ struct PreparedSquad final {
                                     const format::Squad& squad,
                                     std::span<const std::int32_t> requestedCounts,
                                     std::array<std::int8_t, 4>& output) noexcept {
-    return sdk::squad_spawn_profile(
-        sdk::squad_members(catalog, squad), catalog.actor_classes(), requestedCounts, output);
+    output = {};
+    const auto members = sdk::squad_members(catalog, squad);
+    const auto actors = catalog.actor_classes();
+    bool found = false;
+    // A named type-2 member needs its parent's authored profile but zero loose actors.
+    const bool loose = std::any_of(
+        requestedCounts.begin(), requestedCounts.end(), [](auto count) { return count > 0; });
+    for (std::size_t index = 0; index < members.size(); ++index) {
+        if (loose && requestedCounts[index] <= 0) {
+            continue;
+        }
+        const format::SquadMember& member = members[index];
+        if ((member.flags & format::kSquadMemberActorClassExact) == 0
+            || member.actorClassIndex >= actors.size()) {
+            return false;
+        }
+        const auto& candidate = actors[member.actorClassIndex].authoredSpawnProfile;
+        if (found && candidate != output) {
+            return false;
+        }
+        output = candidate;
+        found = true;
+    }
+    return found;
 }
 /** Checks the generated source slot before it can select a wire roster target. */
 [[nodiscard]] bool valid_generated_slot(const sdk::Catalog& catalog,
@@ -299,7 +325,7 @@ struct PreparedSquad final {
     if (squad.scenarioIndex != view.scenarioRow) {
         return Status::wrongScenario;
     }
-    if (!format::squad_runnable(squad.flags)) {
+    if ((squad.flags & format::kSquadRunnableMask) != format::kSquadRunnableMask) {
         return Status::notRunnable;
     }
     const Status members = member_status(catalog, squad, squadRow, requestedCounts);
@@ -356,7 +382,7 @@ retirement_eligibility(const sdk::BoundView& view,
                        bool enabled) noexcept {
     state::gameplay::squad_entity_retirement::Eligibility result{};
     result.squad = {target.registryKey, target.slotIndex, target.slotType};
-    if (!enabled || !view.catalog || target.slotType != format::kSquadSlotType) {
+    if (!enabled || !view.catalog || target.slotType != 1) {
         return result;
     }
     const auto& catalog = *view.catalog;
@@ -396,15 +422,108 @@ retirement_eligibility(const sdk::BoundView& view,
     }
     const auto& occurrence = occurrences[squads[squadRow].occurrenceIndex];
     if (occurrence.bubbleIndex >= bubbles.size()
-        || bubbles[occurrence.bubbleIndex].bubbleOrdinal >= layouts::kBubbleCapacity) {
+        || bubbles[occurrence.bubbleIndex].bubbleOrdinal >= 64) {
         return result;
     }
     result.rsatTag = selected;
     result.bubble = static_cast<std::uint8_t>(bubbles[occurrence.bubbleIndex].bubbleOrdinal);
-    result.enabled = true;
+    result.enabled = result.bubble < 64;
     return result;
 }
 
+/** @return Bubble ordinal of one squad's authored occurrence, or -1 when it has none. */
+[[nodiscard]] std::int32_t squad_bubble(const sdk::Catalog& catalog,
+                                        std::uint32_t squadRow) noexcept {
+    const auto squads = catalog.squads();
+    const auto occurrences = catalog.occurrences();
+    const auto bubbles = catalog.bubbles();
+    if (squadRow >= squads.size() || squads[squadRow].occurrenceIndex >= occurrences.size()) {
+        return -1;
+    }
+    const format::Occurrence& occurrence = occurrences[squads[squadRow].occurrenceIndex];
+    if (occurrence.bubbleIndex >= bubbles.size()
+        || bubbles[occurrence.bubbleIndex].bubbleOrdinal >= layouts::kBubbleCapacity) {
+        return -1;
+    }
+    return static_cast<std::int32_t>(bubbles[occurrence.bubbleIndex].bubbleOrdinal);
+}
+
+/** @return Stable log name of one routing reason. */
+[[nodiscard]] const char* route_reason_name(server::bap::SquadRouteReason reason) noexcept {
+    switch (reason) {
+    case server::bap::SquadRouteReason::owner:
+        return "owner";
+    case server::bap::SquadRouteReason::retained:
+        return "retained";
+    case server::bap::SquadRouteReason::ambassador:
+        return "ambassador";
+    case server::bap::SquadRouteReason::ambassadorUnlinked:
+        return "ambassador_unlinked";
+    }
+    return "unknown";
+}
+
+/**
+ * Prepares one squad for the link that must receive it.
+ * The owner's view resolves it first, which names the generated object. When another link
+ * simulates the squad's bubble, or already retains that object, the squad is resolved again
+ * against that link's own region and goes there. A route that cannot resolve keeps the owner's.
+ * @param report Logs every decision that leaves the owner, and every one that could not.
+ */
+[[nodiscard]] Status prepare_routed(const sdk::BoundView& view,
+                                    std::uint32_t squadRow,
+                                    std::span<const std::int32_t> requestedCounts,
+                                    squad_auth::Mode mode,
+                                    PreparedSquad& output,
+                                    bool report) noexcept {
+    const Status ownerStatus = prepare(view, squadRow, requestedCounts, mode, output);
+    if (view.catalog == nullptr) {
+        return ownerStatus;
+    }
+    const std::int32_t bubble = squad_bubble(*view.catalog, squadRow);
+    const server::bap::SquadRoute route =
+        server::bap::squad_route(view.binding,
+                                 view.activityClientGeneration,
+                                 ownerStatus == Status::ready ? output.target.registryKey : 0,
+                                 output.target.slotIndex,
+                                 bubble);
+    Status status = ownerStatus;
+    const bool rerouted = route.generation != view.activityClientGeneration;
+    if (rerouted) {
+        sdk::BoundView routed = view;
+        routed.activityClientGeneration = route.generation;
+        PreparedSquad candidate{};
+        status = prepare(routed, squadRow, requestedCounts, mode, candidate);
+        if (status == Status::ready) {
+            output = candidate;
+        }
+    }
+    if (report && (rerouted || route.reason == server::bap::SquadRouteReason::ambassadorUnlinked)) {
+        std::array<char, core::log::kLineCapacity> line{};
+        const int written = std::snprintf(
+            line.data(),
+            line.size(),
+            "ev=activity stage=squad_route result=%s reason=%s squad=%u bubble=%d owner_gen=%llu "
+            "gen=%llu status=%s",
+            !rerouted ? "owner" : status == Status::ready ? "routed" : "fallback",
+            route_reason_name(route.reason),
+            static_cast<unsigned>(squadRow),
+            bubble,
+            static_cast<unsigned long long>(view.activityClientGeneration),
+            static_cast<unsigned long long>(route.generation),
+            status_name(status));
+        if (written > 0) {
+            core::log::write(core::log::Channel::server,
+                             core::log::Level::info,
+                             {line.data(), static_cast<std::size_t>(written)});
+        }
+    }
+    return status == Status::ready || !rerouted ? status : ownerStatus;
+}
+
+} // namespace
+
+/** Availability checks never register reuse before Auth delivery. */
 /** The destination is another type-1 squad of the same object, sent as its wire slot. */
 [[nodiscard]] Status resolve_destination(const sdk::Catalog& catalog,
                                          std::uint32_t squadRow,
@@ -437,22 +556,16 @@ retirement_eligibility(const sdk::BoundView& view,
                                         std::optional<std::uint32_t> spawnRuleSlotRow,
                                         std::optional<squad_auth::SpawnRule>& output) noexcept {
     output.reset();
+    if (!spawnRuleSlotRow.has_value()) {
+        return Status::ready;
+    }
     const auto squads = catalog.squads();
     const auto slots = catalog.slots();
-    if (!spawnRuleSlotRow.has_value()) {
-        // A spawner with no rule of its own cannot be placed without a selected one.
-        return squadRow < squads.size()
-                       && (squads[squadRow].flags & format::kSquadRequiresSelectedRule) != 0
-                   ? Status::notRunnable
-                   : Status::ready;
-    }
     if (squadRow >= squads.size() || *spawnRuleSlotRow >= slots.size()) {
         return Status::invalidSquad;
     }
     const format::Slot& slot = slots[*spawnRuleSlotRow];
-    // The squad Auth names a spawn rule by its wire slot index.
-    if (slot.objectIndex != squads[squadRow].objectIndex
-        || slot.slotType != tables::kAuthoredSquadRuleSlotType
+    if (slot.objectIndex != squads[squadRow].objectIndex || slot.slotType != kSpawnRuleSlotType
         || slot.slotIndex > (std::numeric_limits<std::uint16_t>::max)()) {
         return Status::invalidSquad;
     }
@@ -461,21 +574,48 @@ retirement_eligibility(const sdk::BoundView& view,
 }
 
 /**
- * Prepares one placement and queues it, through an owned Host revision when one is given.
- * @param reservation Unarmed Host revision Mission State owns, or null for an operator action.
- * @return queued, or the refusal that stopped it.
+ * Checks one placement without queuing it; name and retirement choices are not yet validated.
+ * @param destinationSquadRow Optional actor-spawn destination squad of the same object.
+ * @param spawnRuleSlotRow Optional type-66 rule slot of the same object.
+ * @return `ready`, or the refusal a placement would get.
  */
-[[nodiscard]] Status queue(const sdk::BoundView& view,
-                           std::uint32_t squadRow,
-                           std::span<const std::int32_t> requestedCounts,
-                           squad_auth::Mode mode,
-                           const host::ScriptableOutputReservation* reservation,
-                           std::optional<std::uint32_t> nameHash,
-                           bool retireOnReturn,
-                           std::optional<std::uint32_t> destinationSquadRow,
-                           std::optional<std::uint32_t> spawnRuleSlotRow) noexcept {
+Status availability(const sdk::BoundView& view,
+                    std::uint32_t squadRow,
+                    std::span<const std::int32_t> requestedCounts,
+                    squad_auth::Mode mode,
+                    std::optional<std::uint32_t> nameHash,
+                    bool retireOnReturn,
+                    std::optional<std::uint32_t> destinationSquadRow,
+                    std::optional<std::uint32_t> spawnRuleSlotRow) noexcept {
+    (void)nameHash;
+    (void)retireOnReturn;
     PreparedSquad prepared{};
-    const Status status = prepare(view, squadRow, requestedCounts, mode, prepared);
+    const Status status = prepare_routed(view, squadRow, requestedCounts, mode, prepared, false);
+    if (status != Status::ready) {
+        return status;
+    }
+    std::optional<squad_auth::Destination> destination{};
+    const Status destinationStatus = resolve_destination(
+        *view.catalog, squadRow, prepared.target.registryKey, destinationSquadRow, destination);
+    if (destinationStatus != Status::ready) {
+        return destinationStatus;
+    }
+    std::optional<squad_auth::SpawnRule> spawnRule{};
+    return resolve_spawn_rule(
+        *view.catalog, squadRow, prepared.target.registryKey, spawnRuleSlotRow, spawnRule);
+}
+
+/** Queues one preflighted generated squad through the proved private type-1 route. */
+Status place(const sdk::BoundView& view,
+             std::uint32_t squadRow,
+             std::span<const std::int32_t> requestedCounts,
+             squad_auth::Mode mode,
+             std::optional<std::uint32_t> nameHash,
+             bool retireOnReturn,
+             std::optional<std::uint32_t> destinationSquadRow,
+             std::optional<std::uint32_t> spawnRuleSlotRow) noexcept {
+    PreparedSquad prepared{};
+    const Status status = prepare_routed(view, squadRow, requestedCounts, mode, prepared, true);
     if (status != Status::ready) {
         return status;
     }
@@ -500,7 +640,7 @@ retirement_eligibility(const sdk::BoundView& view,
             nameHash,
             prepared.effectiveRegion,
             prepared.activityClientGeneration,
-            reservation,
+            nullptr,
             prepared.authoredProfile,
             retirement_eligibility(
                 view, squadRow, requestedCounts, prepared.target, retireOnReturn),
@@ -509,60 +649,6 @@ retirement_eligibility(const sdk::BoundView& view,
         return Status::queued;
     }
     return Status::refused;
-}
-
-} // namespace
-
-/**
- * Checks one placement without queuing it; name and retirement choices are not yet validated.
- * @param destinationSquadRow Optional actor-spawn destination squad of the same object.
- * @param spawnRuleSlotRow Optional type-66 rule slot of the same object.
- * @return `ready`, or the refusal a placement would get.
- */
-Status availability(const sdk::BoundView& view,
-                    std::uint32_t squadRow,
-                    std::span<const std::int32_t> requestedCounts,
-                    squad_auth::Mode mode,
-                    std::optional<std::uint32_t> nameHash,
-                    bool retireOnReturn,
-                    std::optional<std::uint32_t> destinationSquadRow,
-                    std::optional<std::uint32_t> spawnRuleSlotRow) noexcept {
-    (void)nameHash;
-    (void)retireOnReturn;
-    PreparedSquad prepared{};
-    const Status status = prepare(view, squadRow, requestedCounts, mode, prepared);
-    if (status != Status::ready) {
-        return status;
-    }
-    std::optional<squad_auth::Destination> destination{};
-    const Status destinationStatus = resolve_destination(
-        *view.catalog, squadRow, prepared.target.registryKey, destinationSquadRow, destination);
-    if (destinationStatus != Status::ready) {
-        return destinationStatus;
-    }
-    std::optional<squad_auth::SpawnRule> spawnRule{};
-    return resolve_spawn_rule(
-        *view.catalog, squadRow, prepared.target.registryKey, spawnRuleSlotRow, spawnRule);
-}
-
-/** Queues one preflighted generated squad through the proved private type-1 route. */
-Status place(const sdk::BoundView& view,
-             std::uint32_t squadRow,
-             std::span<const std::int32_t> requestedCounts,
-             squad_auth::Mode mode,
-             std::optional<std::uint32_t> nameHash,
-             bool retireOnReturn,
-             std::optional<std::uint32_t> destinationSquadRow,
-             std::optional<std::uint32_t> spawnRuleSlotRow) noexcept {
-    return queue(view,
-                 squadRow,
-                 requestedCounts,
-                 mode,
-                 nullptr,
-                 nameHash,
-                 retireOnReturn,
-                 destinationSquadRow,
-                 spawnRuleSlotRow);
 }
 
 /** Queues one preflighted squad only through an exact unarmed Host revision. */
@@ -575,15 +661,41 @@ Status place_reserved(const sdk::BoundView& view,
                       bool retireOnReturn,
                       std::optional<std::uint32_t> destinationSquadRow,
                       std::optional<std::uint32_t> spawnRuleSlotRow) noexcept {
-    return queue(view,
-                 squadRow,
-                 requestedCounts,
-                 mode,
-                 &reservation,
-                 nameHash,
-                 retireOnReturn,
-                 destinationSquadRow,
-                 spawnRuleSlotRow);
+    PreparedSquad prepared{};
+    const Status status = prepare_routed(view, squadRow, requestedCounts, mode, prepared, true);
+    if (status != Status::ready) {
+        return status;
+    }
+    std::optional<squad_auth::Destination> destination{};
+    const Status destinationStatus = resolve_destination(
+        *view.catalog, squadRow, prepared.target.registryKey, destinationSquadRow, destination);
+    if (destinationStatus != Status::ready) {
+        return destinationStatus;
+    }
+    std::optional<squad_auth::SpawnRule> spawnRule{};
+    const Status ruleStatus = resolve_spawn_rule(
+        *view.catalog, squadRow, prepared.target.registryKey, spawnRuleSlotRow, spawnRule);
+    if (ruleStatus != Status::ready) {
+        return ruleStatus;
+    }
+    if (server::bap::request_activity_squad_override(
+            view.binding,
+            prepared.target,
+            prepared.target.stateLocalRoster ? &prepared.generatedRosterGroup : nullptr,
+            requestedCounts,
+            mode,
+            nameHash,
+            prepared.effectiveRegion,
+            prepared.activityClientGeneration,
+            &reservation,
+            prepared.authoredProfile,
+            retirement_eligibility(
+                view, squadRow, requestedCounts, prepared.target, retireOnReturn),
+            destination,
+            spawnRule)) {
+        return Status::queued;
+    }
+    return Status::refused;
 }
 
 /** Returns the concise operator and VM diagnostic name for one result. */

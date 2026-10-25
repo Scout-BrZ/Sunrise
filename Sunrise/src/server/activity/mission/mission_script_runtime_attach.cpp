@@ -3,9 +3,12 @@
  * Every function here runs under the mission runtime lock its caller already holds.
  */
 
+#include <Windows.h>
+
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstdio>
 #include <limits>
 #include <new>
 #include <span>
@@ -13,13 +16,14 @@
 #include <utility>
 #include <vector>
 
+#include "../../../core/filesystem/path.h"
 #include "../../../core/logging/log.h"
+#include "../../../core/settings/settings.h"
 #include "../../../middleware/crypto/sha256.h"
 #include "../../../state/activity/membership/activity_membership_query.h"
 #include "../../../state/activity/mission/runtime.h"
 #include "../../../state/activity/runtime.h"
 #include "../../../state/activity_sdk/runtime.h"
-#include "../../../state/mods/config/mod_config.h"
 #include "../../bap/runtime.h"
 #include "../activity_sdk_mission_runtime.h"
 #include "../host_runtime.h"
@@ -31,11 +35,64 @@
 namespace sunrise::server::activity::mission {
 namespace {
 
+enum class SourceStatus : std::uint8_t {
+    ready,
+    missing,
+    fileError,
+    tooLarge,
+};
+
+/** One explicit reload may replace the source hash for its exact binding. */
+struct ReloadAuthorization final {
+    state::activity::SessionBinding binding{};
+    mission_state::ProgramKey program{};
+    bool occupied{};
+};
+
+std::array<ReloadAuthorization, host::kInstanceCapacity> g_reloadAuthorizations{};
+std::array<char, lua_vm::kSourceByteCapacity> g_source{};
+core::path::Buffer g_scriptRoot{};
+std::array<char, 1024> g_sdkLuaSearchPath{};
+
+[[nodiscard]] ReloadAuthorization*
+reload_authorization(const state::activity::SessionBinding& binding) noexcept {
+    for (ReloadAuthorization& authorization : g_reloadAuthorizations) {
+        if (authorization.occupied && same_binding(authorization.binding, binding)) {
+            return &authorization;
+        }
+    }
+    return nullptr;
+}
+
+[[nodiscard]] ReloadAuthorization* free_reload_authorization() noexcept {
+    for (ReloadAuthorization& authorization : g_reloadAuthorizations) {
+        if (!authorization.occupied) {
+            return &authorization;
+        }
+    }
+    return nullptr;
+}
+
+/** Handle of the module holding this code, found from a data address inside it. */
+[[nodiscard]] HMODULE owning_module() noexcept {
+    HMODULE module = nullptr;
+    const auto address = reinterpret_cast<LPCWSTR>(g_source.data());
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                               | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           address,
+                           &module)
+        == FALSE) {
+        return nullptr;
+    }
+    return module;
+}
+
 /** True when the link, the SDK view and the world view still match what the instance bound. */
-[[nodiscard]] bool still_exact(const RuntimeInstance& instance) noexcept {
+[[nodiscard]] bool still_exact(RuntimeInstance& instance) noexcept {
     server::bap::ActivityLinkView link{};
     lua_vm::WorldGenerationIdentity worldGeneration{};
-    return server::bap::activity_link_view(instance.view.binding, link)
+    return server::bap::activity_link_view(
+               instance.view.binding, instance.view.activityClientGeneration, link)
            && link.publicTarget == instance.publicTarget
            && sdk::revalidate(instance.view,
                               instance.view.binding,
@@ -50,12 +107,14 @@ namespace {
 }
 
 /**
- * Re-points one open program at the current ActivityClient generation.
+ * Rebuilds one open program view for its exact owning ActivityClient generation.
  * @return True when the instance holds an exact view of the same program.
  */
 [[nodiscard]] bool rebind_instance(RuntimeInstance& instance) noexcept {
     server::bap::ActivityLinkView link{};
-    if (!server::bap::activity_link_view(instance.view.binding, link) || !link.joined) {
+    if (!server::bap::activity_link_view(
+            instance.view.binding, instance.view.activityClientGeneration, link)
+        || !link.joined) {
         return false;
     }
     const sdk::Snapshot catalog = sdk::snapshot();
@@ -77,11 +136,10 @@ namespace {
     if (generated::resolve(view, worldView) != generated::BindStatus::ready) {
         return false;
     }
-    const bool sourceChanged =
-        view.activityClientGeneration != instance.view.activityClientGeneration;
     instance.view = std::move(view);
     instance.worldView = std::move(worldView);
     instance.publicTarget = link.publicTarget;
+    instance.characterSoid = link.characterSoid;
     instance.playerKey = link.playerKey;
     instance.identity.playerKey = link.playerKey;
     instance.identity.publicTarget = link.publicTarget;
@@ -91,15 +149,158 @@ namespace {
                         sdk_bridge::definition_api(instance.view, instance.worldView))) {
         return false;
     }
-    if (sourceChanged) {
-        clear_sense_levels(instance);
-    }
     mission_state::Snapshot snapshot{};
     if (!mission_state::state_snapshot(instance.view.binding, snapshot)) {
         return false;
     }
     accept_mission_state(instance, snapshot);
     return true;
+}
+
+/** Folds the activity name into a lowercase file stem; other bytes become single underscores. */
+[[nodiscard]] bool controller_stem(const sdk::Catalog& catalog,
+                                   const format::Activity& activity,
+                                   std::span<char> output) noexcept {
+    if (output.size() < 2) {
+        return false;
+    }
+    const std::string_view internal = catalog.string(activity.internalName);
+    const std::string_view name =
+        internal.empty() ? catalog.string(activity.displayName) : internal;
+    std::size_t length = 0;
+    bool separator = false;
+    for (const unsigned char byte : name) {
+        const bool digit = byte >= '0' && byte <= '9';
+        const bool upper = byte >= 'A' && byte <= 'Z';
+        const bool lower = byte >= 'a' && byte <= 'z';
+        if (digit || upper || lower) {
+            if (separator && length != 0) {
+                if (length + 1 >= output.size()) {
+                    return false;
+                }
+                output[length++] = '_';
+            }
+            separator = false;
+            if (length + 1 >= output.size()) {
+                return false;
+            }
+            output[length++] = static_cast<char>(upper ? byte + ('a' - 'A') : byte);
+        } else {
+            separator = true;
+        }
+    }
+    if (length == 0) {
+        // A slot with no authored name reports this fixed spelling.
+        constexpr std::string_view unnamed = "unnamed";
+        if (unnamed.size() + 1 > output.size()) {
+            return false;
+        }
+        std::copy(unnamed.begin(), unnamed.end(), output.begin());
+        length = unnamed.size();
+    }
+    if (output[0] >= '0' && output[0] <= '9') {
+        if (length + 2 > output.size()) {
+            return false;
+        }
+        const auto used = static_cast<std::ptrdiff_t>(length);
+        std::move_backward(output.begin(), output.begin() + used, output.begin() + used + 1);
+        output[0] = '_';
+        ++length;
+    }
+    output[length] = '\0';
+    return true;
+}
+
+/** Writes `<stem>/<stem>.lua`: each mission owns a folder named after its script. */
+[[nodiscard]] bool controller_name(const sdk::Catalog& catalog,
+                                   const format::Activity& activity,
+                                   std::span<char> output) noexcept {
+    std::array<char, 120> stem{};
+    if (!controller_stem(catalog, activity, stem)) {
+        return false;
+    }
+    const int length =
+        std::snprintf(output.data(), output.size(), "%s/%s.lua", stem.data(), stem.data());
+    return length > 0 && static_cast<std::size_t>(length) < output.size();
+}
+
+/** Reads one whole file into the shared source buffer and says why it could not be read. */
+[[nodiscard]] SourceStatus read_file(const core::path::Buffer& path,
+                                     std::span<const char>& output) noexcept {
+    output = {};
+    HANDLE file = CreateFileW(path.chars.data(),
+                              GENERIC_READ,
+                              FILE_SHARE_READ | FILE_SHARE_DELETE,
+                              nullptr,
+                              OPEN_EXISTING,
+                              FILE_ATTRIBUTE_NORMAL,
+                              nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        const DWORD error = GetLastError();
+        return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND
+                   ? SourceStatus::missing
+                   : SourceStatus::fileError;
+    }
+    LARGE_INTEGER size{};
+    const bool sizeReady = GetFileSizeEx(file, &size) != FALSE;
+    if (!sizeReady || size.QuadPart <= 0
+        || static_cast<unsigned long long>(size.QuadPart) > g_source.size()) {
+        CloseHandle(file);
+        return sizeReady ? SourceStatus::tooLarge : SourceStatus::fileError;
+    }
+    DWORD read = 0;
+    const auto requested = static_cast<DWORD>(size.QuadPart);
+    const bool loaded =
+        ReadFile(file, g_source.data(), requested, &read, nullptr) != FALSE && read == requested;
+    CloseHandle(file);
+    if (!loaded) {
+        return SourceStatus::fileError;
+    }
+    output = {g_source.data(), read};
+    return SourceStatus::ready;
+}
+
+/** Reads the authored script for the activity, falling back to the generated one when absent. */
+[[nodiscard]] SourceStatus read_source(const sdk::Catalog& catalog,
+                                       const format::Activity& activity,
+                                       std::span<const char>& output) noexcept {
+    std::array<char, 260> authoredName{};
+    if (!controller_name(catalog, activity, authoredName)) {
+        return SourceStatus::fileError;
+    }
+    std::array<wchar_t, 260> wideName{};
+    const int wideLength = MultiByteToWideChar(CP_UTF8,
+                                               MB_ERR_INVALID_CHARS,
+                                               authoredName.data(),
+                                               -1,
+                                               wideName.data(),
+                                               static_cast<int>(wideName.size()));
+    // Use backslashes; a root with the `\\?\` prefix does not accept `/`.
+    std::replace(wideName.begin(), wideName.end(), L'/', L'\\');
+    core::path::Buffer authoredPath = g_scriptRoot;
+    if (wideLength <= 1 || !core::path::append(authoredPath, L"\\")
+        || !core::path::append(authoredPath, wideName.data())) {
+        return SourceStatus::fileError;
+    }
+    const SourceStatus authored = read_file(authoredPath, output);
+    if (authored != SourceStatus::missing) {
+        return authored;
+    }
+
+    core::path::Buffer generatedPath = g_scriptRoot;
+    std::array<wchar_t, 96> generatedName{};
+    const int generatedLength = _snwprintf_s(generatedName.data(),
+                                             generatedName.size(),
+                                             _TRUNCATE,
+                                             L"\\activities\\a_%04u_%08x.lua",
+                                             activity.activityIndex,
+                                             activity.definitionHash);
+    if (generatedLength <= 0
+        || !core::path::append(generatedPath,
+                               {generatedName.data(), static_cast<std::size_t>(generatedLength)})) {
+        return SourceStatus::fileError;
+    }
+    return read_file(generatedPath, output);
 }
 
 /** Builds the exact durable program identity from the already validated SDK view. */
@@ -137,8 +338,16 @@ namespace {
 /** Binds and restores the durable record before the opened program enters a callback. */
 [[nodiscard]] bool bind_mission_state(RuntimeInstance& instance, std::uint64_t now) noexcept {
     mission_state::Snapshot snapshot{};
-    const mission_state::Status status =
+    mission_state::Status status =
         mission_state::bind(instance.view.binding, instance.programKey, snapshot);
+    ReloadAuthorization* const authorization = reload_authorization(instance.view.binding);
+    if (status == mission_state::Status::programMismatch && authorization != nullptr) {
+        status = mission_state::rebind_program(
+            instance.view.binding, authorization->program, instance.programKey, snapshot);
+    }
+    if (authorization != nullptr) {
+        *authorization = {};
+    }
     note_vm_status(instance, "state", mission_state::status_name(status));
     if (status != mission_state::Status::ready) {
         log_line(
@@ -315,12 +524,10 @@ enum class InitialStateGate : std::uint8_t {
         log_line(core::log::Level::warn, &instance, "open", "invalid_sdk_view");
         return AttachResult::programError;
     }
-    instance.identity.sdkLuaSearchPath = sdk_lua_search_path();
+    instance.identity.sdkLuaSearchPath = g_sdkLuaSearchPath;
     instance.identity.playerKey = instance.playerKey;
-    instance.identity.readModConfig = &state::mods::config::read;
-    instance.identity.readModuleOwner = &module_source_owner;
     std::span<const char> source{};
-    switch (read_source(*instance.view.catalog, *activity, source, instance.identity.modId)) {
+    switch (read_source(*instance.view.catalog, *activity, source)) {
     case SourceStatus::missing:
         instance.programStatus = ProgramStatus::missing;
         note_vm_status(instance, "open", "no_script");
@@ -340,7 +547,8 @@ enum class InitialStateGate : std::uint8_t {
         break;
     }
     if (!make_program_key(instance, *activity, source, instance.programKey)) {
-        clear_source(source);
+        std::fill(
+            g_source.begin(), g_source.begin() + static_cast<std::ptrdiff_t>(source.size()), '\0');
         instance.programStatus = ProgramStatus::programError;
         note_vm_status(instance, "state", "invalid_program_key");
         log_line(core::log::Level::warn, &instance, "open", "invalid_program_key");
@@ -351,7 +559,8 @@ enum class InitialStateGate : std::uint8_t {
                      instance.identity,
                      sdk_bridge::definition_api(instance.view, instance.worldView),
                      source);
-    clear_source(source);
+    std::fill(
+        g_source.begin(), g_source.begin() + static_cast<std::ptrdiff_t>(source.size()), '\0');
     note_vm_status(instance, "open", lua_vm::status_name(opened));
     if (opened != lua_vm::OpenStatus::ready) {
         instance.programStatus = ProgramStatus::programError;
@@ -366,16 +575,6 @@ enum class InitialStateGate : std::uint8_t {
         return AttachResult::programError;
     }
     instance.programStatus = ProgramStatus::loaded;
-    std::array<state::activity::SessionRosterRow, state::activity::kSessionCapacity> roster{};
-    std::size_t rosterCount = 0;
-    if (!state::activity::snapshot_session_roster(roster, rosterCount)
-        || rosterCount > roster.size()) {
-        lua_vm::fault(instance.vm, "initial peer snapshot could not be read");
-        instance.programStatus = ProgramStatus::programError;
-        note_vm_status(instance, "open", "peer_snapshot_refused");
-        return AttachResult::programError;
-    }
-    push_session_roster_edges(instance, std::span(roster).first(rosterCount));
     instance.initialStateDeclared =
         lua_vm::initial_state_region(instance.vm, instance.initialStateRegion);
     if (instance.initialStateDeclared) {
@@ -418,6 +617,7 @@ enum class InitialStateGate : std::uint8_t {
 
 /** Binds one host instance to a free slot once its link, SDK view and world view all resolve. */
 void attach_instance(const host::InstanceSnapshot& hostInstance,
+                     std::span<const state::activity::SessionRosterRow> roster,
                      const sdk::Snapshot& catalog,
                      std::uint64_t now) noexcept {
     if (find_instance(hostInstance.binding) != nullptr) {
@@ -429,7 +629,17 @@ void attach_instance(const host::InstanceSnapshot& hostInstance,
         return;
     }
     server::bap::ActivityLinkView link{};
-    if (!server::bap::activity_link_view(hostInstance.binding, link)) {
+    // Host snapshots are session-scoped and have no client owner yet. The lowest joined native
+    // member owns the session-wide program: the primary while present, so a guest sharing its
+    // binding cannot replace it, and the first remaining peer once the primary has left.
+    std::uint64_t memberKey{};
+    for (const auto& row : roster) {
+        if (row.joined && state::activity::same_binding(row.binding, hostInstance.binding)) {
+            memberKey = row.presentMemberKey;
+            break;
+        }
+    }
+    if (!server::bap::activity_link_view_for_member(hostInstance.binding, memberKey, link)) {
         report_attach_result(
             hostInstance.binding, AttachResult::noActivityLink, "no_activity_link");
         return;
@@ -474,6 +684,7 @@ void attach_instance(const host::InstanceSnapshot& hostInstance,
     instance->view = std::move(view);
     instance->worldView = std::move(worldView);
     instance->publicTarget = link.publicTarget;
+    instance->characterSoid = link.characterSoid;
     instance->playerKey = link.playerKey;
     instance->occupied = true;
     const AttachResult opened = open_program(*instance, now);
@@ -483,52 +694,66 @@ void attach_instance(const host::InstanceSnapshot& hostInstance,
 
 } // namespace
 
-/** Opens new code against the instance's view; the running program is untouched. */
-lua_vm::OpenStatus prepare_reload_program(const RuntimeInstance& instance,
-                                          std::span<const char> source,
-                                          std::string_view modId,
-                                          lua_vm::Vm& vm,
-                                          lua_vm::ProgramIdentity& identity,
-                                          mission_state::ProgramKey& key) noexcept {
-    const format::Activity* const activity = sdk::bound_activity(instance.view);
-    if (activity == nullptr
-        || !sdk_bridge::program_identity(instance.view, instance.publicTarget, identity)
-        || !make_program_key(instance, *activity, source, key)) {
-        return lua_vm::OpenStatus::invalidProgram;
+bool controller_file_name(std::uint32_t oneBasedActivityRow, std::span<char> output) noexcept {
+    if (oneBasedActivityRow == 0 || output.empty()) {
+        return false;
     }
-    identity.sdkLuaSearchPath = sdk_lua_search_path();
-    identity.playerKey = instance.playerKey;
-    identity.readModConfig = &state::mods::config::read;
-    identity.readModuleOwner = &module_source_owner;
-    copy_text(identity.modId, modId);
-    return lua_vm::open(
-        vm, identity, sdk_bridge::definition_api(instance.view, instance.worldView), source);
+    const sdk::Snapshot catalog = sdk::snapshot();
+    if (catalog == nullptr || oneBasedActivityRow - 1 >= catalog->activities().size()) {
+        return false;
+    }
+    return controller_name(*catalog, catalog->activities()[oneBasedActivityRow - 1], output);
 }
 
-/** Points a prepared VM at the current view; false when the program key changed. */
-bool rebind_reload_program(const RuntimeInstance& instance,
-                           std::span<const char> source,
-                           lua_vm::Vm& vm,
-                           lua_vm::ProgramIdentity& identity,
-                           const mission_state::ProgramKey& key) noexcept {
-    const format::Activity* const activity = sdk::bound_activity(instance.view);
-    mission_state::ProgramKey current{};
-    lua_vm::ProgramIdentity rebound{};
-    if (activity == nullptr || !still_exact(instance)
-        || !make_program_key(instance, *activity, source, current) || current != key
-        || !sdk_bridge::program_identity(instance.view, instance.publicTarget, rebound)) {
+/** Resolves the script root and the SDK Lua search path. Logs its own refusal. */
+bool resolve_script_paths() noexcept {
+    HMODULE const module = owning_module();
+    core::path::Buffer sdkLua{};
+    core::path::Buffer scriptLua{};
+    // Generated modules come first, so a controller cannot shadow one by filename.
+    if (module == nullptr || !core::path::artifact_directory(module, g_scriptRoot)
+        || !core::path::artifact_directory(module, sdkLua)
+        || !core::path::artifact_directory(module, scriptLua)
+        || !core::path::append(sdkLua, L"\\sdk\\lua\\?.lua")
+        || !core::path::append(scriptLua, L"\\scripts\\?.lua") || !core::path::append(sdkLua, L";")
+        || !core::path::append(sdkLua, {scriptLua.chars.data(), scriptLua.length})
+        || !core::path::append(g_scriptRoot, L"\\scripts")) {
+        log_line(core::log::Level::warn, nullptr, "initialize", "path_error");
         return false;
     }
-    rebound.sdkLuaSearchPath = identity.sdkLuaSearchPath;
-    rebound.playerKey = instance.playerKey;
-    rebound.readModConfig = identity.readModConfig;
-    rebound.readModuleOwner = identity.readModuleOwner;
-    rebound.modId = identity.modId;
-    if (!lua_vm::rebind(
-            vm, rebound, sdk_bridge::definition_api(instance.view, instance.worldView))) {
+    const int sdkLuaBytes = WideCharToMultiByte(CP_UTF8,
+                                                WC_ERR_INVALID_CHARS,
+                                                sdkLua.chars.data(),
+                                                -1,
+                                                g_sdkLuaSearchPath.data(),
+                                                static_cast<int>(g_sdkLuaSearchPath.size()),
+                                                nullptr,
+                                                nullptr);
+    if (sdkLuaBytes <= 1) {
+        g_sdkLuaSearchPath = {};
+        log_line(core::log::Level::warn, nullptr, "initialize", "sdk_lua_path_error");
         return false;
     }
-    identity = rebound;
+    return true;
+}
+
+/** Clears the script buffer, both paths and every reload authorization. */
+void clear_script_paths() noexcept {
+    std::fill(g_source.begin(), g_source.end(), '\0');
+    g_scriptRoot = {};
+    g_sdkLuaSearchPath = {};
+    g_reloadAuthorizations = {};
+}
+
+/** @return False when no authorization slot is free, so the reload cannot replace this program. */
+bool authorize_reload(const RuntimeInstance& instance) noexcept {
+    ReloadAuthorization* const authorization = free_reload_authorization();
+    if (authorization == nullptr) {
+        return false;
+    }
+    authorization->binding = instance.view.binding;
+    authorization->program = instance.programKey;
+    authorization->occupied = true;
     return true;
 }
 
@@ -538,12 +763,13 @@ void synchronize_instances(std::uint64_t now) noexcept {
     host::snapshot(diagnostics);
     retire_attach_diagnostics(diagnostics);
     retire_unbound_pending_events();
+    bool completedMissionEnded = false;
     for (RuntimeInstance& instance : g_instances) {
         const bool bindingActive =
             instance.occupied && is_active(diagnostics, instance.view.binding);
         const bool bindingRetained =
             instance.occupied && state::activity::binding_matches(instance.view.binding);
-        // A generation change only stales the view, so rebind and keep the program.
+        // Rebuild a stale SDK/world view only while the exact client owner remains live.
         if (instance.occupied && bindingActive && bindingRetained && !still_exact(instance)
             && rebind_instance(instance)) {
             log_line(core::log::Level::debug, &instance, "rebind", "generation");
@@ -551,6 +777,7 @@ void synchronize_instances(std::uint64_t now) noexcept {
         }
         if (instance.occupied && (!bindingActive || !still_exact(instance))) {
             log_line(core::log::Level::info, &instance, "close", "stale_generation");
+            completedMissionEnded = completedMissionEnded || instance.attempt.complete;
             // Accepted mission inputs belong to the exact SessionBinding, not one ActivityClient
             // generation or one temporary link outage. Clear only after State replaces the exact
             // session generation; otherwise reattach must finish every already-accepted row.
@@ -569,8 +796,12 @@ void synchronize_instances(std::uint64_t now) noexcept {
     publish_fireteam_life(now);
     for (std::size_t index = 0; index < diagnostics.instanceCount; ++index) {
         if (diagnostics.instances[index].active) {
-            attach_instance(diagnostics.instances[index], catalog, now);
+            attach_instance(
+                diagnostics.instances[index], {roster.data(), rosterCount}, catalog, now);
         }
+    }
+    if (completedMissionEnded && core::settings::get().logging.clearOnMissionComplete) {
+        core::log::clear_history();
     }
 }
 

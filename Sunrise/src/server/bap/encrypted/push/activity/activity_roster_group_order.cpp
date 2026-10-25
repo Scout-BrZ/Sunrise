@@ -24,15 +24,16 @@ constexpr std::uint8_t kStateSequenceWrap = 128;
 constexpr std::uint32_t kFoldBasis = 2166136261U;
 constexpr std::uint32_t kFoldPrime = 16777619U;
 
-/**
- * @return FNV-1a over one group's registration identity: its key, tag and slot set.
- * A bubble change moves no group: a moved byte tears the group's content down and rebuilds it.
- */
-[[nodiscard]] std::uint32_t group_identity_fold(const message::Group& group) noexcept {
+/** @return FNV-1a over one group's registration identity: its key, tag, slot set and epoch. */
+[[nodiscard]] std::uint32_t group_identity_fold(const message::Group& group,
+                                                std::uint8_t regionEpoch) noexcept {
     std::uint32_t folded = kFoldBasis;
     const auto mix = [&folded](std::uint32_t value) noexcept {
         folded = (folded ^ value) * kFoldPrime;
     };
+    // A bubble change moves no group: each key stays registered under every bubble it was
+    // seen in, and a moved byte tears the group's content down and rebuilds it.
+    (void)regionEpoch;
     mix(group.key);
     mix(group.objectTag);
     mix(static_cast<std::uint32_t>(group.slotTypes.size()));
@@ -68,7 +69,8 @@ void advance_region_epoch(Session& session, const RefreshReport* refresh) noexce
         return;
     }
     const std::int32_t previous = session.activityRosterRegionBubble;
-    // A bubble change is the client's business: the epoch stays and every registration is kept.
+    // The epoch no longer advances: a bubble change is the client's business, and the roster
+    // keeps every registration. The log line still names the crossing.
     session.activityRosterRegionBubble = bubble;
     std::array<char, core::log::kLineCapacity> line{};
     const int written = std::snprintf(line.data(),
@@ -444,7 +446,7 @@ void stamp_group_sequences(Session& session, message::Roster& roster) noexcept {
     static_assert(kRosterGroupLeaseCapacity >= message::kPublishedGroupCapacity);
     for (std::size_t index = 0; index < roster.groupCount; ++index) {
         message::Group& group = roster.groups[index];
-        const std::uint32_t folded = group_identity_fold(group);
+        const std::uint32_t folded = group_identity_fold(group, session.activityRosterRegionEpoch);
         RosterGroupLease* lease = nullptr;
         RosterGroupLease* freeSlot = nullptr;
         for (RosterGroupLease& candidate : session.activityRosterGroupLeases) {

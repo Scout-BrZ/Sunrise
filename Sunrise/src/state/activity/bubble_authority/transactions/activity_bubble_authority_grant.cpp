@@ -10,8 +10,15 @@ namespace sunrise::state::activity::bubble_authority {
 bool select_grant(std::uint64_t sessionId,
                   std::int32_t sliceSetIndex,
                   Grant& grant,
-                  bool enteringBubble) noexcept {
+                  bool enteringBubble,
+                  std::uint64_t requesterKey,
+                  bool* withheld,
+                  bool arriving) noexcept {
     grant = {};
+    const std::uint64_t now = GetTickCount64();
+    if (withheld != nullptr) {
+        *withheld = false;
+    }
     if (sessionId == kAbsentSessionId || sliceSetIndex < 0
         || sliceSetIndex > kMaximumGrantSliceSetIndex) {
         return false;
@@ -24,12 +31,33 @@ bool select_grant(std::uint64_t sessionId,
     if (target != kInvalidSessionSlot && bubble < kFallbackBubble) {
         const AuthorityState& authority = state.sessions[target].bubbleAuthority;
         const std::uint16_t previous = authority.grantTokens[bubble];
-        if (previous == 0 || (enteringBubble && !authority.held[bubble])) {
-            // A renewed grant must differ from the client's retained token and skip zero.
+        const std::uint64_t ambassador = authority.ambassadorKeys[bubble];
+        const std::uint64_t holder = authority.grantHolderKeys[bubble];
+        // Only the member that simulates the bubble may hold its authority. The one that did
+        // before has left the bubble, so its grant is superseded rather than waited for.
+        const bool otherAmbassador =
+            requesterKey != 0 && ambassador != 0 && ambassador != requesterKey;
+        const bool takesOver = requesterKey != 0 && ambassador == requesterKey && holder != 0
+                                && holder != requesterKey;
+        // A client gives a bubble up as it walks out, a moment before its region report says
+        // it left. Handed back in that moment, the bubble would be held again from outside and
+        // the entities the client released there would find no client to take them up.
+        const std::uint64_t released = authority.releasedTicks[bubble];
+        const bool settled = released == 0 || now - released >= kReleaseSettleMs;
+        if (otherAmbassador) {
+            if (withheld != nullptr) {
+                *withheld = true;
+            }
+        } else if (previous == 0
+                   || (enteringBubble && !authority.held[bubble] && (arriving || settled))
+                   || takesOver) {
+            // A bubble handed back and re-entered must be granted a token the client's mirror
+            // has not already seen, so the next one follows the highest ever issued.
             const std::uint16_t issued = authority.issuedTokens[bubble];
             grant.bubble = bubble;
             grant.token = issued < kMaximumGrantToken ? static_cast<std::uint16_t>(issued + 1)
-                                                      : kInitialGrantToken;
+                                                      : kMaximumGrantToken;
+            grant.holderKey = requesterKey;
             owed = true;
         }
     }
@@ -49,6 +77,7 @@ void record_grant(std::uint64_t sessionId, const Grant& grant) noexcept {
         state.sessions[target].bubbleAuthority.grantTokens[grant.bubble] = grant.token;
         state.sessions[target].bubbleAuthority.issuedTokens[grant.bubble] = grant.token;
         state.sessions[target].bubbleAuthority.held[grant.bubble] = true;
+        state.sessions[target].bubbleAuthority.grantHolderKeys[grant.bubble] = grant.holderKey;
     }
     ReleaseSRWLockExclusive(&runtime::storage::g_stateLock);
 }
@@ -71,11 +100,29 @@ void record_abdication(std::uint64_t sessionId,
     if (target != kInvalidSessionSlot) {
         AuthorityState& authority = state.sessions[target].bubbleAuthority;
         authority.held[bubble] = false;
+        authority.releasedTicks[bubble] = GetTickCount64();
         if (mask != nullptr) {
             auto& released = authority.releasedEntities[bubble];
             for (std::size_t index = 0; index < released.size(); ++index) {
                 released[index] |= (*mask)[index];
             }
+        }
+    }
+    ReleaseSRWLockExclusive(&runtime::storage::g_stateLock);
+}
+
+/** Merges one bubble's abandoned entities into its pending claim. */
+void record_abandon(std::uint64_t sessionId, std::uint8_t bubble, const EntitySlotMask& mask) noexcept {
+    if (sessionId == kAbsentSessionId || bubble >= kAuthoritySlotCount) {
+        return;
+    }
+    AcquireSRWLockExclusive(&runtime::storage::g_stateLock);
+    ActivityState& state = runtime::storage::g_state.activity;
+    const std::size_t target = activity::transactions::find_session(state, sessionId);
+    if (target != kInvalidSessionSlot) {
+        auto& released = state.sessions[target].bubbleAuthority.releasedEntities[bubble];
+        for (std::size_t index = 0; index < released.size(); ++index) {
+            released[index] |= mask[index];
         }
     }
     ReleaseSRWLockExclusive(&runtime::storage::g_stateLock);

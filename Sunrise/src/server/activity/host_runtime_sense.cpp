@@ -1,5 +1,5 @@
 /**
- * Msg-6 Sense retention, type-43 tracing and scalar selection.
+ * Type-43 Sense retention, tracing and scalar selection.
  * Helpers here need the Host runtime lock; the entry points take it themselves.
  */
 
@@ -342,7 +342,8 @@ void trace_scene_sense(Instance& instance, const SenseInput& input) noexcept {
     }
 }
 
-/** Replaces only fully decoded keys; omitted or unsupported keys stay retained. */
+/** Replaces only fully decoded keys in an accepted packet; omitted or unsupported keys stay
+ * retained. */
 [[nodiscard]] bool
 retain_sense_observations(Instance& instance, const SenseInput& input, std::uint64_t now) noexcept {
     namespace sense = middleware::bap::activity_message::sense_update;
@@ -587,12 +588,9 @@ void apply_sense(const SenseInput& input, std::uint64_t now) noexcept {
 } // namespace detail
 
 /** Queues one owned msg-6 prefix for the Activity Host service. */
-IngressRefusal submit_sense(const SenseInput& input) noexcept {
-    if (!state::activity::binding_matches(input.binding)) {
-        return IngressRefusal::binding;
-    }
-    if (input.sourceGeneration == 0) {
-        return IngressRefusal::generation;
+bool submit_sense(const SenseInput& input) noexcept {
+    if (!state::activity::binding_matches(input.binding) || input.sourceGeneration == 0) {
+        return false;
     }
     AcquireSRWLockExclusive(&g_lock);
     PendingInput pending{};
@@ -601,11 +599,11 @@ IngressRefusal submit_sense(const SenseInput& input) noexcept {
     if (!append_pending(pending)) {
         ++g_droppedIngress;
         ReleaseSRWLockExclusive(&g_lock);
-        return IngressRefusal::queue;
+        return false;
     }
     ++g_queuedIngress;
     ReleaseSRWLockExclusive(&g_lock);
-    return IngressRefusal::none;
+    return true;
 }
 
 /** Copies initialized recovery state for one exact ActivityClient generation. */

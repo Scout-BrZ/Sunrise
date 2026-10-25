@@ -12,6 +12,7 @@ namespace {
 [[nodiscard]] std::array<void*, kGameSlots.size()> game_replacements() noexcept {
     return {
         platform::transport_kind_entry_point(),
+        platform::transport_kind_session_entry_point(),
         http::execute_request_entry_point(),
         bubble_authority::decoder_entry_point(),
         bubble_authority::content_untracked_entry_point(),
@@ -34,9 +35,10 @@ GameSpecs game_specs() noexcept {
     const targets::game::network::Targets& resolved = targets::game::network::get();
     return {
         hooking::detour::Spec{resolved.transportKind, replacements[0]},
-        hooking::detour::Spec{resolved.httpExecuteRequest, replacements[1]},
-        hooking::detour::Spec{resolved.bubbleAuthorityDecoder, replacements[2]},
-        hooking::detour::Spec{resolved.contentUntrackedGetter, replacements[3]},
+        hooking::detour::Spec{resolved.transportKindSession, replacements[1]},
+        hooking::detour::Spec{resolved.httpExecuteRequest, replacements[2]},
+        hooking::detour::Spec{resolved.bubbleAuthorityDecoder, replacements[3]},
+        hooking::detour::Spec{resolved.contentUntrackedGetter, replacements[4]},
     };
 }
 
@@ -50,16 +52,28 @@ PlatformSpecs platform_specs() noexcept {
     };
 }
 
-/** @return The ingress and egress bodies; the replacements sit in .srguard, guarded as a span. */
+/** @return The game replacement, ingress and egress bodies kept safe at detach. */
 GameProtectedEntries game_protected_entries() noexcept {
-    return {hooking::detour::ProtectedCodeEntry{coordinator::ingress_entry_point()},
-            hooking::detour::ProtectedCodeEntry{coordinator::egress_entry_point()}};
+    const auto replacements = game_replacements();
+    GameProtectedEntries entries{};
+    for (std::size_t index = 0; index < replacements.size(); ++index) {
+        entries[index].address = replacements[index];
+    }
+    entries[replacements.size()].address = coordinator::ingress_entry_point();
+    entries[replacements.size() + 1].address = coordinator::egress_entry_point();
+    return entries;
 }
 
-/** @return The ingress and egress bodies; the replacements sit in .srguard, guarded as a span. */
+/** @return The platform replacement, ingress and egress bodies kept safe at detach. */
 PlatformProtectedEntries platform_protected_entries() noexcept {
-    return {hooking::detour::ProtectedCodeEntry{coordinator::ingress_entry_point()},
-            hooking::detour::ProtectedCodeEntry{coordinator::egress_entry_point()}};
+    const auto replacements = platform_replacements();
+    PlatformProtectedEntries entries{};
+    for (std::size_t index = 0; index < replacements.size(); ++index) {
+        entries[index].address = replacements[index];
+    }
+    entries[replacements.size()].address = coordinator::ingress_entry_point();
+    entries[replacements.size() + 1].address = coordinator::egress_entry_point();
+    return entries;
 }
 
 } // namespace sunrise::client::hooks::network::lifecycle

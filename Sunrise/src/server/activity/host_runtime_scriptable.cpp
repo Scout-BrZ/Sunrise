@@ -126,6 +126,8 @@ void clear_reservation(Instance& instance) noexcept {
     return instance.view.outputPending && tail_eligible(request.kind)
            && instance.view.outputKind == OutputKind::scriptableOverride
            && tail_eligible(instance.pendingScriptable.kind)
+           && instance.pendingScriptable.expectedActivityClientGeneration
+                  == request.expectedActivityClientGeneration
            && instance.pendingScriptableTailCount < instance.pendingScriptableTail.size()
            && !pending_holds_target(instance, request.target);
 }
@@ -194,7 +196,9 @@ namespace detail {
 [[nodiscard]] bool retain_scriptable_auth(Instance& instance,
                                           const PendingScriptableOverride& pending,
                                           std::uint64_t sourceGeneration) noexcept {
+    // A lifetime carries no body, but every other link still needs a roster to publish it.
     if (pending.kind == ScriptableOverrideKind::lifetime) {
+        instance.scriptableEstateRevision = next_nonzero(instance.scriptableEstateRevision);
         return true;
     }
     if (pending.byteCount == 0 || pending.byteCount > pending.body.size()) {
@@ -204,9 +208,24 @@ namespace detail {
     if (owned.expectedActivityClientGeneration == 0) {
         owned.expectedActivityClientGeneration = sourceGeneration;
     }
+    // The serial orders a pulse body, such as a dialogue line, against each link's cursor.
+    const std::uint64_t serial = next_nonzero(instance.scriptableEstateRevision);
+    owned.estateSerial = serial;
+    if (owned.kind == ScriptableOverrideKind::dialogue) {
+        // A member far enough behind to fall off the log skips the oldest lines, never newer.
+        if (instance.dialoguePulses.size() >= kDialoguePulseCapacity) {
+            instance.dialoguePulses.erase(instance.dialoguePulses.begin());
+        }
+        try {
+            instance.dialoguePulses.push_back(owned);
+        } catch (const std::bad_alloc&) {
+            return false;
+        }
+    }
     for (PendingScriptableOverride& retained : instance.scriptableAuthEstate) {
         if (same_client_ref(retained.target, pending.target)) {
             retained = owned;
+            instance.scriptableEstateRevision = serial;
             return true;
         }
     }
@@ -215,6 +234,7 @@ namespace detail {
     } catch (const std::bad_alloc&) {
         return false;
     }
+    instance.scriptableEstateRevision = serial;
     return true;
 }
 
@@ -341,6 +361,17 @@ void apply_scriptable_control(const ScriptableRequest& request, std::uint64_t no
     // Lifetime requests use no slot guard.
     const bool untargeted = request.kind == ScriptableOverrideKind::lifetime;
     ScriptableGuard* guard = untargeted ? nullptr : find_guard(*instance, request.target);
+    auth::Type31GenerationGuard* continuation =
+        request.kind == ScriptableOverrideKind::type31
+            ? find_or_reserve_type31_continuation(request.binding.destination, request.target)
+            : nullptr;
+    if (continuation != nullptr && guard != nullptr && guard->type31.hasLast
+        && (!continuation->hasLast || guard->type31.last > continuation->last)) {
+        *continuation = guard->type31;
+    }
+    if (continuation != nullptr && guard != nullptr) {
+        guard->type31 = *continuation;
+    }
     ScriptableGuard candidate{};
     if (!untargeted) {
         if (guard == nullptr) {
@@ -349,6 +380,9 @@ void apply_scriptable_control(const ScriptableRequest& request, std::uint64_t no
             candidate.occupied = true;
         } else {
             candidate = *guard;
+        }
+        if (continuation != nullptr) {
+            candidate.type31 = *continuation;
         }
     }
     PendingScriptableOverride pending{};
@@ -362,6 +396,9 @@ void apply_scriptable_control(const ScriptableRequest& request, std::uint64_t no
     std::size_t written = 0;
     std::size_t writtenBits = 0;
     bool encoded = untargeted || guard != nullptr;
+    if (request.kind == ScriptableOverrideKind::type31 && continuation == nullptr) {
+        encoded = false;
+    }
     if (encoded && request.kind == ScriptableOverrideKind::lifetime) {
         pending.lifetimeState = request.lifetimeState;
     } else if (encoded && request.kind == ScriptableOverrideKind::squad) {
@@ -649,6 +686,9 @@ void apply_scriptable_control(const ScriptableRequest& request, std::uint64_t no
         if (guard != nullptr && !guard->occupied) {
             // Reserve the identity now; commit lane state after transport.
             guard->target = request.target;
+            if (pending.kind == ScriptableOverrideKind::type31) {
+                guard->type31 = candidate.type31;
+            }
             guard->occupied = true;
         }
         pending.byteCount = static_cast<std::uint16_t>(written);

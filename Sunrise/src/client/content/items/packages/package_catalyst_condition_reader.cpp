@@ -4,7 +4,6 @@
 #include <limits>
 
 #include "../../../../middleware/content/packages/tables/definition_index_table.h"
-#include "../../../../state/unlocks/definition.h"
 #include "package_socket_plug_build.h"
 
 namespace sunrise::client::content::items::packages {
@@ -103,7 +102,7 @@ void read_catalyst_completion_condition(std::span<const std::byte> definition,
                             + token * tables::kUnlockInstructionStride,
                         sizeof current);
             if (current[0] == tables::kUnlockReadFlagOpcode
-                && current[1] < state::unlocks::kUnlockFlagCapacity
+                && current[1] < state::build_data::items::kDefinitionCapacity
                 && !append_flag(output.completion, static_cast<std::uint16_t>(current[1]))) {
                 mark_ambiguous(output);
                 return;

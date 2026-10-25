@@ -552,7 +552,7 @@ struct Type23Body final {
 struct Type68Preset final {
     std::uint32_t nameHash{};
     std::int32_t elementIndex{};
-    /** Native directive state: -1 disables, 0 enters, 1 completes, 2 exits. */
+    /** Native directive state: 0 enters, 1 completes, and 2 uses the alternate exit state. */
     std::int8_t state{};
     bool visible{true};
     /** Lane progress values, current then maximum first; the HUD reads them as a counter. */
@@ -927,9 +927,8 @@ struct Type53Body final {
                                         std::size_t bitCount) noexcept;
 
 /**
- * Picks the generation of an arm or disarm. The client stores its activity clock at each fire and
- * fires again only for a later generation, so an arm after the first uses the largest one. That
- * arm fires on every update while the player stays inside, so it is disarmed once it reports.
+ * Seleciona uma geracao crescente para ativacao e desativacao, como na V1.
+ * Preserva o comando de desativacao da V5 e recusa o esgotamento do contador.
  */
 [[nodiscard]] bool type31_arm_generation(const Type31GenerationGuard& guard,
                                          std::uint64_t& next) noexcept;

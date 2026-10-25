@@ -17,9 +17,18 @@ namespace sunrise::server::activity::mission {
  * @param plan Published plan naming the target region and its bubble.
  */
 void arm_state_region_teleport(RuntimeInstance& instance,
-                               const server::bap::ActivityMissionSeedPlan& plan) noexcept {
+                               const server::bap::ActivityMissionSeedPlan& plan,
+                               std::uint32_t spawnSetOverride) noexcept {
     namespace membership = ::sunrise::state::activity::membership;
     const auto& destination = instance.view.binding.destination;
+    // A public region is shared by every player in it, and its programs select a zone's state
+    // only once the client reports that region. A selection naming any other region is a
+    // restored one from an earlier visit, and a teleport the whole fireteam must synchronise
+    // then strands every member on its loading screen.
+    if (instance.publicTarget) {
+        log_line(core::log::Level::info, &instance, "state_region", "teleport_skipped_public");
+        return;
+    }
     if (destination.packageNameLength == 0
         || destination.packageNameLength > destination.packageName.size()
         || plan.effectiveRegion > static_cast<std::uint32_t>(membership::kMaximumSliceSetIndex)) {
@@ -27,7 +36,9 @@ void arm_state_region_teleport(RuntimeInstance& instance,
     }
     const std::int32_t reported = membership::player_region(instance.view.binding.sessionId);
     // A sibling-state transition still needs the host teleport to order the spawn.
-    if (reported == static_cast<std::int32_t>(plan.effectiveRegion)) {
+    // Um destino explicito permite mudar de chegada dentro da mesma regiao.
+    if (spawnSetOverride == 0
+        && reported == static_cast<std::int32_t>(plan.effectiveRegion)) {
         // Already there. Clear any earlier arm so the mirror owns the block again.
         static_cast<void>(membership::arm_host_teleport(
             instance.view.binding.sessionId, membership::kAbsentSliceSetIndex, 0));
@@ -44,7 +55,8 @@ void arm_state_region_teleport(RuntimeInstance& instance,
     const bool armed =
         membership::arm_host_teleport(instance.view.binding.sessionId,
                                       static_cast<std::int32_t>(plan.effectiveRegion),
-                                      declaredAnswers ? declared : dest::kAbsentSpawnSetHash);
+                                      spawnSetOverride != 0 ? spawnSetOverride
+                                          : (declaredAnswers ? declared : dest::kAbsentSpawnSetHash));
     log_line(core::log::Level::info,
              &instance,
              "state_region",

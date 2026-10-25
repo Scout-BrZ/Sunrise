@@ -18,19 +18,6 @@ namespace auth_fields = middleware::bap::activity_message::auth_fields;
 
 namespace {
 
-// Table entries of the slot members this file implements.
-constexpr const api::MemberSpec& kSetDirective = api::slot_member("set_directive");
-constexpr const api::MemberSpec& kClearDirectives = api::slot_member("clear_directives");
-constexpr const api::MemberSpec& kMusicSection = api::slot_member("set_music_section");
-constexpr const api::MemberSpec& kPublicEvent = api::slot_member("set_public_event_state");
-constexpr const api::MemberSpec& kPlaySequence =
-    api::slot_member("play_sequence", format::kSequenceSlotType);
-constexpr const api::MemberSpec& kCinematicActive = api::slot_member("set_cinematic_active");
-constexpr const api::MemberSpec& kResetObjectives = api::slot_member("reset_objectives");
-constexpr const api::MemberSpec& kAdvanceTask = api::slot_member("advance_task");
-constexpr const api::MemberSpec& kPerformance = api::slot_member("play_performance");
-constexpr const api::MemberSpec& kDialogueCue = api::slot_member("play_dialogue_cue");
-
 [[nodiscard]] bool exact_sequence_slot(const SlotDefinition& definition) noexcept {
     return definition.slotType == format::kSequenceSlotType
            && definition.componentClass == format::kSequenceComponentClass
@@ -96,7 +83,10 @@ constexpr const api::MemberSpec& kDialogueCue = api::slot_member("play_dialogue_
 [[nodiscard]] int slot_set_directive(lua_State* state) {
     const auto* const handle =
         static_cast<const SlotHandle*>(luaL_checkudata(state, 1, kSlotMetatable));
-    refuse_unknown_arguments(state, kSetDirective);
+    // Named arguments this call accepts. Any other key is refused.
+    static constexpr std::array<std::string_view, 6> kDeclared{
+        "directive", "state", "navpoint", "audience", "waypoint", "progress"};
+    refuse_unknown_arguments(state, kDeclared);
     SlotDefinition slot{};
     if (!current_slot(state, *handle, slot)) {
         return luaL_error(state, "activity slot is stale or invalid");
@@ -104,18 +94,13 @@ constexpr const api::MemberSpec& kDialogueCue = api::slot_member("play_dialogue_
     if (!exact_directive_slot(slot)) {
         return luaL_error(state, "activity slot is not an exact type-68 directive state");
     }
-    using Kind = api::ValueKind;
-    lua_getfield(state, 2, required_key(kSetDirective, "directive", Kind::missionRow));
+    lua_getfield(state, 2, "directive");
     luaL_checktype(state, -1, LUA_TTABLE);
-    const lua_Integer slotRow = directive_integer(
-        state, -1, table_field_key(kSetDirective, "directive", "slot_row", Kind::integer));
-    const lua_Integer nameHash = directive_integer(
-        state, -1, table_field_key(kSetDirective, "directive", "name_hash", Kind::integer));
-    const lua_Integer element = directive_integer(
-        state, -1, table_field_key(kSetDirective, "directive", "element", Kind::integer));
+    const lua_Integer slotRow = directive_integer(state, -1, "slot_row");
+    const lua_Integer nameHash = directive_integer(state, -1, "name_hash");
+    const lua_Integer element = directive_integer(state, -1, "element");
     lua_pop(state, 1);
-    const lua_Integer directiveState =
-        optional_integer_argument(state, integer_option(kSetDirective, "state"));
+    const lua_Integer directiveState = optional_integer_argument(state, "state", 0);
     if (slotRow < 0 || slotRow > (std::numeric_limits<std::uint32_t>::max)() || nameHash < 0
         || nameHash > (std::numeric_limits<std::uint32_t>::max)() || element < 0
         || element > (std::numeric_limits<std::int32_t>::max)() || directiveState < 0
@@ -138,7 +123,7 @@ constexpr const api::MemberSpec& kDialogueCue = api::slot_member("play_dialogue_
                                          .state = static_cast<std::int8_t>(directiveState),
                                          .visible = true};
     // Progress rides only on an element that declares a counter; the HUD ignores it otherwise.
-    if (push_argument(state, optional_key(kSetDirective, "progress", Kind::list)) != LUA_TNIL) {
+    if (push_argument(state, "progress") != LUA_TNIL) {
         luaL_checktype(state, -1, LUA_TTABLE);
         const std::size_t count = lua_rawlen(state, -1);
         if ((resolved.flags & format::kDirectiveElementCounter) == 0) {
@@ -162,26 +147,21 @@ constexpr const api::MemberSpec& kDialogueCue = api::slot_member("play_dialogue_
         }
     }
     lua_pop(state, 1);
-    const char* const navpointKey = optional_key(kSetDirective, "navpoint", Kind::handle);
-    if (!optional_slot_reference(state,
-                                 optional_key(kSetDirective, "audience", Kind::handle),
-                                 scriptable_auth::kType70SlotType,
-                                 preset.audience)) {
+    if (!optional_slot_reference(
+            state, "audience", scriptable_auth::kType70SlotType, preset.audience)) {
         return luaL_error(state,
                           "directive audience requires an authored type-70 engagement sensor");
     }
     if (!optional_slot_reference(
-            state, navpointKey, scriptable_auth::kType47SlotType, preset.navpoint)) {
+            state, "navpoint", scriptable_auth::kType47SlotType, preset.navpoint)) {
         return luaL_error(state, "directive navpoint requires a current authored type-47 slot");
     }
-    if (!optional_slot_reference(state,
-                                 optional_key(kSetDirective, "waypoint", Kind::handle),
-                                 scriptable_auth::kType60SlotType,
-                                 preset.waypoint)) {
+    if (!optional_slot_reference(
+            state, "waypoint", scriptable_auth::kType60SlotType, preset.waypoint)) {
         return luaL_error(state, "directive waypoint requires a current authored type-60 volume");
     }
     if (preset.navpoint.slotIndex >= 0) {
-        lua_getfield(state, 2, navpointKey);
+        lua_getfield(state, 2, "navpoint");
         const auto* const navpoint =
             static_cast<const SlotHandle*>(luaL_checkudata(state, -1, kSlotMetatable));
         SlotDefinition navpointSlot{};
@@ -204,7 +184,9 @@ constexpr const api::MemberSpec& kDialogueCue = api::slot_member("play_dialogue_
 [[nodiscard]] int slot_clear_directives(lua_State* state) {
     const auto* const handle =
         static_cast<const SlotHandle*>(luaL_checkudata(state, 1, kSlotMetatable));
-    refuse_unknown_arguments(state, kClearDirectives);
+    // Named arguments this call accepts. Any other key is refused.
+    static constexpr std::array<std::string_view, 0> kDeclared{};
+    refuse_unknown_arguments(state, kDeclared);
     SlotDefinition slot{};
     if (!current_slot(state, *handle, slot) || !exact_directive_slot(slot)) {
         return luaL_error(state, "activity slot is not an exact type-68 directive state");
@@ -225,10 +207,11 @@ constexpr const api::MemberSpec& kDialogueCue = api::slot_member("play_dialogue_
     namespace music = middleware::bap::activity_message::music_section;
     const auto* const handle =
         static_cast<const SlotHandle*>(luaL_checkudata(state, 1, kSlotMetatable));
-    refuse_unknown_arguments(state, kMusicSection);
+    // Only these named arguments belong to this API.
+    static constexpr std::array<std::string_view, 2> kDeclared{"section", "enabled"};
+    refuse_unknown_arguments(state, kDeclared);
     SlotDefinition slot{};
-    const lua_Integer section = checked_integer_argument(
-        state, required_key(kMusicSection, "section", api::ValueKind::integer));
+    const lua_Integer section = checked_integer_argument(state, "section");
     if (!current_slot(state, *handle, slot) || slot.slotType != music::kSlotType
         || slot.componentClass != music::kComponentClass || slot.authSchema != music::kSchema
         || (slot.flags & format::kSlotSchemaJoinExact) == 0 || section < 0
@@ -238,7 +221,7 @@ constexpr const api::MemberSpec& kDialogueCue = api::slot_member("play_dialogue_
     std::array<std::byte, music::kBytes> body{};
     std::size_t written = 0;
     if (!music::encode(static_cast<std::uint8_t>(section),
-                       optional_boolean_argument(state, boolean_option(kMusicSection, "enabled")),
+                       optional_boolean_argument(state, "enabled", true),
                        body,
                        written)) {
         return luaL_error(state, "music section encoder failed");
@@ -254,10 +237,11 @@ constexpr const api::MemberSpec& kDialogueCue = api::slot_member("play_dialogue_
     if (!current_slot(state, *handle, slot) || !exact_public_event_slot(slot)) {
         return luaL_error(state, "activity slot is not an exact type-71 public-event sensor");
     }
-    refuse_unknown_arguments(state, kPublicEvent);
-    using Kind = api::ValueKind;
-    const lua_Integer eventState =
-        optional_integer_argument(state, integer_option(kPublicEvent, "state"));
+    // Named arguments this call accepts. Any other key is refused.
+    static constexpr std::array<std::string_view, 4> kDeclared{
+        "state", "player", "area", "leave_seconds"};
+    refuse_unknown_arguments(state, kDeclared);
+    const lua_Integer eventState = optional_integer_argument(state, "state", 0);
     if (eventState < (std::numeric_limits<std::int32_t>::min)()
         || eventState > (std::numeric_limits<std::int32_t>::max)()) {
         return luaL_error(state, "state must be a 32-bit signed integer");
@@ -265,10 +249,9 @@ constexpr const api::MemberSpec& kDialogueCue = api::slot_member("play_dialogue_
     // Absent, the sensor watches this link's own player. Present, it is a decimal string, the
     // form every 64-bit key crosses into Lua in.
     std::uint64_t player = impl_from_state(state)->identity.playerKey;
-    const char* const playerKey = optional_key(kPublicEvent, "player", Kind::decimalString);
-    if (push_argument(state, playerKey) != LUA_TNIL) {
+    if (push_argument(state, "player") != LUA_TNIL) {
         lua_pop(state, 1);
-        const std::string_view playerText = borrowed_string_argument(state, playerKey);
+        const std::string_view playerText = borrowed_string_argument(state, "player");
         const auto parsed =
             std::from_chars(playerText.data(), playerText.data() + playerText.size(), player);
         if (parsed.ec != std::errc{} || parsed.ptr != playerText.data() + playerText.size()) {
@@ -281,10 +264,8 @@ constexpr const api::MemberSpec& kDialogueCue = api::slot_member("play_dialogue_
     if (player == 0) {
         return luaL_error(state, "no player key is known for this activity link");
     }
-    const SlotHandle areaHandle = checked_argument<SlotHandle>(
-        state, required_key(kPublicEvent, "area", Kind::handle), kSlotMetatable);
-    const lua_Number seconds =
-        checked_number_argument(state, required_key(kPublicEvent, "leave_seconds", Kind::number));
+    const SlotHandle areaHandle = checked_argument<SlotHandle>(state, "area", kSlotMetatable);
+    const lua_Number seconds = checked_number_argument(state, "leave_seconds");
     SlotDefinition area{};
     if (!current_slot(state, areaHandle, area)) {
         return luaL_error(state, "area slot is stale or invalid");
@@ -318,7 +299,9 @@ constexpr const api::MemberSpec& kDialogueCue = api::slot_member("play_dialogue_
     if (!current_slot(state, *handle, definition) || !exact_sequence_slot(definition)) {
         return luaL_error(state, "activity slot is not an exact type-5 authored sequence");
     }
-    refuse_unknown_arguments(state, kPlaySequence);
+    // Named arguments this call accepts. Any other key is refused.
+    static constexpr std::array<std::string_view, 0> kDeclared{};
+    refuse_unknown_arguments(state, kDeclared);
     CallFrame& frame = active_frame(state);
     Intent intent{};
     intent.kind = IntentKind::playSequence;
@@ -334,12 +317,14 @@ constexpr const api::MemberSpec& kDialogueCue = api::slot_member("play_dialogue_
     if (!current_slot(state, *handle, definition) || !exact_cinematic_slot(definition)) {
         return luaL_error(state, "activity slot is not an exact type-6 authored cinematic");
     }
-    refuse_unknown_arguments(state, kCinematicActive);
+    // Named arguments this call accepts. Any other key is refused.
+    static constexpr std::array<std::string_view, 1> kDeclared{"active"};
+    refuse_unknown_arguments(state, kDeclared);
     CallFrame& frame = active_frame(state);
     Intent intent{};
     intent.kind = IntentKind::setCinematicActive;
     intent.firstRow = definition.nativeRow;
-    intent.active = optional_boolean_argument(state, boolean_option(kCinematicActive, "active"));
+    intent.active = optional_boolean_argument(state, "active", true);
     return queue_intent(state, frame, intent);
 }
 
@@ -351,7 +336,9 @@ constexpr const api::MemberSpec& kDialogueCue = api::slot_member("play_dialogue_
     if (!current_slot(state, *handle, definition) || !exact_objective_reset_slot(definition)) {
         return luaL_error(state, "activity slot is not an exact type-3 objective reset");
     }
-    refuse_unknown_arguments(state, kResetObjectives);
+    // Named arguments this call accepts. Any other key is refused.
+    static constexpr std::array<std::string_view, 0> kDeclared{};
+    refuse_unknown_arguments(state, kDeclared);
     CallFrame& frame = active_frame(state);
     Intent intent{};
     intent.kind = IntentKind::resetObjectives;
@@ -367,7 +354,9 @@ constexpr const api::MemberSpec& kDialogueCue = api::slot_member("play_dialogue_
     if (!current_slot(state, *handle, definition) || !exact_task_slot(definition)) {
         return luaL_error(state, "activity slot is not an exact type-38 authored task");
     }
-    refuse_unknown_arguments(state, kAdvanceTask);
+    // Named arguments this call accepts. Any other key is refused.
+    static constexpr std::array<std::string_view, 0> kDeclared{};
+    refuse_unknown_arguments(state, kDeclared);
     CallFrame& frame = active_frame(state);
     Intent intent{};
     intent.kind = IntentKind::advanceTask;
@@ -386,18 +375,17 @@ constexpr const api::MemberSpec& kDialogueCue = api::slot_member("play_dialogue_
     if (!current_slot(state, *handle, definition) || !exact_performance_slot(definition)) {
         return luaL_error(state, "activity slot is not an exact type-42 performance sensor");
     }
-    refuse_unknown_arguments(state, kPerformance);
+    // Named arguments this call accepts. Any other key is refused.
+    static constexpr std::array<std::string_view, 1> kDeclared{"state"};
+    refuse_unknown_arguments(state, kDeclared);
     lua_Integer slotRow = static_cast<lua_Integer>(definition.nativeRow);
     lua_Integer nameHash = 0;
     if (!lua_isnoneornil(state, 2)) {
-        using Kind = api::ValueKind;
-        lua_getfield(state, 2, optional_key(kPerformance, "state", Kind::missionRow));
+        lua_getfield(state, 2, "state");
         if (!lua_isnil(state, -1)) {
             luaL_checktype(state, -1, LUA_TTABLE);
-            slotRow = directive_integer(
-                state, -1, table_field_key(kPerformance, "state", "slot_row", Kind::integer));
-            nameHash = directive_integer(
-                state, -1, table_field_key(kPerformance, "state", "name_hash", Kind::integer));
+            slotRow = directive_integer(state, -1, "slot_row");
+            nameHash = directive_integer(state, -1, "name_hash");
         }
         lua_pop(state, 1);
     }
@@ -431,9 +419,10 @@ constexpr const api::MemberSpec& kDialogueCue = api::slot_member("play_dialogue_
     if (!current_slot(state, *handle, definition) || !exact_dialogue_slot(definition)) {
         return luaL_error(state, "activity slot is not an exact type-53 authored dialogue");
     }
-    refuse_unknown_arguments(state, kDialogueCue);
-    const lua_Integer cue =
-        checked_integer_argument(state, required_key(kDialogueCue, "cue", api::ValueKind::integer));
+    // Named arguments this call accepts. Any other key is refused.
+    static constexpr std::array<std::string_view, 2> kDeclared{"cue", "filter"};
+    refuse_unknown_arguments(state, kDeclared);
+    const lua_Integer cue = checked_integer_argument(state, "cue");
     if (cue < 0 || cue > (std::numeric_limits<std::uint16_t>::max)()) {
         return luaL_error(state, "dialogue cue must be a non-negative 16-bit integer");
     }
@@ -442,7 +431,7 @@ constexpr const api::MemberSpec& kDialogueCue = api::slot_member("play_dialogue_
     intent.kind = IntentKind::playDialogueCue;
     intent.firstRow = definition.nativeRow;
     intent.secondRow = static_cast<std::uint32_t>(cue);
-    lua_getfield(state, 2, optional_key(kDialogueCue, "filter", api::ValueKind::handle));
+    lua_getfield(state, 2, "filter");
     if (!lua_isnil(state, -1)) {
         const auto* const volume =
             static_cast<const SlotHandle*>(luaL_checkudata(state, -1, kSlotMetatable));

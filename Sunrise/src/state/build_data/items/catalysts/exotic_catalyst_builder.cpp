@@ -21,7 +21,7 @@ struct LaneResult {
     std::uint16_t completedPlugDefinitionIndex{details::kUnavailableItemIndex};
     std::uint16_t progressPlugDefinitionIndex{details::kUnavailableItemIndex};
     std::uint16_t effectDefinitionIndex{details::kUnavailableItemIndex};
-    std::uint16_t acquisitionFlag{kUnavailableAcquisitionIndex};
+    std::uint16_t acquisitionDefinitionIndex{kUnavailableAcquisitionIndex};
     CompletionRequirements completion{};
     ObjectiveCompletion objective{};
 };
@@ -123,26 +123,11 @@ find_acquisition_gate(std::span<const AcquisitionGate> definitions,
 }
 
 /**
- * @param source Parsed item details.
- * @param item Candidate active effect item.
- * @return True for an exotic stackable item with native perks or stat changes.
- */
-[[nodiscard]] bool has_catalyst_effect(const Source& source,
-                                       const items::Definition& item) noexcept {
-    const details::Definition* detail = find_detail(source.details, item.definitionIndex);
-    return item.tier == static_cast<std::uint8_t>(items::Tier::exotic) && detail != nullptr
-           && detail->definitionHash == item.definitionHash
-           && detail->instancedDefinitionState == details::InstancedDefinitionState::stackable
-           && (detail->sandboxPerkCount != 0 || detail->statCount != 0);
-}
-
-/**
  * Resolves the exotic item row that owns one completed plug's native perks and stat changes.
- * A two-state socket's completed plug is the effect. With a progress plug, the effect is the unique
- * exotic stackable item in the completed plug's category.
+ * Later catalysts use that item as their socket plug. Legacy sockets use a display-only plug in
+ * the same category, so the unique exotic stackable item in that category supplies the effect.
  * @param source Parsed target-build tables.
  * @param completedPlugDefinitionIndex Completed display or active plug from the socket pool.
- * @param progressPlugDefinitionIndex Progress plug, or unavailable for a two-state socket.
  * @param socketType Native socket type that owns the acquired-state gate.
  * @return Completed lane relation, or an effect mapping error.
  */
@@ -156,23 +141,21 @@ find_acquisition_gate(std::span<const AcquisitionGate> definitions,
     }
 
     std::optional<std::uint16_t> effect;
-    if (progressPlugDefinitionIndex == details::kUnavailableItemIndex) {
-        // A two-state socket names its active effect directly, even when clones share its category.
-        if (!has_catalyst_effect(source, *completed)) {
+    for (const items::Definition& candidate : source.items) {
+        if (candidate.plugCategoryHash != completed->plugCategoryHash
+            || candidate.tier != static_cast<std::uint8_t>(items::Tier::exotic)) {
+            continue;
+        }
+        const details::Definition* detail = find_detail(source.details, candidate.definitionIndex);
+        if (detail == nullptr || detail->definitionHash != candidate.definitionHash
+            || detail->instancedDefinitionState != details::InstancedDefinitionState::stackable
+            || (detail->sandboxPerkCount == 0 && detail->statCount == 0)) {
+            continue;
+        }
+        if (effect.has_value()) {
             return {};
         }
-        effect = completedPlugDefinitionIndex;
-    } else {
-        for (const items::Definition& candidate : source.items) {
-            if (candidate.plugCategoryHash != completed->plugCategoryHash
-                || !has_catalyst_effect(source, candidate)) {
-                continue;
-            }
-            if (effect.has_value()) {
-                return {};
-            }
-            effect = candidate.definitionIndex;
-        }
+        effect = candidate.definitionIndex;
     }
     if (!effect.has_value()) {
         return {};
@@ -180,7 +163,7 @@ find_acquisition_gate(std::span<const AcquisitionGate> definitions,
 
     const AcquisitionGate* acquisition = find_acquisition_gate(source.acquisitionGates, socketType);
     if (acquisition == nullptr || acquisition->state != AcquisitionState::present
-        || acquisition->flag == kUnavailableAcquisitionIndex) {
+        || acquisition->definitionIndex == kUnavailableAcquisitionIndex) {
         return {.catalyst = true,
                 .error = Error::invalidAcquisition,
                 .completedPlugDefinitionIndex = completedPlugDefinitionIndex,
@@ -197,7 +180,7 @@ find_acquisition_gate(std::span<const AcquisitionGate> definitions,
                 .completedPlugDefinitionIndex = completedPlugDefinitionIndex,
                 .progressPlugDefinitionIndex = progressPlugDefinitionIndex,
                 .effectDefinitionIndex = *effect,
-                .acquisitionFlag = acquisition->flag};
+                .acquisitionDefinitionIndex = acquisition->definitionIndex};
     }
 
     ObjectiveCompletion objective{};
@@ -210,7 +193,7 @@ find_acquisition_gate(std::span<const AcquisitionGate> definitions,
                     .completedPlugDefinitionIndex = completedPlugDefinitionIndex,
                     .progressPlugDefinitionIndex = progressPlugDefinitionIndex,
                     .effectDefinitionIndex = *effect,
-                    .acquisitionFlag = acquisition->flag};
+                    .acquisitionDefinitionIndex = acquisition->definitionIndex};
         }
         if (progress->objectiveDefinitionIndex != kUnavailableObjectiveIndex) {
             if (progress->state != CompletionConditionState::present
@@ -221,7 +204,7 @@ find_acquisition_gate(std::span<const AcquisitionGate> definitions,
                         .completedPlugDefinitionIndex = completedPlugDefinitionIndex,
                         .progressPlugDefinitionIndex = progressPlugDefinitionIndex,
                         .effectDefinitionIndex = *effect,
-                        .acquisitionFlag = acquisition->flag};
+                        .acquisitionDefinitionIndex = acquisition->definitionIndex};
             }
             objective = {progress->objectiveDefinitionIndex,
                          source.objectiveCompletionValues[progress->objectiveDefinitionIndex]};
@@ -233,7 +216,7 @@ find_acquisition_gate(std::span<const AcquisitionGate> definitions,
             .completedPlugDefinitionIndex = completedPlugDefinitionIndex,
             .progressPlugDefinitionIndex = progressPlugDefinitionIndex,
             .effectDefinitionIndex = *effect,
-            .acquisitionFlag = acquisition->flag,
+            .acquisitionDefinitionIndex = acquisition->definitionIndex,
             .completion = condition->completion,
             .objective = objective};
 }
@@ -485,7 +468,7 @@ bool derive(const Source& source,
                                           result.completedPlugDefinitionIndex,
                                           result.progressPlugDefinitionIndex,
                                           result.effectDefinitionIndex,
-                                          result.acquisitionFlag,
+                                          result.acquisitionDefinitionIndex,
                                           result.completion,
                                           result.objective};
         }
@@ -502,7 +485,7 @@ bool derive(const Source& source,
             unsupported.completedPlugDefinitionIndex = details::kUnavailableItemIndex;
             unsupported.progressPlugDefinitionIndex = details::kUnavailableItemIndex;
             unsupported.effectDefinitionIndex = details::kUnavailableItemIndex;
-            unsupported.acquisitionFlag = kUnavailableAcquisitionIndex;
+            unsupported.acquisitionDefinitionIndex = kUnavailableAcquisitionIndex;
             unsupported.socketLane = detectedLane;
             unsupported.availability = Availability::unsupported;
             if (!append_definition(output, count, report, unsupported)) {
@@ -527,7 +510,7 @@ bool derive(const Source& source,
         definition.completedPlugDefinitionIndex = completed->completedPlugDefinitionIndex;
         definition.progressPlugDefinitionIndex = completed->progressPlugDefinitionIndex;
         definition.effectDefinitionIndex = completed->effectDefinitionIndex;
-        definition.acquisitionFlag = completed->acquisitionFlag;
+        definition.acquisitionDefinitionIndex = completed->acquisitionDefinitionIndex;
         definition.completion = completed->completion;
         for (std::size_t flag = 0; flag < definition.completion.flagCount; ++flag) {
             const std::uint16_t slot = definition.completion.flags[flag];
@@ -630,21 +613,14 @@ bool matches_cached(const Source& source,
         return true;
     };
 
-    // Cached counts are checked before any loop indexes by them.
-    for (const Definition& definition : definitions) {
-        if (definition.completion.flagCount > definition.completion.flags.size()
-            || definition.completion.flagCount > definition.completionAccountFlagIndices.size()
-            || definition.completion.valueCount > definition.completion.values.size()) {
-            return false;
-        }
-    }
     // The slot map covers the highest mapped slot, so it is sized before it is filled.
     std::size_t slotMapSize = 0;
     for (const Definition& definition : definitions) {
         for (std::size_t flag = 0; flag < definition.completion.flagCount; ++flag) {
             if (definition.completionAccountFlagIndices[flag] != kUnavailableCompletionFlagIndex) {
-                slotMapSize = (std::max)(
-                    slotMapSize, static_cast<std::size_t>(definition.completion.flags[flag]) + 1);
+                slotMapSize =
+                    (std::max)(slotMapSize,
+                               static_cast<std::size_t>(definition.completion.flags[flag]) + 1);
             }
         }
     }
@@ -671,7 +647,9 @@ bool matches_cached(const Source& source,
         const bool hasObjective =
             definition.objective.definitionIndex != kUnavailableObjectiveIndex;
         if (detail == nullptr || definition.socketLane >= detail->ordinarySocketCount
-            || definition.acquisitionFlag >= state::unlocks::kUnlockFlagCapacity
+            || find_item(source.items, definition.acquisitionDefinitionIndex) == nullptr
+            || definition.completion.flagCount > definition.completion.flags.size()
+            || definition.completion.valueCount > definition.completion.values.size()
             || hasObjective != (definition.objective.value > 0)
             || (definition.progressPlugDefinitionIndex != details::kUnavailableItemIndex
                 && find_item(source.items, definition.progressPlugDefinitionIndex) == nullptr)
@@ -681,7 +659,7 @@ bool matches_cached(const Source& source,
             return false;
         }
         for (std::size_t flag = 0; flag < definition.completion.flagCount; ++flag) {
-            if (definition.completion.flags[flag] >= state::unlocks::kUnlockFlagCapacity) {
+            if (find_item(source.items, definition.completion.flags[flag]) == nullptr) {
                 return false;
             }
         }
@@ -700,14 +678,14 @@ bool matches_cached(const Source& source,
                 return gate.socketType == socketType;
             });
         if (priorGate != gateEnd) {
-            if (priorGate->flag != definition.acquisitionFlag) {
+            if (priorGate->definitionIndex != definition.acquisitionDefinitionIndex) {
                 return false;
             }
         } else if (acquisitionCount >= acquisitionGates.size()) {
             return false;
         } else {
             acquisitionGates[acquisitionCount++] = {
-                socketType, definition.acquisitionFlag, AcquisitionState::present};
+                socketType, definition.acquisitionDefinitionIndex, AcquisitionState::present};
         }
 
         CompletionCondition effect{};
@@ -738,8 +716,9 @@ bool matches_cached(const Source& source,
                 return false;
             }
             objective = definition.objective.value;
-            objectiveCount = (std::max)(
-                objectiveCount, static_cast<std::size_t>(definition.objective.definitionIndex) + 1);
+            objectiveCount =
+                (std::max)(objectiveCount,
+                           static_cast<std::size_t>(definition.objective.definitionIndex) + 1);
         }
     }
     std::sort(completionConditions.begin(),

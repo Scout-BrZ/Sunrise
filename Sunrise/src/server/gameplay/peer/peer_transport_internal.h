@@ -76,7 +76,8 @@ void notify_external_outcomes(const DisplacedExternals& completed, std::size_t c
 
 /**
  * Tells the lane-0 transport that a group session lost its channel state.
- * @param sessions Session ids copied out under the lock.
+ * @param sessions
+ * Session ids copied out under the lock.
  * @param count Entries in use.
  */
 void reset_transports(const std::uint64_t* sessions, std::size_t count) noexcept;
@@ -106,6 +107,13 @@ find_locked(const state::gameplay::Endpoint& from) noexcept;
 /** @return Link carrying one group session, or null. Callers hold the lock. */
 [[nodiscard]] state::gameplay::PeerLink* find_session_locked(std::uint64_t sessionId) noexcept;
 
+/**
+ * Resolves the session an out-of-band message at one endpoint belongs to.
+ * @param from Peer endpoint.
+ * @return The session id, or zero when it cannot be resolved.
+ */
+[[nodiscard]] std::uint64_t session_for_endpoint(const state::gameplay::Endpoint& from) noexcept;
+
 /** @return A free peer slot, or null. Callers already hold the lock. */
 [[nodiscard]] state::gameplay::PeerLink* allocate_locked() noexcept;
 
@@ -128,5 +136,8 @@ void consume_container(const state::gameplay::Endpoint& from,
 void consume_established(const state::gameplay::Endpoint& from,
                          std::span<const std::byte> payload,
                          std::uint64_t now) noexcept;
+/** Restores an established participant channel from its own still-current native owner link. */
+void bind_participant(const state::gameplay::Endpoint& from,
+                      const state::gameplay::entity_identity::Source& ingress) noexcept;
 
 } // namespace sunrise::server::gameplay::peer

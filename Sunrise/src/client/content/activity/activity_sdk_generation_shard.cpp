@@ -44,7 +44,7 @@ constexpr std::wstring_view kShardExtension = L".pack";
     return true;
 }
 
-/** Copies one authenticated full shard into caller-owned storage. */
+/** Reopens one legacy cache row through the same authenticated full-only gate. */
 [[nodiscard]] bool load_record(const std::wstring& scenarioDirectory,
                                const generated::Digest& sourceFingerprint,
                                const Scenario& scenario,

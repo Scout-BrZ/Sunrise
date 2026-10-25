@@ -138,8 +138,8 @@ void report(ProgressProbe probe, void* context, Phase phase) noexcept {
 
 /** Resolves one exact actor definition tag against the validated sorted actor section. */
 [[nodiscard]] bool
-resolve_actor(void* opaque, std::uint32_t definitionTag, squads::ResolvedActor& output) noexcept {
-    output = {};
+resolve_actor(void* opaque, std::uint32_t definitionTag, std::uint32_t& output) noexcept {
+    output = format::kAbsentIndex;
     if (opaque == nullptr) {
         return false;
     }
@@ -154,8 +154,7 @@ resolve_actor(void* opaque, std::uint32_t definitionTag, squads::ResolvedActor& 
         || static_cast<std::size_t>(found - actors.begin()) >= format::kAbsentIndex) {
         return false;
     }
-    output.actorClassIndex = static_cast<std::uint32_t>(found - actors.begin());
-    output.authoredSpawnProfile = found->authoredSpawnProfile;
+    output = static_cast<std::uint32_t>(found - actors.begin());
     return true;
 }
 
@@ -220,28 +219,6 @@ lua_source(const state::activity_sdk::identity::Expected& identity,
 
 } // namespace
 
-/** Flags the slot rows of the scenes the inventory found without a resource. */
-bool attach_unresourced_scenes(const topology_inventory::Snapshot& topology,
-                               const authored_scene::Snapshot& scenes,
-                               topology_enrichment::Snapshot& enrichment) noexcept {
-    if (enrichment.slots.size() != topology.slots.size()) {
-        return false;
-    }
-    for (const std::uint32_t slotRow : scenes.unresourcedSlots) {
-        if (slotRow >= topology.slots.size()
-            || topology.slots[slotRow].slotType != format::kAuthoredSceneSlotType) {
-            return false;
-        }
-        topology_enrichment::Slot& enriched = enrichment.slots[slotRow];
-        if (enriched.componentClass != format::kAuthoredSceneComponentClass
-            || (enriched.flags & format::kSlotSchemaJoinExact) == 0) {
-            return false;
-        }
-        enriched.flags |= format::kSlotAuthoredSceneUnresourced;
-    }
-    return true;
-}
-
 /** Returns the stable log token for each pipeline result. */
 const char* status_name(Status value) noexcept {
     switch (value) {
@@ -285,6 +262,8 @@ const char* status_name(Status value) noexcept {
         return "publication";
     case Status::luaPublication:
         return "lua_publication";
+    case Status::reload:
+        return "reload";
     }
     return "invalid_input";
 }
@@ -350,8 +329,11 @@ Status stage(const wchar_t* sdkDirectory,
         actor_rsat::Snapshot actorRows{};
         std::vector<std::uint32_t> installedRsats{};
         reader::ScanResult rsatScan{};
-        if (!reader::scan_class(
-                source, actor_rsat::kActorRsatClass, &collect_tag, &installedRsats, rsatScan)) {
+        if (!reader::scan_class(source.directory,
+                                actor_rsat::kActorRsatClass,
+                                &collect_tag,
+                                &installedRsats,
+                                rsatScan)) {
             return Status::actorRsat;
         }
         std::sort(installedRsats.begin(), installedRsats.end());
@@ -486,12 +468,55 @@ Status stage(const wchar_t* sdkDirectory,
         output.identity = identity;
         output.payloadSha256 = payload;
         output.fileBytes = fileBytes;
+        output.luaBytes = luaResult.byteCount;
         output.luaFiles = luaResult.fileCount;
         return Status::ready;
     } catch (...) {
         output = {};
         return cancelled(cancel, cancelContext) ? Status::cancelled : Status::invalidInput;
     }
+}
+
+/** Builds, publishes, and reloads one canonical native SDK generation. */
+Status publish(void* module,
+               const wchar_t* sdkDirectory,
+               const wchar_t* packPath,
+               const reader::Source& source,
+               const pack::Digest& sourceFingerprint,
+               const activity_inventory::Snapshot& activities,
+               topology_inventory::Snapshot& topology,
+               const external_placements::Index& externalPlacements,
+               bool luaDeclarations,
+               CancelProbe cancel,
+               void* cancelContext,
+               Result& output) noexcept {
+    output = {};
+    if (module == nullptr) {
+        return Status::invalidInput;
+    }
+    const Status staged = stage(sdkDirectory,
+                                packPath,
+                                source,
+                                sourceFingerprint,
+                                activities,
+                                topology,
+                                {},
+                                externalPlacements,
+                                luaDeclarations,
+                                cancel,
+                                cancelContext,
+                                nullptr,
+                                nullptr,
+                                output);
+    if (staged != Status::ready) {
+        return staged;
+    }
+    if (!state::activity_sdk::reload(module, output.identity)) {
+        output = {};
+        return Status::reload;
+    }
+    // A reload replaces the catalog the wire descriptors borrow, so they are rebuilt here.
+    return Status::ready;
 }
 
 } // namespace sunrise::client::content::activity::sdk_generation::native_pack_pipeline

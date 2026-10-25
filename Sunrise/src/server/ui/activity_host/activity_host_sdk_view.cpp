@@ -8,6 +8,7 @@
 #include <utility>
 
 #include "../../../client/ui/activity/authored_placement_marker.h"
+#include "../../../core/ui/components/card/ui_card_component.h"
 #include "../../../core/ui/scaling/dpi/ui_dpi_scaling.h"
 #include "../../../state/activity_sdk/generation/runtime.h"
 #include "../../../state/activity_sdk/runtime.h"
@@ -18,11 +19,13 @@
 #include "activity_host_sdk_mission_view.h"
 #include "activity_host_sdk_squad_view.h"
 #include "activity_host_sdk_state_pages.h"
+#include "activity_host_sdk_symbol_pages.h"
 #include "activity_host_tool_window.h"
 
 namespace sunrise::server::ui::activity_host::sdk_view {
 namespace {
 
+namespace card = core::ui::components::card;
 namespace format = state::activity_sdk::format;
 namespace generation = state::activity_sdk::generation;
 namespace host = server::activity::host;
@@ -33,8 +36,8 @@ namespace scaling = core::ui::scaling::dpi;
 
 /** Width of the navigation column, which fits the longest page name with room to spare. */
 constexpr float kNavigationWidth = 132.0F;
-/** The panel's last reload request; zero before the first one. */
-std::uint64_t g_scriptReloadTicket{};
+bool g_scriptReloadRequested{};
+bool g_scriptReloadAccepted{};
 
 /** @return A catalog row count bounded for Dear ImGui's signed clipper. */
 [[nodiscard]] int clipped_count(std::size_t count) noexcept {
@@ -43,7 +46,8 @@ std::uint64_t g_scriptReloadTicket{};
 
 /** Draws the selected activity's Lua attach, VM, delivery, and Host-lane health. */
 void draw_script_runtime(const host::InstanceSnapshot& hostInstance) noexcept {
-    mission::DiagnosticsSnapshot runtime{};
+    // Reused by the UI thread; the complete server roster exceeds a safe local stack budget.
+    static mission::DiagnosticsSnapshot runtime{};
     mission::snapshot(runtime);
     ImGui::Text("Runtime %s", runtime.enabled ? "on" : "off");
     ImGui::SameLine();
@@ -116,18 +120,12 @@ void draw_script_runtime(const host::InstanceSnapshot& hostInstance) noexcept {
     ImGui::Text("Queued %s", hostInstance.outputPending ? "yes" : "no");
 
     if (ImGui::Button("Reload script")) {
-        g_scriptReloadTicket = mission::request_reload({});
+        g_scriptReloadRequested = true;
+        g_scriptReloadAccepted = mission::reload();
     }
-    if (g_scriptReloadTicket != 0) {
-        const mission::ReloadResult result = mission::reload_result(g_scriptReloadTicket);
-        const char* label = result.message.data();
-        if (result.status == mission::ReloadStatus::pending) {
-            label = "reload waits for a safe point";
-        } else if (result.status == mission::ReloadStatus::replaced) {
-            label = "replaced by a newer reload";
-        }
+    if (g_scriptReloadRequested) {
         ImGui::SameLine();
-        ImGui::TextDisabled("%s", label);
+        ImGui::TextDisabled("%s", g_scriptReloadAccepted ? "reload queued" : "runtime unavailable");
     }
 }
 
@@ -303,6 +301,9 @@ void draw_page(const PageRow& row,
 void draw_bound(const sdk::BoundView& view,
                 const format::Scenario& scenario,
                 const host::InstanceSnapshot& instance) noexcept {
+    const sdk::Catalog& catalog = *view.catalog;
+    const auto occurrences = sdk::scenario_occurrences(catalog, scenario);
+    sync_selection(view, occurrences);
     const PageRow& row = draw_navigation();
     marker::set_world_page(row.world);
     ImGui::SameLine();
@@ -386,10 +387,13 @@ void draw(bool& open, const host::InstanceSnapshot* instance) noexcept {
         marker::set_world_page(marker::WorldPage::none);
         return;
     }
-    const bool visible =
-        tool_window::begin("World - Activity Host###activity_host_sdk", open, {0.72F, 0.68F});
+    const bool visible = tool_window::begin(
+        "Activity Host - World###activity_host_sdk", open, {32.0F, 40.0F}, {940.0F, 680.0F});
     if (visible) {
-        draw_content(instance);
+        const card::Scope surface("##activity_host_sdk_card");
+        if (surface.visible()) {
+            draw_content(instance);
+        }
     }
     ImGui::End();
     if (!open) {

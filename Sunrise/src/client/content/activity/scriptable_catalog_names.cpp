@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <span>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -15,14 +14,12 @@
 #include "../../../middleware/content/packages/tables/slot_descriptor_reader.h"
 #include "../../../middleware/content/packages/tables/static_spatial_candidate_reader.h"
 #include "../../../state/build_data/runtime.h"
-#include "../../../state/build_data/scriptables/inline_name_evidence.h"
 #include "../../../state/content/content_catalog.h"
 
 namespace sunrise::client::content::activity::scriptables::internal {
 namespace {
 
 namespace catalog = state::build_data::scriptables;
-namespace names_state = state::build_data::hash_names;
 namespace tables = middleware::content::packages::tables;
 
 struct HashDefinition final {
@@ -30,35 +27,17 @@ struct HashDefinition final {
     std::uint32_t definitionRow{};
 };
 
-[[nodiscard]] bool cancelled(NameCancelCheck check) noexcept {
-    return check != nullptr && check();
+/** @return The compact FNV-1 id used by authored package name hashes. */
+[[nodiscard]] std::uint32_t content_hash(std::string_view value) noexcept {
+    std::uint32_t hash = 2166136261U;
+    for (const unsigned char byte : value) {
+        hash = (hash * 16777619U) ^ byte;
+    }
+    return hash;
 }
 
-/**
- * Finds one identifier name by its hash.
- * @param hashNames Rows sorted by hash, or null for the table State publishes.
- * @param hash Name hash.
- * @param name Receives the matching row.
- * @return True when the chosen table holds that exact hash.
- */
-[[nodiscard]] bool find_identifier(const std::vector<names_state::Name>* hashNames,
-                                   std::uint32_t hash,
-                                   names_state::Name& name) noexcept {
-    if (hashNames == nullptr) {
-        return state::build_data::find_hash_name(hash, name);
-    }
-    const auto found =
-        std::lower_bound(hashNames->begin(),
-                         hashNames->end(),
-                         hash,
-                         [](const names_state::Name& row, std::uint32_t value) noexcept {
-                             return row.hash < value;
-                         });
-    if (found == hashNames->end() || found->hash != hash) {
-        return false;
-    }
-    name = *found;
-    return true;
+[[nodiscard]] bool cancelled(NameCancelCheck check) noexcept {
+    return check != nullptr && check();
 }
 
 [[nodiscard]] bool same_candidate(const catalog::NameCandidate& candidate,
@@ -133,7 +112,6 @@ template <typename NameRow>
                                          std::span<const InlineName> inlineNames,
                                          std::span<const state::content::Definition> definitions,
                                          std::span<const HashDefinition> hashDefinitions,
-                                         const std::vector<names_state::Name>* hashNames,
                                          NameCancelCheck cancel,
                                          std::uint32_t hash) {
     catalog::Name name{};
@@ -202,8 +180,8 @@ template <typename NameRow>
     if (cancelled(cancel)) {
         return false;
     }
-    names_state::Name identifier{};
-    if (find_identifier(hashNames, hash, identifier)
+    state::build_data::hash_names::Name identifier{};
+    if (state::build_data::find_hash_name(hash, identifier)
         && !append_candidate(output,
                              name,
                              std::string_view(identifier.name.data(), identifier.nameLength),
@@ -308,21 +286,15 @@ tag_name_row(const catalog::Snapshot& output, std::uint32_t tag, std::uint32_t c
 /** Resolves authored hashes and exact installed-package definition tags in one snapshot. */
 bool resolve_names(catalog::Snapshot& output,
                    std::span<const InlineName> inlineNames,
-                   const std::vector<state::content::Definition>* installed,
-                   const std::vector<names_state::Name>* hashNames,
                    NameCancelCheck cancel) noexcept {
     try {
-        std::vector<state::content::Definition> definitions{};
-        if (installed != nullptr) {
-            definitions = *installed;
-        } else {
-            definitions.resize(state::content::kDefinitionCatalogCapacity);
-            std::size_t definitionCount = 0;
-            if (!state::content::snapshot(definitions, definitionCount)) {
-                return false;
-            }
-            definitions.resize(definitionCount);
+        std::vector<state::content::Definition> definitions(
+            state::content::kDefinitionCatalogCapacity);
+        std::size_t definitionCount = 0;
+        if (!state::content::snapshot(definitions, definitionCount)) {
+            return false;
         }
+        definitions.resize(definitionCount);
         std::sort(definitions.begin(),
                   definitions.end(),
                   [](const state::content::Definition& first,
@@ -343,9 +315,9 @@ bool resolve_names(catalog::Snapshot& output,
         hashDefinitions.reserve(definitions.size());
         for (std::size_t row = 0; row < definitions.size(); ++row) {
             const state::content::Definition& definition = definitions[row];
-            hashDefinitions.push_back({catalog::inline_name_evidence::hash(std::as_bytes(std::span(
-                                           definition.name.data(), definition.nameLength))),
-                                       static_cast<std::uint32_t>(row)});
+            hashDefinitions.push_back(
+                {content_hash(std::string_view(definition.name.data(), definition.nameLength)),
+                 static_cast<std::uint32_t>(row)});
         }
         std::sort(
             hashDefinitions.begin(),
@@ -394,7 +366,7 @@ bool resolve_names(catalog::Snapshot& output,
         for (const std::uint32_t hash : hashes) {
             if (cancelled(cancel)
                 || !resolve_one_hash_name(
-                    output, inlineNames, definitions, hashDefinitions, hashNames, cancel, hash)) {
+                    output, inlineNames, definitions, hashDefinitions, cancel, hash)) {
                 return false;
             }
         }

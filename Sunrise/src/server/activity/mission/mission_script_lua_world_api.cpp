@@ -11,6 +11,12 @@ namespace {
 
 namespace catalog = state::build_data::scriptables;
 
+[[nodiscard]] std::string_view checked_key(lua_State* state) {
+    std::size_t length = 0;
+    const char* const value = luaL_checklstring(state, 2, &length);
+    return {value, length};
+}
+
 /** @return The Lua-facing name of one world collection kind. */
 [[nodiscard]] const char* collection_name(WorldCollectionKind kind) noexcept {
     switch (kind) {
@@ -158,6 +164,28 @@ namespace catalog = state::build_data::scriptables;
     return nullptr;
 }
 
+/** Pushes one 32-byte digest as 64 lowercase hex characters. */
+void push_digest(lua_State* state, const std::array<std::byte, 32>& digest) {
+    // Lowercase hex digits; every digest and byte field is spelled this way.
+    constexpr char digits[] = "0123456789abcdef";
+    std::array<char, 64> text{};
+    for (std::size_t index = 0; index < digest.size(); ++index) {
+        const auto value = static_cast<std::uint8_t>(digest[index]);
+        text[index * 2] = digits[value >> 4U];
+        text[index * 2 + 1] = digits[value & 0xFU];
+    }
+    lua_pushlstring(state, text.data(), text.size());
+}
+
+void push_u64(lua_State* state, std::uint64_t value) {
+    std::array<char, 32> text{};
+    const auto result = std::to_chars(text.data(), text.data() + text.size(), value);
+    if (result.ec != std::errc{}) {
+        luaL_error(state, "world identity conversion failed");
+    }
+    lua_pushlstring(state, text.data(), static_cast<std::size_t>(result.ptr - text.data()));
+}
+
 void push_world(lua_State* state, const WorldDefinitionApi& api) {
     push_handle(state, kWorldMetatable, WorldHandle{api.generation});
 }
@@ -213,7 +241,7 @@ void push_row(lua_State* state,
     if (owner == nullptr || !current(*owner, collection->generation)) {
         return luaL_error(state, "generated-world collection is stale");
     }
-    const std::string_view key = lua_string_view(state, 2);
+    const std::string_view key = checked_key(state);
     if (key == "count") {
         lua_pushinteger(
             state,
@@ -259,7 +287,7 @@ void push_row(lua_State* state,
     if (owner == nullptr || !current(*owner, collection->generation)) {
         return luaL_error(state, "squad-anchor collection is stale");
     }
-    const std::string_view key = lua_string_view(state, 2);
+    const std::string_view key = checked_key(state);
     if (key == "count") {
         lua_pushinteger(
             state,
@@ -322,7 +350,7 @@ void push_row(lua_State* state,
     if (owner == nullptr || !current(*owner, collection->generation)) {
         return luaL_error(state, "trigger geometry collection is stale");
     }
-    const std::string_view key = lua_string_view(state, 2);
+    const std::string_view key = checked_key(state);
     if (key == "count") {
         WorldRowDefinition row{};
         if (!owner->definitions.world.resolve(owner->definitions.world.context,
@@ -352,7 +380,7 @@ void push_row(lua_State* state,
     if (owner == nullptr || !current(*owner, handle->generation)) {
         return luaL_error(state, "generated-world view is stale");
     }
-    const std::string_view key = lua_string_view(state, 2);
+    const std::string_view key = checked_key(state);
     if (key == "scenario_tag") {
         lua_pushinteger(state, handle->generation.scenarioTag);
     } else if (key == "scenario_name") {
@@ -450,13 +478,20 @@ void push_optional_row(lua_State* state, std::uint32_t value) {
     }
 }
 
+void push_optional_name(lua_State* state, std::string_view value) {
+    if (value.empty()) {
+        lua_pushnil(state);
+    } else {
+        lua_pushlstring(state, value.data(), value.size());
+    }
+}
+
 /** Pushes the lane of one world name field the key selects: value, provenance, or count. */
 void push_name_field(lua_State* state, std::string_view key, const WorldNameDefinition& value) {
     if (key.ends_with("_name")) {
         push_optional_name(state, value.value);
     } else if (key.ends_with("_name_provenance")) {
-        const char* const provenance = provenance_name(value.provenance);
-        push_optional_name(state, provenance == nullptr ? std::string_view{} : provenance);
+        push_optional_name(state, provenance_name(value.provenance));
     } else if (key.ends_with("_name_provenance_code")) {
         lua_pushinteger(state, value.provenance);
     } else if (key.ends_with("_name_candidate_count")) {
@@ -563,7 +598,7 @@ void push_field(lua_State* state, const WorldFieldDefinition& value) {
 int vector_index(lua_State* state) {
     const auto* const handle =
         static_cast<const VectorHandle*>(luaL_checkudata(state, 1, kVectorMetatable));
-    const std::string_view key = lua_string_view(state, 2);
+    const std::string_view key = checked_key(state);
     std::size_t lane = handle->lanes;
     if (key == "x") {
         lane = 0;
@@ -619,14 +654,18 @@ bool push_activity_member(lua_State* state, std::string_view key) {
     return true;
 }
 
-/** Serves the squad handle's `anchors` member. */
-void push_squad_anchors(lua_State* state, const SquadDefinition& squad) {
+/** Serves the squad table's `anchors` member. @return False for any other key. */
+bool push_squad_member(lua_State* state, const SquadDefinition& squad, std::string_view key) {
+    if (key != "anchors") {
+        return false;
+    }
     Impl* const owner = impl_from_state(state);
     if (owner == nullptr || !current(*owner, owner->definitions.world.generation)) {
         lua_pushnil(state);
-        return;
+        return true;
     }
     push_squad_anchor_collection(state, owner->definitions.world.generation, squad.localRow);
+    return true;
 }
 
 } // namespace sunrise::server::activity::mission::lua_vm::detail::world_api

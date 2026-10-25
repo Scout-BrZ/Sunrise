@@ -33,7 +33,8 @@ constexpr DWORD kConflictingOptions = DNS_QUERY_BYPASS_CACHE | DNS_QUERY_NO_LOCA
 }
 
 /**
- * An address literal needs no lookup and cannot name a remote host, so it is passed on untouched.
+ * An address literal needs no lookup and cannot name a remote host, so it is passed on
+ * untouched. Replacing it is what produced the rejected query.
  * @return True when the caller already asked for a numeric address.
  */
 template <typename Character> [[nodiscard]] bool is_numeric(const Character* name) noexcept {

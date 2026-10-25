@@ -17,6 +17,8 @@ using ExecuteRequest = std::int64_t(__fastcall*)(void*, std::byte*) noexcept;
 
 /** Operation 2 selects the direct-buffer POST path. */
 constexpr std::uint32_t kPostOperation = 2;
+/** Returning 5 makes the worker skip the native external operation. */
+constexpr std::int64_t kSkipNativeOperation = 5;
 /** The executor takes a direct response size of at most a signed 32-bit value. */
 constexpr std::int64_t kMaximumResponseCapacity = INT_MAX;
 /** The descriptor owns a fixed 512-byte inline URL. */
@@ -90,14 +92,20 @@ void redirect_url(std::array<char, kUrlCapacity>& url) noexcept {
     std::array<char, kUrlCapacity> rewritten{};
     const std::string_view original = bounded_string(url);
     const std::size_t size = external_server::rewrite_host(original, rewritten);
-    core::log::writef(core::log::Channel::client,
-                      core::log::Level::debug,
-                      "ev=http stage=external from=%.*s to=%.*s result=%s",
-                      static_cast<int>(original.size()),
-                      original.data(),
-                      static_cast<int>(size),
-                      rewritten.data(),
-                      size != 0 ? "ok" : "unchanged");
+    std::array<char, 2 * kUrlCapacity> line{};
+    const int written = std::snprintf(line.data(),
+                                      line.size(),
+                                      "ev=http stage=external from=%.*s to=%.*s result=%s",
+                                      static_cast<int>(original.size()),
+                                      original.data(),
+                                      static_cast<int>(size),
+                                      rewritten.data(),
+                                      size != 0 ? "ok" : "unchanged");
+    if (written > 0) {
+        core::log::write(core::log::Channel::client,
+                         core::log::Level::debug,
+                         {line.data(), static_cast<std::size_t>(written)});
+    }
     if (size != 0) {
         url = rewritten;
     }
@@ -112,20 +120,26 @@ void redirect_url(std::array<char, kUrlCapacity>& url) noexcept {
 [[nodiscard]] std::int64_t unmapped_route(void* wrapper,
                                           const std::array<char, kUrlCapacity>& url) noexcept {
     const std::string_view route = bounded_string(url);
-    core::log::writef(core::log::Channel::client,
-                      core::log::Level::warn,
-                      "ev=http stage=route result=unmapped url=%.*s",
-                      static_cast<int>(route.size()),
-                      route.data());
+    std::array<char, 2 * kUrlCapacity> line{};
+    const int written = std::snprintf(line.data(),
+                                      line.size(),
+                                      "ev=http stage=route result=unmapped url=%.*s",
+                                      static_cast<int>(route.size()),
+                                      route.data());
+    if (written > 0) {
+        core::log::write(core::log::Channel::client,
+                         core::log::Level::warn,
+                         {line.data(), static_cast<std::size_t>(written)});
+    }
     return block_request(wrapper);
 }
 
 } // namespace
 
-/** Routes one HTTP descriptor locally, or to the external server in external-server mode. */
-__declspec(noinline) std::int64_t route_descriptor(const coordinator::CallLease& lease,
-                                                   void* wrapperValue,
-                                                   std::byte* descriptorValue) noexcept {
+/** Routes one game-owned HTTP descriptor without calling the native transport. */
+std::int64_t route_descriptor(const coordinator::CallLease& lease,
+                              void* wrapperValue,
+                              std::byte* descriptorValue) noexcept {
     if (external_server::enabled()) {
         const auto call = reinterpret_cast<ExecuteRequest>(lease.original);
         if (call == nullptr) {

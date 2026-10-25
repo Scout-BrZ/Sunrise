@@ -5,6 +5,7 @@
 #include <string_view>
 #include <vector>
 
+#include "../../../../../core/logging/log.h"
 #include "../../../../../middleware/bap/activity_message/darkness_zone_auth.h"
 #include "../../../../../middleware/bap/activity_message/ghost_link_sense.h"
 #include "../../../../../middleware/content/packages/tables/region_reader.h"
@@ -17,6 +18,7 @@
 #include "../../../../gameplay/gameplay_advertisement.h"
 #include "../../../../gameplay/group/group_host_sessions.h"
 #include "activity_arrival.h"
+#include "activity_member_roster.h"
 #include "activity_mission_seed_roster.h"
 #include "internal.h"
 
@@ -192,6 +194,7 @@ build_roster_snapshot(Session& session,
                       std::span<const TailAuthOverride> tailOverrides) noexcept {
     snapshot = {};
     destinationLength = 0;
+    session.activityDialogueSerialBuilt = session.activityDialogueSerial;
     state::activity::defaults::ActivityDefaults defaults{};
     state::activity::defaults::snapshot(defaults);
     if (session.activity.role == ActivityClientRole::none
@@ -374,7 +377,8 @@ build_roster_snapshot(Session& session,
         }
         // A dialogue body is a pulse: the client plays one line of the cue each time it applies
         // the body, and it applies every body of every msg 5. So it goes out once, in the push
-        // that delivers it, and the slot then carries no body.
+        // that delivers it, and the slot then carries no body. Members replay the dialogue log
+        // below instead.
         if (retained.kind == server::activity::host::ScriptableOverrideKind::dialogue) {
             continue;
         }
@@ -422,6 +426,114 @@ build_roster_snapshot(Session& session,
                                       target.rosterSlotOffset,
                                       target.stateLocalRoster)) {
             return refuse_override("retained_auth_apply");
+        }
+    }
+    // A line plays for every member present when it plays. The owning link hears it in the push
+    // that delivers it; every other present member gets it on its own link straight after, one
+    // line per body because one msg 5 holds one body per sensor, in the order they played. A
+    // member absent at that moment was moved past the line and never gets it. A line this region
+    // cannot place is passed over, so it can neither stall the next ones nor refuse the roster.
+    // A body without the sensor clears it on the client, and a line cleared in the frame it
+    // arrived in never plays: with no new line, the one this link heard last rides along again.
+    server::activity::host::PendingScriptableOverride pulse{};
+    const bool freshPulse =
+        server::activity::host::next_dialogue_pulse(session.activity.session,
+                                                    session.activityDialogueSerial,
+                                                    session.activity.bindingGeneration,
+                                                    pulse);
+    // Only into the region it played in, and only until the client starts another load: another
+    // region's sensor, or the one a load rebuilds, is a fresh one, which would take the carried
+    // line as new and play it again.
+    const std::uint8_t transitionToken =
+        state::activity::membership::reported_transition_token(session.activity.session.sessionId);
+    bool carriedPulse =
+        !freshPulse
+        && server::activity::host::heard_dialogue_pulse(session.activity.session,
+                                                        session.activityDialogueSerial,
+                                                        session.activity.bindingGeneration,
+                                                        pulse)
+        && (!pulse.target.stateLocalRoster || pulse.target.stateLocalRegion == region.index);
+    // The owning link hears a line through its scripted override, not as a fresh pulse here, so
+    // the count is noted the first time a line rides along, whichever way it was delivered.
+    if (freshPulse || (carriedPulse && pulse.estateSerial != session.activityDialogueHeardSerial)) {
+        session.activityDialogueHeardSerial = pulse.estateSerial;
+        session.activityDialogueHeardToken = transitionToken;
+    }
+    carriedPulse = carriedPulse && session.activityDialogueHeardToken == transitionToken;
+    if (freshPulse || carriedPulse) {
+        if (freshPulse) {
+            session.activityDialogueSerialBuilt = pulse.estateSerial;
+        }
+        const server::activity::host::ScriptableTarget& target = pulse.target;
+        // The same group admission the estate uses: an SDK-generated sensor lives in a
+        // state-local group this body may first have to activate or append.
+        std::string_view failure{};
+        if (target.stateLocalRoster) {
+            std::size_t position = snapshot.roster.groups.size();
+            const ExistingGroup existing =
+                layouts::valid_roster_group(pulse.stateLocalRosterGroup)
+                        && target.stateLocalRegion >= 0
+                        && target.rosterGroupIndex
+                               == server::activity::host::kGeneratedRosterGroupIndex
+                    ? find_existing_group(
+                          pulse.stateLocalRosterGroup, scratch, snapshot.roster, position)
+                    : ExistingGroup::conflict;
+            const std::uint32_t bubble =
+                static_cast<std::uint32_t>((std::max)(target.stateLocalRegion, 0))
+                / middleware::content::packages::tables::kSliceSetIndexFactor;
+            if (existing == ExistingGroup::conflict
+                || (existing == ExistingGroup::exact
+                    && !activate_existing_group(position, bubble, scratch, snapshot.roster))
+                || (existing == ExistingGroup::missing
+                    && !append_state_local_group(
+                        pulse.stateLocalRosterGroup, bubble, scratch, snapshot.roster))) {
+                failure = "state_local_group";
+            }
+        } else {
+            const CanonicalGroupStatus status =
+                canonical_group_status(layout, region, target.rosterGroupIndex);
+            if (status != CanonicalGroupStatus::active) {
+                failure = status == CanonicalGroupStatus::inactive ? "group_inactive"
+                                                                   : "group_unknown";
+            }
+        }
+        message::AuthOverride value{};
+        if (failure.empty() && !make_auth_override(pulse, value)) {
+            failure = "encode";
+        }
+        if (failure.empty()
+            && !install_auth_override(layout,
+                                      region,
+                                      scratch,
+                                      snapshot,
+                                      value,
+                                      target.rosterGroupIndex,
+                                      target.rosterSlotOffset,
+                                      target.stateLocalRoster)) {
+            failure = "install";
+        }
+        // A carried line this region no longer places is simply left out.
+        std::array<char, core::log::kLineCapacity> line{};
+        const int written = !freshPulse ? 0 : std::snprintf(
+            line.data(),
+            line.size(),
+            "ev=activity stage=dialogue_replay result=%s reason=%.*s serial=%llu cue=%u "
+            "state_local=%u group=%u slot=%u join=0x%016llX",
+            failure.empty() ? "placed" : "skipped",
+            static_cast<int>(failure.size()),
+            failure.data(),
+            static_cast<unsigned long long>(pulse.estateSerial),
+            static_cast<unsigned>(pulse.dialogueCue),
+            target.stateLocalRoster ? 1U : 0U,
+            static_cast<unsigned>(target.rosterGroupIndex),
+            static_cast<unsigned>(target.rosterSlotOffset),
+            static_cast<unsigned long long>(session.activityMemberKey));
+        if (written > 0) {
+            core::log::write(
+                core::log::Channel::server,
+                failure.empty() ? core::log::Level::info : core::log::Level::warn,
+                {line.data(),
+                 (std::min)(static_cast<std::size_t>(written), line.size() - 1)});
         }
     }
     // The pending override's group goes after the retained estate, where the next push will place
@@ -494,11 +606,11 @@ build_roster_snapshot(Session& session,
     // carries matches nothing.
     snapshot.playerKey = published_player_key(session);
     snapshot.lifetime = lifetimeState;
-    // Hold the native spawn gate until the ws-702 world state reads 8. A spawn before the fade
-    // arms leaves the screen black.
+    // Each player owns its committed region readiness; a local writeback cannot ready peers.
     // A program that opens on a cutscene holds the spawn too, so no body exists to place.
     snapshot.awaitClientSync =
-        !client_in_world(session, refresh)
+        (!client_region_ready(session, refresh)
+         && !cinematic_arrival_publication_allowed(session, refresh))
         || state::activity::membership::program_spawn_hold(session.activity.source.sessionId);
     // Player_BindComponents walks every type-13 reference and the player datum can name any one of
     // them. So every participation record carries the same player key. Selecting the first slot
@@ -507,6 +619,15 @@ build_roster_snapshot(Session& session,
     // The participation record's `+0` latches only when the region index is known.
     snapshot.region = static_cast<std::uint32_t>(region.index);
     snapshot.hasRegion = true;
+    state::activity::membership::PendingMutation members{};
+    if (state::activity::membership::prepare_refresh(
+            session.activity.session.sessionId,
+            state::activity::membership::kAbsentRevision,
+            state::activity::membership::kMinimumRefreshBubble,
+            members)
+        && members.hasSnapshot) {
+        fill_member_roster(snapshot, members.memberDirectory, members.snapshot.identity.opaqueSoid);
+    }
     // The override names the slice set the client is in. The client applies a pair only there, and
     // a forced set with no point in that slice set leaves the biped picker with no transform.
     snapshot.spawnSliceSet =

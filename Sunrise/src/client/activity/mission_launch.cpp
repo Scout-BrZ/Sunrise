@@ -16,6 +16,8 @@
 #include "../../state/build_data/runtime.h"
 #include "../patterns/image_scan.h"
 #include "mission_launch_options.h"
+#include "../../state/activity/campaign_continuation.h"
+#include "../../state/activity/mission/runtime.h"
 
 namespace sunrise::client::activity::mission_launch {
 namespace {
@@ -35,6 +37,8 @@ constexpr auto kMemberRecord = signature<signature_length(kMemberRecordText)>(kM
 constexpr std::size_t kManagerCallOffset = 8;
 /** A near call is its opcode and a 4-byte displacement. */
 constexpr std::size_t kNearCallBytes = 5;
+/** Intel's direct near-call opcode guards a decoded target against layout drift. */
+constexpr std::byte kNearCallOpcode{0xE8};
 
 // Matches the membership-revision test; the exact field offset is what makes it unique.
 constexpr std::string_view kSessionReadyText = "83 B9 6C 08 00 00 00 0F 95 C0 C3";
@@ -326,6 +330,8 @@ arrived(const Snapshot& state,
  * @param rows The published activity catalog.
  * @return The outcome; `queued` when the commit was sent.
  */
+#include "campaign_continuation.inl"
+
 [[nodiscard]] Status
 submit(const Snapshot& state,
        std::span<const state::build_data::activities::Definition> rows) noexcept {
@@ -393,7 +399,8 @@ bool install() noexcept {
         scan_main_image_unique(kCommitSelection, "mission_launch_commit_selection");
     if (record == nullptr || sessionReady == nullptr || memberReady == nullptr
         || construct == nullptr || valid == nullptr || name == nullptr || clearSite == nullptr
-        || select == nullptr || commit == nullptr) {
+        || select == nullptr || commit == nullptr || record[kManagerCallOffset] != kNearCallOpcode
+        || clearSite[0] != kNearCallOpcode) {
         core::log::write(core::log::Channel::client,
                          core::log::Level::warn,
                          "ev=mission_launch stage=install result=fail reason=target");
@@ -421,6 +428,8 @@ bool install() noexcept {
 }
 
 void uninstall() noexcept {
+    if (g_campaignTransfer.active) { finish_campaign_transfer(Status::nativeUnavailable); }
+    continuation::retire(continuation::peek());
     g_resolved.store(false, std::memory_order_release);
     g_natives = {};
 }
@@ -460,6 +469,10 @@ bool request_manual(std::uint16_t index, const forced::ForcedDestination& destin
 
 /** Validates the pending request against the catalog and the client, then submits it. */
 void poll(std::int32_t step) noexcept {
+    // O commit pode reentrar no poll. Uma unica passagem possui a selecao nativa.
+    if (g_launchPolling.test_and_set(std::memory_order_acquire)) { return; }
+    struct PollGuard { ~PollGuard() { g_launchPolling.clear(std::memory_order_release); } } guard;
+    if (poll_campaign_transfer(step)) { return; }
     const auto state = snapshot();
     if (!state.busy) {
         return;

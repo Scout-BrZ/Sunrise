@@ -5,7 +5,6 @@
 #include "handle_cache.h"
 #include "internal.h"
 #include "locator_cache.h"
-#include "overlay.h"
 
 namespace sunrise::middleware::content::packages::reader {
 namespace {
@@ -149,13 +148,11 @@ void release_locations(Scratch& scratch) noexcept {
     }
 }
 
-namespace {
-
-/** Finds the highest installed patch of one package id. */
-[[nodiscard]] bool find_installed(std::wstring_view directory,
-                                  std::uint16_t packageId,
-                                  Path& stem,
-                                  std::uint32_t& patchIndex) noexcept {
+/** Finds the highest-patch file for one package id. */
+bool find_latest(std::wstring_view directory,
+                 std::uint16_t packageId,
+                 Path& stem,
+                 std::uint32_t& patchIndex) noexcept {
     stem = {};
     patchIndex = 0;
     const std::uint64_t directoryKey = locator_cache::directory_hash(directory);
@@ -196,89 +193,26 @@ namespace {
     return locator_cache::find(directoryKey, packageId, stem, patchIndex);
 }
 
-} // namespace
-
-/** A mod-served generation above the installed ones becomes the latest. */
-bool find_latest(std::wstring_view directory,
-                 bool installedOnly,
-                 std::uint16_t packageId,
-                 Path& stem,
-                 std::uint32_t& patchIndex) noexcept {
-    const bool installed = find_installed(directory, packageId, stem, patchIndex);
-    std::uint32_t served = 0;
-    if (installedOnly || !overlay::latest(packageId, served)) {
-        return installed;
-    }
-    if (installed) {
-        patchIndex = (std::max)(patchIndex, served);
-        return true;
-    }
-    // A new package exists only in its mod, so its stem is the served file's.
-    Path path{};
-    if (!overlay::find(packageId, served, path)
-        || !copy_stem(std::wstring_view(path.chars.data()), stem)) {
-        return false;
-    }
-    patchIndex = served;
-    return true;
-}
-
-namespace {
-
-/**
- * Drops every cache whose key omits the source directory or read mode.
- * Headers, tables and blocks are keyed by package and patch, and a mod can serve the same patch
- * index as an installed file. Open files are keyed by path, so they stay.
- * @param scratch Reader whose caches are dropped.
- */
-void drop_source_caches(Scratch& scratch) noexcept {
-    release_locations(scratch);
-    scratch.packageLocationFallback = {};
-    for (HeaderSlot& slot : scratch.headers) {
-        slot.valid = false;
-    }
-    // Dropped slots stay chained otherwise, and the next hold would chain one slot twice.
-    clear_slot_index(scratch.tableIndex);
-    for (TableSlot& slot : scratch.tables) {
-        slot.occupied = false;
-        slot.entryCount = 0;
-        slot.blockCount = 0;
-        slot.used = 0;
-    }
-    scratch.tableCursor = 0;
-    clear_slot_index(scratch.blockIndex);
-    for (BlockSlot& slot : scratch.blocks) {
-        slot.valid = false;
-    }
-    scratch.blockCursor = 0;
-}
-
-} // namespace
-
-/** Resolves one package once per reader, source directory and read mode. */
+/** Resolves one package once per reader and source directory. */
 bool resolve_latest(Scratch& scratch,
-                    const Source& source,
+                    std::wstring_view directory,
                     std::uint16_t packageId,
                     const PackageLocation*& output) noexcept {
     output = nullptr;
-    const std::wstring_view directory = source.directory;
-    if (source.installedOnly != scratch.packageInstalledOnly) {
-        drop_source_caches(scratch);
-        scratch.packageInstalledOnly = source.installedOnly;
-    }
     // The key is compared by content. A borrowed pointer identity could alias a freed and
     // reallocated directory string and serve stale locations.
     const bool sameDirectory =
         directory.size() != 0 && directory.size() == scratch.packageDirectoryLength
         && std::equal(directory.begin(), directory.end(), scratch.packageDirectory.chars.begin());
     if (!sameDirectory) {
-        drop_source_caches(scratch);
+        release_locations(scratch);
         scratch.packageDirectory = {};
         scratch.packageDirectoryLength = 0;
         if (directory.size() < scratch.packageDirectory.chars.size()) {
             std::copy(directory.begin(), directory.end(), scratch.packageDirectory.chars.begin());
             scratch.packageDirectoryLength = directory.size();
         }
+        scratch.packageLocationFallback = {};
     }
     PackageLocationSlot* const slot = location_slot(scratch, packageId);
     if (slot != nullptr && slot->held) {
@@ -289,10 +223,8 @@ bool resolve_latest(Scratch& scratch,
 
     ++scratch.packageLocationMisses;
     PackageLocation pending{};
-    pending.found =
-        find_latest(directory, source.installedOnly, packageId, pending.stem, pending.patchIndex)
-        && build_path(
-            pending.stem, packageId, pending.patchIndex, source.installedOnly, pending.latestPath);
+    pending.found = find_latest(directory, packageId, pending.stem, pending.patchIndex)
+                    && build_path(pending.stem, pending.patchIndex, pending.latestPath);
     // A full or unallocated table keeps the result in the fallback, so the caller still gets it.
     PackageLocation& kept = slot != nullptr ? slot->location : scratch.packageLocationFallback;
     kept = pending;
@@ -304,15 +236,8 @@ bool resolve_latest(Scratch& scratch,
     return kept.found;
 }
 
-/** A mod-served generation is read from its own file; every other one sits beside the stem. */
-bool build_path(const Path& stem,
-                std::uint16_t packageId,
-                std::uint32_t patchIndex,
-                bool installedOnly,
-                Path& path) noexcept {
-    if (!installedOnly && overlay::find(packageId, patchIndex, path)) {
-        return true;
-    }
+/** Builds the full path of one patch of a package stem. */
+bool build_path(const Path& stem, std::uint32_t patchIndex, Path& path) noexcept {
     path = {};
     const int written = std::swprintf(
         path.chars.data(), path.chars.size(), L"%s_%u.pkg", stem.chars.data(), patchIndex);

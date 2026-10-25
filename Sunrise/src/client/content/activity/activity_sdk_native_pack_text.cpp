@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -183,23 +184,6 @@ void log_dialogue_list(const squads::DescriptorFact& descriptor,
             level,
             {line.data(), (std::min)(static_cast<std::size_t>(written), line.size() - 1U)});
     }
-}
-
-/** @return The log result name of one cue status. */
-const char* cue_status_name(dialogue_list::CueStatus status) noexcept {
-    switch (status) {
-    case dialogue_list::CueStatus::resolved:
-        return "cue_resolved";
-    case dialogue_list::CueStatus::ambiguous:
-        return "cue_ambiguous";
-    case dialogue_list::CueStatus::missing:
-        return "cue_missing";
-    case dialogue_list::CueStatus::malformed:
-        return "cue_malformed";
-    case dialogue_list::CueStatus::mismatched:
-        return "cue_window_mismatch";
-    }
-    return "cue_unknown";
 }
 
 } // namespace
@@ -417,25 +401,24 @@ bool attach_authored_text(const topology_inventory::Snapshot& topology,
                     cueRow.cueIndex = static_cast<std::uint32_t>(cue);
                     cueRow.listTag = resourceTag;
                     cueRow.definitionHash = row.definitionHash;
-                    cueRow.authoredWindowSeconds = row.windowSeconds;
-                    const bool mismatched = row.status == dialogue_list::CueStatus::mismatched;
-                    const bool hasLines =
-                        mismatched || row.status == dialogue_list::CueStatus::resolved;
-                    if (hasLines) {
+                    cueRow.authoredWindowSeconds = row.seconds;
+                    if (row.status == dialogue_list::CueStatus::resolved) {
                         cueRow.lineCount = row.lineCount;
-                        cueRow.flags = format::kDialogueCueLinesExact
-                                       | (mismatched ? format::kDialogueCueWindowMismatch : 0U);
+                        cueRow.flags = format::kDialogueCueLinesExact;
                     }
                     output.dialogueCues.push_back(cueRow);
-                    if (row.status != dialogue_list::CueStatus::resolved) {
-                        log_dialogue_list(descriptor,
-                                          resourceTag,
-                                          cue_status_name(row.status),
-                                          row.definitionHash,
-                                          static_cast<std::uint32_t>(cue),
-                                          core::log::Level::warn);
-                    }
-                    if (!hasLines) {
+                    if (row.status == dialogue_list::CueStatus::ambiguous
+                        || row.status == dialogue_list::CueStatus::missing
+                        || row.status == dialogue_list::CueStatus::malformed) {
+                        log_dialogue_list(
+                            descriptor,
+                            resourceTag,
+                            row.status == dialogue_list::CueStatus::ambiguous ? "cue_ambiguous"
+                            : row.status == dialogue_list::CueStatus::missing ? "cue_missing"
+                                                                              : "cue_malformed",
+                            row.definitionHash,
+                            static_cast<std::uint32_t>(cue),
+                            core::log::Level::warn);
                         continue;
                     }
                     // Both takes of a line normally reference the same text; each is still its
@@ -796,6 +779,28 @@ bool attach_dialogue_cue_counts(const topology_inventory::Snapshot& topology,
     } catch (...) {
         return false;
     }
+}
+
+/** Flags the slot rows of the scenes the inventory found without a resource. */
+bool attach_unresourced_scenes(const topology_inventory::Snapshot& topology,
+                               const authored_scene::Snapshot& scenes,
+                               topology_enrichment::Snapshot& enrichment) noexcept {
+    if (enrichment.slots.size() != topology.slots.size()) {
+        return false;
+    }
+    for (const std::uint32_t slotRow : scenes.unresourcedSlots) {
+        if (slotRow >= topology.slots.size()
+            || topology.slots[slotRow].slotType != format::kAuthoredSceneSlotType) {
+            return false;
+        }
+        topology_enrichment::Slot& enriched = enrichment.slots[slotRow];
+        if (enriched.componentClass != format::kAuthoredSceneComponentClass
+            || (enriched.flags & format::kSlotSchemaJoinExact) == 0) {
+            return false;
+        }
+        enriched.flags |= format::kSlotAuthoredSceneUnresourced;
+    }
+    return true;
 }
 
 } // namespace sunrise::client::content::activity::sdk_generation::native_pack_pipeline

@@ -6,6 +6,7 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="src\server\activity\adieu_ending\controller.cpp" />
     <ClCompile Include="vendor\lua\lapi.c"><Filter>Vendor\Lua</Filter></ClCompile>
     <ClCompile Include="vendor\lua\lauxlib.c"><Filter>Vendor\Lua</Filter></ClCompile>
     <ClCompile Include="vendor\lua\lbaselib.c"><Filter>Vendor\Lua</Filter></ClCompile>
@@ -34,6 +35,7 @@
     <ClCompile Include="vendor\lua\lzio.c"><Filter>Vendor\Lua</Filter></ClCompile>
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="src\server\activity\adieu_ending\controller.h" />
     <ClInclude Include="vendor\lua\lapi.h"><Filter>Vendor\Lua</Filter></ClInclude>
     <ClInclude Include="vendor\lua\lauxlib.h"><Filter>Vendor\Lua</Filter></ClInclude>
     <ClInclude Include="vendor\lua\lcode.h"><Filter>Vendor\Lua</Filter></ClInclude>

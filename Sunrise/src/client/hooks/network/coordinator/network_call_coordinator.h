@@ -12,11 +12,11 @@ enum class ConsumerKind {
     http,
 };
 
-/** Ingress sets every field. */
+/** State copied at ingress and kept until egress. */
 struct CallLease final {
-    void* original;
-    sunrise::client::network::HttpConsumer httpConsumer;
-    bool accepting;
+    void* original{};
+    sunrise::client::network::HttpConsumer httpConsumer{};
+    bool accepting{};
 };
 
 /** The exact ingress ABI every base-network replacement body calls. */

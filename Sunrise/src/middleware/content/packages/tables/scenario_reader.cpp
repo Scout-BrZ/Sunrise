@@ -170,13 +170,12 @@ bool slice_state_at(std::span<const std::byte> blob,
  * Reads the index and registry of one slice-set entry.
  * @param blob Whole slice-set entry bytes.
  * @param output Receives the entry fields.
- * @return True when both fields fit and the scaled index stays in range.
+ * @return True when both fields are inside the blob.
  */
 bool slice_entry(std::span<const std::byte> blob, SliceEntry& output) noexcept {
     output = {};
     if (!read(blob, kSliceEntryIndexOffset, output.index)
-        || !read(blob, kSliceEntryRegistryOffset, output.registryTag)
-        || output.index > (std::numeric_limits<std::uint32_t>::max)() / kSliceSetIndexFactor) {
+        || !read(blob, kSliceEntryRegistryOffset, output.registryTag)) {
         output = {};
         return false;
     }

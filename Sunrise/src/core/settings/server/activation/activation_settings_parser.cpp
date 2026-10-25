@@ -38,6 +38,36 @@ bool Parser::activation_settings(server::activation::Settings& output) noexcept 
                 return false;
             }
             candidate.missionScripting = value;
+        } else if (key == "single_private_ambassador") {
+            if (!boolean(value)) {
+                return false;
+            }
+            candidate.singlePrivateAmbassador = value;
+        } else if (key == "peer_region_facts") {
+            if (!boolean(value)) {
+                return false;
+            }
+            candidate.peerRegionFacts = value;
+        } else if (key == "unfiltered_shared_dialogue") {
+            if (!boolean(value)) {
+                return false;
+            }
+            candidate.unfilteredSharedDialogue = value;
+        } else if (key == "claim_released_entities") {
+            if (!boolean(value)) {
+                return false;
+            }
+            candidate.claimReleasedEntities = value;
+        } else if (key == "purge_abandoned_entities") {
+            if (!boolean(value)) {
+                return false;
+            }
+            candidate.purgeAbandonedEntities = value;
+        } else if (key == "purge_state_change_entities") {
+            if (!boolean(value)) {
+                return false;
+            }
+            candidate.purgeStateChangeEntities = value;
         } else if (!skip_value(0)) {
             return false;
         }

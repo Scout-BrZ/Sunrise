@@ -5,8 +5,10 @@
 #include "../content/activity/activity_sdk_generation_worker.h"
 #include "../content/activity/scriptable_catalog_worker.h"
 #include "../content/investment/worker.h"
+#include "../hooks/account_registration/account_registration.h"
 #include "../hooks/assert_handler/assert_handler_lifecycle.h"
 #include "../hooks/async_io/async_io_lifetime_guard.h"
+#include "../hooks/content_resource_guard/content_resource_guard.h"
 #include "../hooks/bootflow/bootflow_hook_lifecycle.h"
 #include "../hooks/bootflow/bootflow_texture_override.h"
 #include "../hooks/cine_probe/cine_probe.h"
@@ -16,9 +18,11 @@
 #include "../hooks/hitch_probe/hitch_probe.h"
 #include "../hooks/inactivity/inactivity_override.h"
 #include "../hooks/infinite_ammo/infinite_ammo.h"
+#include "../hooks/instance_mutex/instance_mutex_release.h"
+#include "../hooks/machine_id/machine_id_override.h"
+#include "../hooks/network/presence_publication.h"
 #include "../hooks/network/runtime.h"
 #include "../hooks/noclip/runtime.h"
-#include "../hooks/package_path/package_path_redirect.h"
 #include "../hooks/package_trust/package_trust_bypass.h"
 #include "../hooks/polled_input/runtime.h"
 #include "../hooks/retail_log/retail_log_lifecycle.h"
@@ -57,20 +61,46 @@ bool shutdown() noexcept {
         ReleaseSRWLockExclusive(&runtime::g_lock);
         return false;
     }
-    // Detached after presentation, so no later frame can apply the cursor policy.
-    hooks::cursor::uninstall();
-    hooks::polled_input::uninstall();
+    // Stop game-tick producers before clearing their input, world and object accessors.
     if (!hooks::teleport::uninstall()) {
-        core::log::write(core::log::Channel::client,
-                         core::log::Level::error,
-                         "ev=shutdown stage=teleport_studio result=fail");
         ReleaseSRWLockExclusive(&runtime::g_lock);
         return false;
     }
+    // Detached after presentation, so no later frame can apply the cursor policy.
+    hooks::cursor::uninstall();
+    hooks::polled_input::uninstall();
     if (!hooks::world_objects::uninstall()) {
         core::log::write(core::log::Channel::client,
                          core::log::Level::error,
                          "ev=shutdown stage=world_objects result=fail");
+        ReleaseSRWLockExclusive(&runtime::g_lock);
+        return false;
+    }
+    if (!hooks::presence_publication::uninstall()) {
+        core::log::write(core::log::Channel::client,
+                         core::log::Level::error,
+                         "ev=shutdown stage=presence_publication result=fail");
+        ReleaseSRWLockExclusive(&runtime::g_lock);
+        return false;
+    }
+    if (!hooks::account_registration::uninstall()) {
+        core::log::write(core::log::Channel::client,
+                         core::log::Level::error,
+                         "ev=shutdown stage=account_registration result=fail");
+        ReleaseSRWLockExclusive(&runtime::g_lock);
+        return false;
+    }
+    if (!hooks::machine_id::uninstall()) {
+        core::log::write(core::log::Channel::client,
+                         core::log::Level::error,
+                         "ev=shutdown stage=machine_id result=fail");
+        ReleaseSRWLockExclusive(&runtime::g_lock);
+        return false;
+    }
+    if (!hooks::instance_mutex::uninstall()) {
+        core::log::write(core::log::Channel::client,
+                         core::log::Level::error,
+                         "ev=shutdown stage=instance_mutex result=fail");
         ReleaseSRWLockExclusive(&runtime::g_lock);
         return false;
     }
@@ -126,13 +156,6 @@ bool shutdown() noexcept {
         ReleaseSRWLockExclusive(&runtime::g_lock);
         return false;
     }
-    if (!hooks::package_path::uninstall()) {
-        core::log::write(core::log::Channel::client,
-                         core::log::Level::error,
-                         "ev=shutdown stage=package_path result=fail");
-        ReleaseSRWLockExclusive(&runtime::g_lock);
-        return false;
-    }
     if (!hooks::assert_handler::uninstall()) {
         ReleaseSRWLockExclusive(&runtime::g_lock);
         return false;
@@ -141,6 +164,11 @@ bool shutdown() noexcept {
         core::log::write(core::log::Channel::client,
                          core::log::Level::error,
                          "ev=shutdown stage=retail_log result=fail");
+        ReleaseSRWLockExclusive(&runtime::g_lock);
+        return false;
+    }
+    // Nao descarrega a DLL enquanto houver um desvio ou stub que nao foi removido.
+    if (!hooks::content_resource_guard::uninstall()) {
         ReleaseSRWLockExclusive(&runtime::g_lock);
         return false;
     }
@@ -161,7 +189,6 @@ bool shutdown() noexcept {
         runtime::g_platformModule = nullptr;
     }
     targets::game::retail_log::clear();
-    targets::game::package_path::clear();
     targets::game::content::clear();
     targets::game::network::clear();
     runtime::g_mainStage = runtime::StageState::pending;

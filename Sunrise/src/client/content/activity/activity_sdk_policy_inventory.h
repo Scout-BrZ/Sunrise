@@ -102,7 +102,7 @@ struct Inputs final {
     std::uint32_t objectCount{};
 };
 
-/** One Text row before its string offset is linked. */
+/** One format-v12 Text row before its string offset is linked. */
 struct TextRow final {
     Text value{};
     std::uint32_t kind{};
@@ -111,7 +111,7 @@ struct TextRow final {
     bool operator==(const TextRow&) const = default;
 };
 
-/** One Capability row before its strings are linked. */
+/** One format-v12 Capability row before its strings are linked. */
 struct Capability final {
     Text id{};
     Text operation{};
@@ -134,7 +134,7 @@ struct Capability final {
     }
 };
 
-/** One Gate row before its strings are linked. */
+/** One format-v12 Gate row before its strings are linked. */
 struct Gate final {
     Text gate{};
     Text status{};
@@ -146,7 +146,7 @@ struct Gate final {
     bool operator==(const Gate&) const = default;
 };
 
-/** One Refusal row before its strings are linked. */
+/** One format-v12 Refusal row before its strings are linked. */
 struct Refusal final {
     Text id{};
     Text exposure{};

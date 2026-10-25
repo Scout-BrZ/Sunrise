@@ -1,11 +1,15 @@
 /** Scriptable Auth overrides: target eligibility and the entry points a mission script calls. */
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <mutex>
 #include <shared_mutex>
 #include <span>
 
+#include "../../core/logging/log.h"
+#include "../../core/settings/settings.h"
 #include "../../state/build_data/runtime.h"
 #include "../activity/host_runtime.h"
 #include "internal.h"
@@ -17,6 +21,21 @@ namespace {
 namespace layouts = state::build_data::scenarios;
 namespace roster_message = middleware::bap::activity_message::sensor_auth_update;
 namespace tables = middleware::content::packages::tables;
+
+/** @return Authenticated private links bound to this activity, one per member playing it. */
+[[nodiscard]] std::size_t
+private_member_links_locked(const state::activity::SessionBinding& binding) noexcept {
+    std::size_t count = 0;
+    for (const Session& session : sessions()) {
+        if (session.id != 0 && session.authenticated
+            && session.activity.role == ActivityClientRole::privateCurrent
+            && session.activity.bindingGeneration != 0
+            && state::activity::same_binding(session.activity.session, binding)) {
+            ++count;
+        }
+    }
+    return count;
+}
 
 /** @return True when a generated group owns the exact requested type-23 Auth slot. */
 [[nodiscard]] bool valid_state_local_type23_target(const activity::host::ScriptableTarget& target,
@@ -218,14 +237,16 @@ bool activity_type23_override_available(const state::activity::SessionBinding& b
                                         std::uint64_t expectedGeneration) noexcept {
     const std::shared_lock lock(session_lock());
     std::size_t linkCount = 0;
-    const Session* const session = unique_activity_link_locked(binding, linkCount);
+    const Session* const session =
+        activity_link_for_generation_locked(binding, expectedGeneration, linkCount);
     const bool available =
         session != nullptr
         && canonical_type23_available_locked(*session, target, expectedRegion, expectedGeneration);
     return available;
 }
 
-/** Queues a type-23 override only while exactly one authenticated link owns the binding. */
+/** Queues a type-23 override only while the requested authenticated client generation owns the
+ * binding. */
 bool request_activity_type23_override(
     const state::activity::SessionBinding& binding,
     const activity::host::ScriptableTarget& target,
@@ -237,7 +258,8 @@ bool request_activity_type23_override(
     const activity::host::ScriptableOutputReservation* reservation) noexcept {
     const std::lock_guard lock(session_lock());
     std::size_t linkCount = 0;
-    const Session* const session = unique_activity_link_locked(binding, linkCount);
+    const Session* const session =
+        activity_link_for_generation_locked(binding, expectedGeneration, linkCount);
     const bool queued =
         session != nullptr
         && canonical_type23_available_locked(*session, target, expectedRegion, expectedGeneration)
@@ -246,7 +268,8 @@ bool request_activity_type23_override(
     return queued;
 }
 
-/** Queues one activity lifetime change while exactly one authenticated link owns the binding. */
+/** Queues one activity lifetime change while the requested authenticated client generation owns the
+ * binding. */
 bool request_activity_lifetime_override(
     const state::activity::SessionBinding& binding,
     std::uint8_t lifetimeState,
@@ -255,7 +278,8 @@ bool request_activity_lifetime_override(
     const activity::host::ScriptableOutputReservation* reservation) noexcept {
     const std::lock_guard lock(session_lock());
     std::size_t linkCount = 0;
-    const Session* const session = unique_activity_link_locked(binding, linkCount);
+    const Session* const session =
+        activity_link_for_generation_locked(binding, expectedGeneration, linkCount);
     const bool queued = session != nullptr
                         && lifetime_available_locked(*session, expectedRegion, expectedGeneration)
                         && activity::host::request_lifetime_override(
@@ -276,7 +300,8 @@ bool request_activity_state_local_type23_override(
     const activity::host::ScriptableOutputReservation* reservation) noexcept {
     const std::lock_guard lock(session_lock());
     std::size_t linkCount = 0;
-    const Session* const session = unique_activity_link_locked(binding, linkCount);
+    const Session* const session =
+        activity_link_for_generation_locked(binding, expectedGeneration, linkCount);
     const bool queued =
         session != nullptr
         && state_local_type23_available_locked(
@@ -305,7 +330,8 @@ bool request_activity_sdk_auth_override(
     activity::host::ScriptableOverrideKind kind) noexcept {
     const std::lock_guard lock(session_lock());
     std::size_t linkCount = 0;
-    const Session* const session = unique_activity_link_locked(binding, linkCount);
+    const Session* const session =
+        activity_link_for_generation_locked(binding, expectedGeneration, linkCount);
     const bool available =
         session != nullptr
         && (target.stateLocalRoster
@@ -330,20 +356,23 @@ bool request_activity_sdk_auth_override(
     return queued;
 }
 
-/** Queues a type-31 pulse only while exactly one authenticated link owns the binding. */
+/** Queues a type-31 pulse only while the requested authenticated client generation owns the
+ * binding. */
 bool request_activity_type31_override(
     const state::activity::SessionBinding& binding,
     const activity::host::ScriptableTarget& target,
     std::int32_t expectedRegion,
+    std::uint64_t expectedGeneration,
     const activity::host::ScriptableOutputReservation* reservation,
     bool enabled) noexcept {
     const std::lock_guard lock(session_lock());
     std::size_t linkCount = 0;
-    const Session* const session = unique_activity_link_locked(binding, linkCount);
-    const bool queued =
-        expectedRegion >= 0 && session != nullptr
-        && selected_region_index_locked(*session) == expectedRegion
-        && activity::host::request_type31_override(binding, target, reservation, enabled);
+    const Session* const session =
+        activity_link_for_generation_locked(binding, expectedGeneration, linkCount);
+    const bool queued = expectedRegion >= 0 && session != nullptr
+                        && selected_region_index_locked(*session) == expectedRegion
+                        && activity::host::request_type31_override(
+                            binding, target, expectedGeneration, reservation, enabled);
     return queued;
 }
 
@@ -358,7 +387,8 @@ bool request_activity_state_local_type31_override(
     bool enabled) noexcept {
     const std::lock_guard lock(session_lock());
     std::size_t linkCount = 0;
-    const Session* const session = unique_activity_link_locked(binding, linkCount);
+    const Session* const session =
+        activity_link_for_generation_locked(binding, expectedGeneration, linkCount);
     const std::int32_t region = session != nullptr ? selected_region_index_locked(*session) : -1;
     const bool queued =
         expectedRegion >= 0 && expectedGeneration != 0 && session != nullptr
@@ -381,7 +411,8 @@ bool request_activity_state_local_sequence_override(
     const activity::host::ScriptableOutputReservation* reservation) noexcept {
     const std::lock_guard lock(session_lock());
     std::size_t linkCount = 0;
-    const Session* const session = unique_activity_link_locked(binding, linkCount);
+    const Session* const session =
+        activity_link_for_generation_locked(binding, expectedGeneration, linkCount);
     const std::int32_t region = session != nullptr ? selected_region_index_locked(*session) : -1;
     const bool queued =
         expectedRegion >= 0 && expectedGeneration != 0 && session != nullptr
@@ -407,7 +438,8 @@ bool request_activity_state_local_cinematic_override(
     const activity::host::ScriptableOutputReservation* reservation) noexcept {
     const std::lock_guard lock(session_lock());
     std::size_t linkCount = 0;
-    const Session* const session = unique_activity_link_locked(binding, linkCount);
+    const Session* const session =
+        activity_link_for_generation_locked(binding, expectedGeneration, linkCount);
     const std::int32_t region = session != nullptr ? selected_region_index_locked(*session) : -1;
     const bool queued =
         expectedRegion >= 0 && expectedGeneration != 0 && session != nullptr
@@ -433,7 +465,8 @@ bool request_activity_state_local_performance_override(
     const activity::host::ScriptableOutputReservation* reservation) noexcept {
     const std::lock_guard lock(session_lock());
     std::size_t linkCount = 0;
-    const Session* const session = unique_activity_link_locked(binding, linkCount);
+    const Session* const session =
+        activity_link_for_generation_locked(binding, expectedGeneration, linkCount);
     const std::int32_t region = session != nullptr ? selected_region_index_locked(*session) : -1;
     const bool queued =
         expectedRegion >= 0 && expectedGeneration != 0 && session != nullptr
@@ -461,7 +494,8 @@ bool request_activity_state_local_authored_scene_override(
     bool stop) noexcept {
     const std::lock_guard lock(session_lock());
     std::size_t linkCount = 0;
-    const Session* const session = unique_activity_link_locked(binding, linkCount);
+    const Session* const session =
+        activity_link_for_generation_locked(binding, expectedGeneration, linkCount);
     const std::int32_t region = session != nullptr ? selected_region_index_locked(*session) : -1;
     const bool queued =
         expectedRegion >= 0 && expectedGeneration != 0 && session != nullptr
@@ -492,8 +526,29 @@ bool request_activity_state_local_dialogue_override(
     const activity::host::ScriptableOutputReservation* reservation,
     middleware::bap::activity_message::scriptable_auth::Type2LaneClientRef filter) noexcept {
     const std::lock_guard lock(session_lock());
+    // A filtered line waits on the client until its player enters the volume, and a client not
+    // already inside when the line arrives never plays it, alone or not. The line plays at once
+    // for everyone instead, since whoever set it off has moved the whole party on.
+    if (filter.slotIndex >= 0
+        && core::settings::get().server.activation.unfilteredSharedDialogue) {
+        std::array<char, core::log::kLineCapacity> line{};
+        const int written = std::snprintf(line.data(),
+                                          line.size(),
+                                          "ev=activity stage=dialogue_filter result=dropped "
+                                          "cue=%u members=%zu filter_key=0x%08X",
+                                          static_cast<unsigned>(cueIndex),
+                                          private_member_links_locked(binding),
+                                          static_cast<unsigned>(filter.registryKey));
+        if (written > 0) {
+            core::log::write(core::log::Channel::server,
+                             core::log::Level::info,
+                             {line.data(), static_cast<std::size_t>(written)});
+        }
+        filter = {};
+    }
     std::size_t linkCount = 0;
-    const Session* const session = unique_activity_link_locked(binding, linkCount);
+    const Session* const session =
+        activity_link_for_generation_locked(binding, expectedGeneration, linkCount);
     const std::int32_t region = session != nullptr ? selected_region_index_locked(*session) : -1;
     const bool queued =
         expectedRegion >= 0 && expectedGeneration != 0 && session != nullptr
@@ -524,7 +579,8 @@ bool request_activity_state_local_objective_reset(
     const activity::host::ScriptableOutputReservation* reservation) noexcept {
     const std::lock_guard lock(session_lock());
     std::size_t linkCount = 0;
-    const Session* const session = unique_activity_link_locked(binding, linkCount);
+    const Session* const session =
+        activity_link_for_generation_locked(binding, expectedGeneration, linkCount);
     const std::int32_t region = session != nullptr ? selected_region_index_locked(*session) : -1;
     const bool queued =
         expectedRegion >= 0 && expectedGeneration != 0 && session != nullptr
@@ -549,7 +605,8 @@ bool request_activity_state_local_task_override(
     const activity::host::ScriptableOutputReservation* reservation) noexcept {
     const std::lock_guard lock(session_lock());
     std::size_t linkCount = 0;
-    const Session* const session = unique_activity_link_locked(binding, linkCount);
+    const Session* const session =
+        activity_link_for_generation_locked(binding, expectedGeneration, linkCount);
     const std::int32_t region = session != nullptr ? selected_region_index_locked(*session) : -1;
     const bool queued =
         expectedRegion >= 0 && expectedGeneration != 0 && session != nullptr

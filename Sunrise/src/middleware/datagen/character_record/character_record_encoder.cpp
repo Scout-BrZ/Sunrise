@@ -42,9 +42,9 @@ constexpr std::size_t kCardFlagOffset = 8;
         static_cast<std::int8_t>(character.gender),
         static_cast<std::int8_t>(character.characterClass),
     };
-    const auto& headerSource =
-        character.appearanceHeaderValid ? character.appearanceHeader : layout::kHeaderBlockBytes;
-    std::memcpy(identity.headerBlock.data(), headerSource.data(), headerSource.size());
+    std::memcpy(identity.headerBlock.data(),
+                layout::kHeaderBlockBytes.data(),
+                layout::kHeaderBlockBytes.size());
 
     output = {};
     appearance::apply_sentinels(output);
@@ -116,6 +116,7 @@ void report_perk_banks(const char* family, const layout::Appearance& block) noex
 [[nodiscard]] layout::Summary build_summary(std::int32_t light,
                                             std::uint16_t titleRecordIndex) noexcept {
     layout::Summary summary{};
+    summary.lightFloatA = static_cast<float>(light);
     summary.light = light;
     summary.hashA = layout::kNoHash;
     summary.indexD = titleRecordIndex;
@@ -128,12 +129,14 @@ void report_perk_banks(const char* family, const layout::Appearance& block) noex
  * @param block Shared appearance block.
  * @param summary Shared summary block.
  * @param reservedSize Reserved bytes between identity and appearance.
- * @param output Exact record storage; bytes after the summary stay zero.
+ * @param tailSize Reserved bytes after the summary.
+ * @param output Exact record storage.
  */
 void copy_record(const layout::Identity& identity,
                  const layout::Appearance& block,
                  const layout::Summary& summary,
                  std::size_t reservedSize,
+                 std::size_t tailSize,
                  std::span<std::byte> output) noexcept {
     std::fill(output.begin(), output.end(), std::byte{});
     std::size_t cursor = 0;
@@ -142,6 +145,8 @@ void copy_record(const layout::Identity& identity,
     std::memcpy(output.data() + cursor, &block, sizeof block);
     cursor += sizeof block;
     std::memcpy(output.data() + cursor, &summary, sizeof summary);
+    cursor += sizeof(summary) + tailSize;
+    (void)cursor;
 }
 
 } // namespace
@@ -163,6 +168,7 @@ bool encode_family3(const state::CharacterState& character,
                 block,
                 build_summary(light, character.equippedTitleRecordIndex),
                 kFamily3ReservedSize,
+                kFamily3TailSize,
                 record);
     // Both stamps are the last reset before sign-in. Zero would make the client run a daily and
     // a weekly rollover as soon as it accepts the record.
@@ -190,8 +196,16 @@ bool encode_family0(const state::CharacterState& character,
     }
     report_perk_banks("0", block);
     const auto record = output.first(kFamily0RecordSize);
-    copy_record(
-        identity, block, build_summary(light, character.equippedTitleRecordIndex), 0, record);
+    auto summary = build_summary(light, character.equippedTitleRecordIndex);
+    constexpr auto emblemSlot =
+        static_cast<std::uint8_t>(state::account::inventory::EquipmentSlot::emblem);
+    for (std::size_t i = 0; i < instances.itemCount && i < instances.items.size(); ++i) {
+        if (instances.items[i].equipmentSlot == emblemSlot) {
+            summary.indexA = instances.items[i].instance.baseDefinitionIndex;
+            break;
+        }
+    }
+    copy_record(identity, block, summary, 0, kFamily0TailSize, record);
     const layout::Family0Tail tail{};
     std::memcpy(record.data() + kFamily0RecordSize - kFamily0TailSize, &tail, sizeof tail);
     return true;

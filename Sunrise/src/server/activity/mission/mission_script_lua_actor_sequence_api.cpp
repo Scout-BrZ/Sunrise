@@ -2,7 +2,6 @@
 #include <charconv>
 #include <limits>
 
-#include "mission_script_lua_dispatch.h"
 #include "mission_script_lua_internal.h"
 
 namespace sunrise::server::activity::mission::lua_vm::detail {
@@ -36,68 +35,6 @@ current_sequence(lua_State* state, const SequenceHandle& handle, ActorSequenceDe
                impl->definitions.actorSequences.context, handle.owner, handle.ordinal, output);
 }
 
-using SequenceBinding = Binding<ActorSequenceDefinition>;
-
-/** Actor sequence members in table order. */
-constexpr std::array<SequenceBinding, std::size(api::kActorSequenceMembers)> kSequenceBindings{{
-    {"id",
-     nullptr,
-     [](lua_State* state, const ActorSequenceDefinition& row) {
-         push_optional_name(state, row.id);
-     }},
-    {"name",
-     nullptr,
-     [](lua_State* state, const ActorSequenceDefinition& row) {
-         push_optional_name(state, row.name);
-     }},
-    {"symbol",
-     nullptr,
-     [](lua_State* state, const ActorSequenceDefinition& row) {
-         push_optional_name(state, row.symbol);
-     }},
-    {"source_path",
-     nullptr,
-     [](lua_State* state, const ActorSequenceDefinition& row) {
-         push_optional_name(state, row.sourcePath);
-     }},
-    {"key",
-     nullptr,
-     [](lua_State* state, const ActorSequenceDefinition& row) {
-         lua_pushinteger(state, row.keyHash);
-     }},
-    {"kind",
-     nullptr,
-     [](lua_State* state, const ActorSequenceDefinition& row) {
-         lua_pushinteger(state, row.kind);
-     }},
-    {"resource_tag",
-     nullptr,
-     [](lua_State* state, const ActorSequenceDefinition& row) {
-         lua_pushinteger(state, row.resourceTag);
-     }},
-    {"table_index",
-     nullptr,
-     [](lua_State* state, const ActorSequenceDefinition& row) {
-         lua_pushinteger(state, row.tableIndex);
-     }},
-    {"ordinal",
-     nullptr,
-     [](lua_State* state, const ActorSequenceDefinition& row) {
-         lua_pushinteger(state, row.ordinal);
-     }},
-    {"source_offset",
-     nullptr,
-     [](lua_State* state, const ActorSequenceDefinition& row) {
-         lua_pushinteger(state, row.sourceOffset);
-     }},
-    {"playable",
-     nullptr,
-     [](lua_State* state, const ActorSequenceDefinition& row) {
-         lua_pushboolean(state, row.playable);
-     }},
-}};
-static_assert(bound_to<ActorSequenceDefinition>(api::kActorSequenceMembers, kSequenceBindings));
-
 /** Exposes all extracted kinds without making unsupported entries executable. */
 [[nodiscard]] int sequence_index(lua_State* state) {
     const auto* const handle =
@@ -106,8 +43,47 @@ static_assert(bound_to<ActorSequenceDefinition>(api::kActorSequenceMembers, kSeq
     if (!current_sequence(state, *handle, row)) {
         return luaL_error(state, "actor sequence owner is stale");
     }
-    return dispatch<ActorSequenceDefinition>(
-        state, kSequenceBindings, luaL_checkstring(state, 2), row);
+    const std::string_view key = luaL_checkstring(state, 2);
+    std::string_view text{};
+    if (key == "id") {
+        text = row.id;
+    } else if (key == "name") {
+        text = row.name;
+    } else if (key == "symbol") {
+        text = row.symbol;
+    } else if (key == "source_path") {
+        text = row.sourcePath;
+    } else if (key == "key") {
+        lua_pushinteger(state, row.keyHash);
+        return 1;
+    } else if (key == "kind") {
+        lua_pushinteger(state, row.kind);
+        return 1;
+    } else if (key == "resource_tag") {
+        lua_pushinteger(state, row.resourceTag);
+        return 1;
+    } else if (key == "table_index") {
+        lua_pushinteger(state, row.tableIndex);
+        return 1;
+    } else if (key == "ordinal") {
+        lua_pushinteger(state, row.ordinal);
+        return 1;
+    } else if (key == "source_offset") {
+        lua_pushinteger(state, row.sourceOffset);
+        return 1;
+    } else if (key == "playable") {
+        lua_pushboolean(state, row.playable);
+        return 1;
+    } else {
+        lua_pushnil(state);
+        return 1;
+    }
+    if (text.empty()) {
+        lua_pushnil(state);
+    } else {
+        lua_pushlstring(state, text.data(), text.size());
+    }
+    return 1;
 }
 
 /** Collection rows are one-based; an absent ordinal returns nil. */
@@ -129,23 +105,6 @@ static_assert(bound_to<ActorSequenceDefinition>(api::kActorSequenceMembers, kSeq
     return 1;
 }
 
-/** What a sequence collection read resolves before its key. */
-struct SequencesSubject final {
-    std::size_t count{};
-};
-
-/** Sequence collection members in table order; symbols are served after them. */
-constexpr std::array<Binding<SequencesSubject>, std::size(api::kActorSequencesMembers)>
-    kSequencesBindings{{
-        {"count",
-         nullptr,
-         [](lua_State* state, const SequencesSubject& subject) {
-             lua_pushinteger(state, static_cast<lua_Integer>(subject.count));
-         }},
-        {"at", &sequences_at},
-    }};
-static_assert(bound_to<SequencesSubject>(api::kActorSequencesMembers, kSequencesBindings));
-
 /** Named members are the extractor's collision-safe symbols. */
 [[nodiscard]] int sequences_index(lua_State* state) {
     const auto* const owner =
@@ -153,11 +112,14 @@ static_assert(bound_to<SequencesSubject>(api::kActorSequencesMembers, kSequences
     if (!current_owner(state, *owner)) {
         return luaL_error(state, "actor sequence owner is stale");
     }
-    const auto& sequences = impl_from_state(state)->definitions.actorSequences;
-    const std::size_t count =
-        sequences.count != nullptr ? sequences.count(sequences.context, *owner) : 0;
+    const auto& api = impl_from_state(state)->definitions.actorSequences;
+    const std::size_t count = api.count != nullptr ? api.count(api.context, *owner) : 0;
     const std::string_view key = luaL_checkstring(state, 2);
-    if (!serve<SequencesSubject>(state, kSequencesBindings, key, SequencesSubject{count})) {
+    if (key == "count") {
+        lua_pushinteger(state, static_cast<lua_Integer>(count));
+    } else if (key == "at") {
+        lua_pushcfunction(state, &sequences_at);
+    } else {
         std::uint32_t keyHash = 0;
         bool alias = false;
         if (key.size() == 12 && key.starts_with("KEY_")) {
@@ -167,8 +129,7 @@ static_assert(bound_to<SequencesSubject>(api::kActorSequencesMembers, kSequences
         }
         for (std::size_t ordinal = 1; ordinal <= count; ++ordinal) {
             ActorSequenceDefinition row{};
-            if (!sequences.resolve(
-                    sequences.context, *owner, static_cast<std::uint32_t>(ordinal), row)) {
+            if (!api.resolve(api.context, *owner, static_cast<std::uint32_t>(ordinal), row)) {
                 continue;
             }
             if (alias ? row.keyHash == keyHash : row.symbol == key) {
@@ -182,11 +143,6 @@ static_assert(bound_to<SequencesSubject>(api::kActorSequencesMembers, kSequences
     }
     return 1;
 }
-
-// The table entry of the actor form of play_sequence.
-constexpr const api::MemberSpec& kPlayActorSequence =
-    api::slot_member("play_sequence", api::slot_auth::kType2SlotType);
-
 } // namespace
 
 /** Binds the catalog to the selected combatant before any sequence handle is minted. */
@@ -216,9 +172,10 @@ int slot_play_actor_sequence(lua_State* state) {
     if (!current_slot(state, *handle, slot) || !exact_combatant_slot(slot)) {
         return luaL_error(state, "activity slot is not an exact combatant");
     }
-    refuse_unknown_arguments(state, kPlayActorSequence);
-    static_cast<void>(
-        push_argument(state, required_key(kPlayActorSequence, "sequence", api::ValueKind::handle)));
+    // Only these named arguments belong to this API.
+    static constexpr std::array<std::string_view, 1> kArguments{"sequence"};
+    refuse_unknown_arguments(state, kArguments);
+    static_cast<void>(push_argument(state, "sequence"));
     const SequenceHandle sequence =
         *static_cast<const SequenceHandle*>(luaL_checkudata(state, -1, kSequenceMetatable));
     lua_pop(state, 1);

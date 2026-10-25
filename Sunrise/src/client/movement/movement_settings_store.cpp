@@ -17,7 +17,6 @@
 
 #include "../../core/filesystem/path.h"
 #include "../../core/logging/log.h"
-#include "../../core/settings/settings.h"
 
 namespace sunrise::client::movement {
 namespace {
@@ -253,21 +252,11 @@ void shutdown() noexcept {
     ReleaseSRWLockExclusive(&g_lock);
 }
 
-/** @return One lock-consistent copy; with cheats locked every tool reads as off and unbound. */
+/** @return One lock-consistent copy of the current configuration. */
 Settings get() noexcept {
     AcquireSRWLockShared(&g_lock);
-    Settings snapshot = g_settings;
+    const Settings snapshot = g_settings;
     ReleaseSRWLockShared(&g_lock);
-    // Every movement tool is a cheat. Unbound keys also stop fly and noclip toggling themselves on.
-    if (!core::settings::get().client.cheats) {
-        snapshot.enabled = false;
-        snapshot.virtualKey = kNoKey;
-        snapshot.noclipEnabled = false;
-        snapshot.noclipToggleKey = kNoKey;
-        snapshot.swordSkateEnabled = false;
-        snapshot.flyEnabled = false;
-        snapshot.flyToggleKey = kNoKey;
-    }
     return snapshot;
 }
 

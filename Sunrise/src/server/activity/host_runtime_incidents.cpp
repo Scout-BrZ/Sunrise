@@ -83,6 +83,7 @@ void apply_incident(const IncidentInput& input, std::uint64_t now) noexcept {
         return;
     }
     touch(*instance);
+    ++instance->view.incidentsReceived;
     Event event{};
     event.attemptGeneration = input.attemptGeneration;
     event.binding = input.binding;
@@ -146,6 +147,7 @@ void apply_incident_control(const IncidentRequest& request, std::uint64_t now) n
     } else {
         touch(*instance);
         ++instance->view.incidentRevision;
+        ++instance->view.incidentsQueued;
         ++instance->view.incidentsPending;
         instance->view.outputPending = true;
         instance->view.outputKind = OutputKind::incident;
@@ -202,12 +204,9 @@ void reset_incidents() noexcept {
 } // namespace detail
 
 /** Queues one owned, outer-valid client msg 19 for the Activity Host service. */
-IngressRefusal submit_incident(const IncidentInput& input) noexcept {
-    if (!state::activity::binding_matches(input.binding)) {
-        return IngressRefusal::binding;
-    }
-    if (!incident_allowed(input.incident)) {
-        return IngressRefusal::payload;
+bool submit_incident(const IncidentInput& input) noexcept {
+    if (!state::activity::binding_matches(input.binding) || !incident_allowed(input.incident)) {
+        return false;
     }
     AcquireSRWLockExclusive(&g_lock);
     PendingInput pending{};
@@ -217,11 +216,11 @@ IngressRefusal submit_incident(const IncidentInput& input) noexcept {
         ++g_droppedIngress;
         ++g_droppedIncidents;
         ReleaseSRWLockExclusive(&g_lock);
-        return IngressRefusal::queue;
+        return false;
     }
     ++g_queuedIngress;
     ReleaseSRWLockExclusive(&g_lock);
-    return IngressRefusal::none;
+    return true;
 }
 
 /** Queues one outer-valid operator msg 19 for the exact activity generation. */

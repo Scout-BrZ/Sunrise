@@ -9,7 +9,6 @@
 #include <string_view>
 #include <vector>
 
-#include "../../../core/filesystem/path.h"
 #include "../../../core/logging/log.h"
 #include "../../../state/activity/mission/runtime.h"
 #include "../../../state/activity/runtime.h"
@@ -23,9 +22,9 @@
 #include "mission_script_object_sense.h"
 #include "mission_script_player_sense.h"
 #include "mission_script_runtime.h"
+#include "../adieu_ending/controller.h"
 #include "mission_script_squad_sense.h"
 #include "mission_script_vm.h"
-#include "mission_trigger_observation.h"
 
 // What the mission-runtime translation units share: the instance table and service slice,
 // the attach pipeline, the two Host feeds and the VM callback, the panel rows, the delivery state
@@ -107,13 +106,11 @@ constexpr std::size_t kObjectiveCapacity = 24;
 constexpr std::size_t kObjectiveTaskCapacity = 24;
 /** How long a committed Host output may take to reach transport before the delivery faults. */
 constexpr std::uint64_t kTransportTimeoutMs = 15'000;
-/** How long an enqueued Host output may take to reach the reducer before it is reconciled. */
+/** How long an enqueued Host output may take to reach the reducer before the delivery retries. */
 constexpr std::uint64_t kHostCommitTimeoutMs = 2'000;
 
-/** Last occupancy seen for one watched volume, so only a change raises an edge. */
+/** Last occupancy seen for one watched volume, so only a change raises an event. */
 struct TriggerOccupancy final {
-    /** Counter continuity of the volume's reports, for triggerState events only. */
-    trigger_observation::Tracker tracker{};
     std::uint32_t registryKey{};
     std::uint32_t objectTag{};
     std::uint16_t slotIndex{};
@@ -184,26 +181,16 @@ struct SquadObservation final {
     std::uint32_t registryKey{};
     std::uint32_t objectTag{};
     std::int32_t aliveCount{};
-    /** Last spawn generation the squad Sense echoed from its placement Auth. */
-    std::int32_t spawnGeneration{};
     std::uint16_t slotIndex{};
     std::uint8_t slotCountLength{};
     bool removalFlag{};
-    bool hasSpawnGeneration{};
-    /** An alive count was reported; until then aliveCount is a zero placeholder. */
-    bool populationKnown{};
     bool used{};
 };
 /** Last completion latch seen for one watched authored scene, so only the edge raises an event. */
 struct SceneObservation final {
-    /** Output keys this run has reported. A scene's Sense list holds at most 32 keys. */
-    std::array<std::uint32_t, 32> outputs{};
     std::uint32_t registryKey{};
     std::uint32_t objectTag{};
-    /** Activation token of the run the outputs belong to; a new token starts a new run. */
-    std::int32_t token{};
     std::uint16_t slotIndex{};
-    std::uint8_t outputCount{};
     bool completed{};
     bool used{};
 };
@@ -226,9 +213,30 @@ struct SessionRosterWatch final {
     bool used{};
 };
 
+/** Most fireteam members, besides the program owner, whose life a program follows. */
+inline constexpr std::size_t kMemberLifeCapacity = 8;
+
+/** The participation levels one fireteam member's own client reports about its player. */
+struct MemberLifeWatch final {
+    std::array<PlayerLifeObservation, kParticipationSlotCount> playerLife{};
+    /** Generation of the member's link; zero for a free entry. */
+    std::uint64_t generation{};
+    /** The player key that member's message 5 binds, which its records report state for. */
+    std::uint64_t playerKey{};
+};
+
 /** Everything one bound mission program owns: its VM, views, delivery state and counters. */
 struct RuntimeInstance final {
+    adieu_ending::Controller adieuEnding{};
     mission_state::AttemptState attempt{};
+    // Controle local de credito: nao ocupa variaveis duraveis do Lua.
+    std::uint64_t redWarObjectiveGeneration{};
+    std::uint64_t continuationGeneration{}, outroGeneration{};
+    bool outroStarted{}, outroEnded{};
+    // Recibos dos dois videos finais de Adieu quando o encerramento e controlado pelo Lua.
+    std::uint64_t adieuOutroGeneration{};
+    std::uint8_t adieuOutroStarted{}, adieuOutroEnded{};
+    std::uint64_t redWarObjectiveRetryAt{};
     std::uint64_t dispatchAttemptGeneration{};
     std::uint64_t dispatchInputSequence{};
     lua_vm::Vm vm{};
@@ -241,6 +249,7 @@ struct RuntimeInstance final {
     std::uint64_t eventsSeen{};
     std::uint64_t eventsCommitted{};
     std::uint64_t intentsTransportStaged{};
+    std::uint64_t lastEventSequence{};
     std::uint64_t lastLoggedRevision{};
     std::uint64_t lastMissionSequence{};
     std::uint64_t missionStateRevision{};
@@ -251,14 +260,17 @@ struct RuntimeInstance final {
     std::uint64_t expectedScriptableRevision{};
     std::uint64_t deliveryDeadline{};
     std::uint64_t firstIntentAttempt{};
+    std::uint64_t nextIntentAttempt{};
+    std::uint64_t firstStartAttempt{};
+    std::uint64_t nextStartAttempt{};
     host::Event pendingTimerEvent{};
+    std::uint64_t firstTimerAttempt{};
+    std::uint64_t nextTimerAttempt{};
     std::array<TriggerOccupancy, kTriggerOccupancyCapacity> triggerOccupancy{};
     std::array<SquadObservation, kSquadObservationCapacity> squadObservations{};
     std::array<GhostObservation, kGhostObservationCapacity> ghostObservations{};
     std::array<DamageObservation, kDamageObservationCapacity> damageObservations{};
     std::array<CombatantDamageObservation, kSquadObservationCapacity> combatantDamageObservations{};
-    /** Damage levels replicated by authored entities, kept apart from the Type-2 Sense rows. */
-    std::array<CombatantDamageObservation, kSquadObservationCapacity> entityDamageObservations{};
     std::array<DeviceObservation, kDeviceObservationCapacity> deviceObservations{};
     std::array<ObjectInteractionObservation, kObjectInteractionObservationCapacity>
         objectInteractionObservations{};
@@ -270,21 +282,36 @@ struct RuntimeInstance final {
     /** Participation levels of the sixteen player slots, for the client generation below. */
     std::array<PlayerLifeObservation, kParticipationSlotCount> playerLife{};
     std::uint64_t playerLifeGeneration{};
+    /** The same levels as each other member's own client reports them, one entry per link. */
+    std::array<MemberLifeWatch, kMemberLifeCapacity> memberLife{};
     /** Last published party life counts. Published once, then only on a change. */
     FireteamLife lastFireteamLife{};
     bool fireteamLifePublished{};
     /** Dynamically sized host-state reports waiting for this script, in arrival order. */
     std::vector<host::Event> scriptEvents{};
+    std::uint64_t firstScriptEventAttempt{};
+    std::uint64_t nextScriptEventAttempt{};
     std::uint32_t intentAttempts{};
     std::uint32_t startAttempts{};
+    std::uint32_t timerAttempts{};
+    std::uint32_t scriptEventAttempts{};
     std::size_t durablePendingIntentCount{};
     std::size_t scriptEventRead{};
     std::uint16_t lastIntentStatus{(std::numeric_limits<std::uint16_t>::max)()};
     std::int32_t initialStateRegion{-1};
     /** Last client-reported activity region used to select state-local incoming references. */
     std::int32_t activeRegion{-1};
+    /**
+     * One bit per region any member of the party has entered in `partyRegionsAttempt`. A peer's
+     * move reaches the program only into a region with no bit, so the party advances when anyone
+     * gets somewhere first and the program never hears the same region from a peer twice.
+     */
+    std::array<std::uint64_t, 8> partyRegions{};
+    std::uint64_t partyRegionsAttempt{};
     ProgramStatus programStatus{ProgramStatus::none};
     DeliveryStage deliveryStage{DeliveryStage::idle};
+    /** Personagem da conexao para credito da jornada; nao usar playerKey como SOID. */
+    std::uint64_t characterSoid{};
     /** The player key the bound link's message 5 binds, read at attach. */
     std::uint64_t playerKey{};
     bool publicTarget{};
@@ -302,6 +329,16 @@ struct RuntimeInstance final {
     bool occupied{};
 };
 
+/**
+ * Tests whether a Sense report may drive this program's device and damage edges.
+ * The owner's always may. In a shared activity the member that simulates a bubble reports its
+ * devices and combatants, which is often not the owner, so a live member link of the same activity
+ * may too while one ambassador per private bubble is on.
+ * @param sourceGeneration Generation of the link that sent the report.
+ */
+[[nodiscard]] bool accepts_member_sense(const RuntimeInstance& instance,
+                                        std::uint64_t sourceGeneration) noexcept;
+
 /** Writes one bounded mission-script diagnostic line. Fields are key=value, error is free text. */
 void log_line(core::log::Level level,
               const RuntimeInstance* instance,
@@ -311,13 +348,34 @@ void log_line(core::log::Level level,
               std::string_view error = {}) noexcept;
 /** Appends one host-state event for the script. */
 void push_script_event(RuntimeInstance& instance, const host::Event& event) noexcept;
+/**
+ * Appends one event whose dispatch changes durable state on the runtime's behalf, so it is queued
+ * whether or not the script handles it.
+ */
+void push_program_event(RuntimeInstance& instance, const host::Event& event) noexcept;
+/**
+ * Fills the type-53 source and authored duration of one cue from the bound SDK catalog.
+ * The slot row and cue are set even on failure.
+ * @return False when the row is not a dialogue slot of this catalog or the cue has no cue row.
+ */
+[[nodiscard]] bool describe_dialogue_cue(const RuntimeInstance& instance,
+                                         std::uint32_t slotRow,
+                                         std::uint16_t cue,
+                                         host::Event& event) noexcept;
 /** Raises a fireteam event on each private instance whose party life counts changed. */
 void publish_fireteam_life(std::uint64_t now) noexcept;
 /** Merges the type-13 participation records of one Sense snapshot into the instance. */
 void observe_player_life(RuntimeInstance& instance,
                          const host::SenseObservationSnapshot& sense) noexcept;
+/**
+ * Merges the participation records another member's own client reports into that member's
+ * entry, so the party's life counts every member and not the owner alone.
+ * @param sense Snapshot from a live member link that is not the owner's.
+ */
+void observe_member_life(RuntimeInstance& instance,
+                         const host::SenseObservationSnapshot& sense) noexcept;
 
-/** Raises one triggerState per report, and one edge per watched volume whose occupancy changed. */
+/** Raises one event per watched trigger volume whose occupancy changed. */
 void push_trigger_edges(RuntimeInstance& instance,
                         const host::SenseObservationSnapshot& sense) noexcept;
 /** Raises one dedicated type-31 edge from a decoded schema-0x8080879F msg-19 payload. */
@@ -333,14 +391,6 @@ void push_damage_edges(RuntimeInstance& instance,
 /** Raises observed Type-2 damage pools and lifecycle resets without inferring damage. */
 void push_combatant_damage_edges(RuntimeInstance& instance,
                                  const host::SenseObservationSnapshot& sense) noexcept;
-/** Raises a damage state from an entity's replicated damage levels (fractions of full). */
-void push_entity_damage(RuntimeInstance& instance,
-                        std::uint32_t registryKey,
-                        std::uint8_t slotType,
-                        std::uint16_t slotIndex,
-                        float primary,
-                        float secondary,
-                        std::uint64_t tick) noexcept;
 /** Raises current device values and sequence resets from accepted client reports. */
 void push_device_edges(RuntimeInstance& instance,
                        const host::SenseObservationSnapshot& sense) noexcept;
@@ -355,32 +405,6 @@ void publish_ghost_levels(RuntimeInstance& instance) noexcept;
 /** Raises the squad state, spawn and death events derived from one msg 6 body. */
 void push_squad_edges(RuntimeInstance& instance,
                       const host::SenseObservationSnapshot& sense) noexcept;
-
-/**
- * Finds the retained row for one slot, allocating a free row on a first observation.
- * @return Null when every row is in use.
- */
-template <typename Row, std::size_t N>
-[[nodiscard]] Row* find_slot_row(std::array<Row, N>& rows,
-                                 const host::SenseObservationKey& key) noexcept {
-    Row* spare = nullptr;
-    for (Row& retained : rows) {
-        if (retained.used && retained.registryKey == key.registryKey
-            && retained.objectTag == key.objectTag && retained.slotIndex == key.slotIndex) {
-            return &retained;
-        }
-        if (!retained.used && spare == nullptr) {
-            spare = &retained;
-        }
-    }
-    if (spare != nullptr) {
-        spare->used = true;
-        spare->registryKey = key.registryKey;
-        spare->objectTag = key.objectTag;
-        spare->slotIndex = key.slotIndex;
-    }
-    return spare;
-}
 
 /** Retains generation-qualified population facts before the derived squad callback. */
 [[nodiscard]] bool observe_population(
@@ -397,7 +421,8 @@ void push_objective_edges(RuntimeInstance& instance,
 void queue_phase_entered(RuntimeInstance& instance, std::uint32_t previousPhase) noexcept;
 /** Moves the client to the region a freshly selected mission state belongs to. */
 void arm_state_region_teleport(RuntimeInstance& instance,
-                               const server::bap::ActivityMissionSeedPlan& plan) noexcept;
+                               const server::bap::ActivityMissionSeedPlan& plan,
+                               std::uint32_t spawnSetOverride) noexcept;
 /** @return The identity every host-state edge that is not a Sense edge carries. */
 [[nodiscard]] host::Event state_edge_event(const RuntimeInstance& instance) noexcept;
 /** Raises one event per peer session that appeared or left this instance's destination. */
@@ -492,54 +517,19 @@ void clear_instance(RuntimeInstance& instance, bool clearPending = true) noexcep
 void note_vm_status(RuntimeInstance& instance,
                     std::string_view stage,
                     std::string_view status) noexcept;
-/** Native Sense levels cannot cross an attempt or ActivityClient generation boundary. */
-void clear_sense_levels(RuntimeInstance& instance) noexcept;
 /** Commits the VM's phase/revision/start transaction into exact server-owned State. */
 [[nodiscard]] bool commit_mission_state(RuntimeInstance& instance,
                                         bool started,
                                         std::uint64_t nextInputSequence) noexcept;
 
-// The sources unit owns these: where a program's script and its require path come from.
-
-/** How reading one mission script ended. */
-enum class SourceStatus : std::uint8_t {
-    ready,
-    missing,
-    fileError,
-    tooLarge,
-};
+// The attach unit owns these. The service slice and the lifecycle entry points call into them.
 
 /** Resolves the script root and the SDK Lua search path. Logs its own refusal. */
 [[nodiscard]] bool resolve_script_paths() noexcept;
-/**
- * Reads the activity's script: a loaded mod's, then the authored one, then the generated one.
- * @param output Receives the source; it stays valid until the next read.
- * @param modId Receives the supplying mod's id, or an empty string for a base script.
- * @return Why no source was read, or ready.
- */
-[[nodiscard]] SourceStatus read_source(const sdk::Catalog& catalog,
-                                       const format::Activity& activity,
-                                       std::span<const char>& output,
-                                       std::array<char, state::mods::kIdCapacity>& modId) noexcept;
-/**
- * Appends `<mods>\<folder>` for one mod.
- * @return False when the path does not fit.
- */
-[[nodiscard]] bool append_mod_directory(core::path::Buffer& path,
-                                        const state::mods::View& view,
-                                        const state::mods::Record& record) noexcept;
-/** @return The Lua require path every program opens with. */
-[[nodiscard]] const std::array<char, lua_vm::kSearchPathByteCapacity>&
-sdk_lua_search_path() noexcept;
-/** Zeroes the bytes `read_source` returned, once the program no longer needs them. */
-void clear_source(std::span<const char> source) noexcept;
-/** Clears the script buffer and both paths. */
-void clear_script_sources() noexcept;
-/** Resolves a loaded filename to its loaded mod owner; empty output means a base file. */
-[[nodiscard]] bool module_source_owner(std::string_view path, std::span<char> modId) noexcept;
-
-// The attach unit owns these. The service slice and the lifecycle entry points call into them.
-
+/** Clears the script buffer, both paths and every reload authorization. */
+void clear_script_paths() noexcept;
+/** @return False when no authorization slot is free, so the reload cannot replace this program. */
+[[nodiscard]] bool authorize_reload(const RuntimeInstance& instance) noexcept;
 /** Drops slots that no longer match, publishes the roster, and attaches active host instances. */
 void synchronize_instances(std::uint64_t now) noexcept;
 /** Advances fresh programs only when their declared state roster has reached transport output. */
@@ -573,34 +563,9 @@ void copy_diagnostics(const RuntimeInstance& instance, InstanceDiagnostics& outp
 /** Copies every retained attach result into the panel-facing snapshot. */
 void snapshot_attach_diagnostics(DiagnosticsSnapshot& output) noexcept;
 
-// The reload unit owns these. The service slice and shutdown call into them.
-
-/** Reopens the programs the mailbox request names once each is at a safe point. */
-void service_reload(std::uint64_t now) noexcept;
-/** Drops any unanswered request and its answer. */
-void clear_reload_mailbox() noexcept;
-/** Copies the committed attempt, revision, cursors, phase and intent head into the instance. */
-void accept_compare_fields(RuntimeInstance& instance,
-                           const mission_state::Snapshot& snapshot) noexcept;
-/** Opens replacement code against the same exact view without changing the running instance. */
-[[nodiscard]] lua_vm::OpenStatus prepare_reload_program(const RuntimeInstance& instance,
-                                                        std::span<const char> source,
-                                                        std::string_view modId,
-                                                        lua_vm::Vm& vm,
-                                                        lua_vm::ProgramIdentity& identity,
-                                                        mission_state::ProgramKey& key) noexcept;
-/** Retargets a prepared VM only while its SDK, world and source identities still match. */
-[[nodiscard]] bool rebind_reload_program(const RuntimeInstance& instance,
-                                         std::span<const char> source,
-                                         lua_vm::Vm& vm,
-                                         lua_vm::ProgramIdentity& identity,
-                                         const mission_state::ProgramKey& key) noexcept;
-/** @return True when mission scripting is on and its paths resolved. Takes the runtime lock. */
-[[nodiscard]] bool runtime_ready() noexcept;
-
 // The feed unit owns these. The service slice and the lifecycle entry points call into them.
 
-/** Retires every queued mission event of every binding and frees the queue. */
+/** Retires every queued mission event that belongs to one binding. */
 void clear_all_pending_events() noexcept;
 /** Keeps accepted values but removes every VM- and ActivityClient-generation-local decision. */
 void reset_pending_events_for_reattach(const state::activity::SessionBinding& binding) noexcept;
@@ -623,12 +588,17 @@ void consume_mission_inputs(std::uint64_t now) noexcept;
  * Runs one event through the VM, commits what it changed, and faults on a script failure.
  * @param sense Values owned by a Sense row, or null.
  * @param clientMessage Envelope snapshot owned by a client-message row, or null.
+ * @param firstAttempt True on the first delivery attempt, which is the one that counts it.
  * @return The VM call status; `inactive` when no callback could take the event.
  */
 [[nodiscard]] lua_vm::CallStatus dispatch_event(RuntimeInstance& instance,
                                                 const host::Event& event,
                                                 const host::SenseObservationSnapshot* sense,
                                                 const host::ClientMessageSnapshot* clientMessage,
+                                                bool firstAttempt,
                                                 std::uint64_t now) noexcept;
+
+bool begin_adieu_ending(RuntimeInstance&, std::uint64_t now) noexcept;
+void service_adieu_ending(RuntimeInstance&, std::uint64_t now) noexcept;
 
 } // namespace sunrise::server::activity::mission

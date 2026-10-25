@@ -2,6 +2,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <span>
 
 #include "../../../../middleware/bap/activity_message/cinematic_incident.h"
@@ -9,7 +10,10 @@
 #include "../../../../middleware/bap/activity_message/incident.h"
 #include "../../../../middleware/bap/activity_message/player_trigger_incident.h"
 #include "../../../../middleware/bap/activity_message/sense_update.h"
+#include "../../../../state/activity/member_context.h"
 #include "../../../../state/activity_sdk/runtime.h"
+#include "../../activity_link_selection.h"
+#include "../../internal.h"
 #include "activity_message_route_internal.h"
 
 namespace sunrise::server::bap::encrypted::activity_message {
@@ -19,6 +23,40 @@ namespace sense_update = middleware::bap::activity_message::sense_update;
 namespace cinematic_incident = middleware::bap::activity_message::cinematic_incident;
 namespace player_trigger_incident = middleware::bap::activity_message::player_trigger_incident;
 namespace activity_sdk = state::activity_sdk;
+
+/**
+ * Reason a purge of abdicated entities carries: the one the client itself gives the entity it
+ * abandons as it leaves a state, which it purges when answered with it.
+ */
+constexpr std::int32_t kStateChangePurgeReason = 3;
+
+/**
+ * Resolves the private link a public bubble's crossing belongs to.
+ * One private link plays the bubble when the player is alone. A fireteam gives every member a
+ * link on the same private activity, so the crossing goes to the reporting player's own link.
+ * @pre The caller holds the BAP session lock.
+ */
+[[nodiscard]] const Session* private_source_link(const ActivityClientBinding& binding) noexcept {
+    std::size_t links = 0;
+    const Session* const unique = unique_activity_link_locked(binding.source, links);
+    if (unique != nullptr) {
+        return unique->activity.role == ActivityClientRole::privateCurrent ? unique : nullptr;
+    }
+    std::size_t reporters = 0;
+    const Session* const reporter =
+        activity_link_for_generation_locked(binding.session, binding.bindingGeneration, reporters);
+    if (reporter == nullptr || reporter->accountHandle == state::kInvalidAccount) {
+        return nullptr;
+    }
+    for (const Session& session : sessions()) {
+        if (session.id && session.authenticated && session.accountHandle == reporter->accountHandle
+            && session.activity.role == ActivityClientRole::privateCurrent
+            && state::activity::same_binding(session.activity.session, binding.source)) {
+            return &session;
+        }
+    }
+    return nullptr;
+}
 
 /** Borrowed exact connection and SDK state used only during one msg-6 route call. */
 struct SenseResolverContext final {
@@ -216,11 +254,8 @@ bool frame_only(const ActivityClientBinding& binding,
         input.verdict = framed.verdict;
         input.decoded = parsedSense.decoded;
         input.hasFirstObject = parsedSense.hasFirstObject;
-        const auto refusal = server::activity::host::submit_sense(input);
-        if (refusal != server::activity::host::IngressRefusal::none) {
-            report_message(request.messageType,
-                           request.sessionId,
-                           server::activity::host::ingress_refusal_name(refusal));
+        if (!server::activity::host::submit_sense(input)) {
+            report_message(request.messageType, request.sessionId, "host_ingress_refused");
         }
     } else if (isIncident && framed.verdict == store::Verdict::framed) {
         server::activity::host::IncidentInput input{};
@@ -234,6 +269,15 @@ bool frame_only(const ActivityClientBinding& binding,
             input.hasPlayerTrigger = player_trigger_incident::decode(
                 std::span(parsedIncident.payload).first(parsedIncident.payloadLength),
                 input.playerTrigger);
+            // A public bubble's crossings reach the host the client joined for it, while the
+            // triggers were armed by the private activity that plays the bubble. The incident
+            // is delivered to that private link, whose script owns the trigger.
+            if (input.hasPlayerTrigger && binding.role == ActivityClientRole::publicTarget) {
+                if (const Session* const source = private_source_link(binding)) {
+                    input.binding = binding.source;
+                    input.sourceGeneration = source->activity.bindingGeneration;
+                }
+            }
         }
         if (parsedIncident.payloadLength == cinematic_incident::kPayloadBytes
             && cinematic_incident::signal_for_target(parsedIncident.primaryTarget,
@@ -242,11 +286,8 @@ bool frame_only(const ActivityClientBinding& binding,
                 std::span(parsedIncident.payload).first(parsedIncident.payloadLength),
                 input.cinematic);
         }
-        const auto refusal = server::activity::host::submit_incident(input);
-        if (refusal != server::activity::host::IngressRefusal::none) {
-            report_message(request.messageType,
-                           request.sessionId,
-                           server::activity::host::ingress_refusal_name(refusal));
+        if (!server::activity::host::submit_incident(input)) {
+            report_message(request.messageType, request.sessionId, "host_ingress_refused");
         }
     }
     return true;
@@ -301,7 +342,11 @@ bool prepare_peer_leave(const ActivityClientBinding& binding,
     return true;
 }
 
-/** A purge answer preserves the requesting client's complete mask and reason. */
+/**
+ * A purge answer preserves the requesting client's complete mask and reason. An abandon (msg 26)
+ * is answered the same way: the client tore those entities down. An abdication (msg 33) is
+ * answered with the abandon's reason, and the bubble it gives up is kept for the commit.
+ */
 bool prepare_authority_purge(const ActivityClientBinding& binding,
                              const RosterDecodeMap& rosterDecode,
                              IngressAdapter adapter,
@@ -309,7 +354,21 @@ bool prepare_authority_purge(const ActivityClientBinding& binding,
                              ActivityPlan& plan,
                              bool& hasTransaction) noexcept {
     service::entity_authority::PurgeRequest purge{};
-    const bool parsed = service::entity_authority::parse_request_purge(request.payload, purge);
+    bool parsed = false;
+    if (adapter == IngressAdapter::authorityAbandon) {
+        service::entity_authority::Release abandon{};
+        parsed = service::entity_authority::parse_abandon(request.payload, abandon);
+        purge.mask = abandon.mask;
+        purge.reason = abandon.reason;
+    } else if (adapter == IngressAdapter::authorityAbdicate) {
+        service::entity_authority::Release abdication{};
+        parsed = service::entity_authority::parse_abdicate(request.payload, abdication);
+        purge.mask = abdication.mask;
+        purge.reason = kStateChangePurgeReason;
+        plan.authorityPurge.abdicatedBubble = static_cast<std::int16_t>(abdication.selector);
+    } else {
+        parsed = service::entity_authority::parse_request_purge(request.payload, purge);
+    }
     if (!frame_only(binding, rosterDecode, adapter, request)) {
         return false;
     }
@@ -319,7 +378,15 @@ bool prepare_authority_purge(const ActivityClientBinding& binding,
     plan.sessionId = request.sessionId;
     plan.authorityPurge.body.slots = purge.mask;
     plan.authorityPurge.body.reason = static_cast<std::int8_t>(purge.reason);
-    plan.authorityPurge.body.epoch = static_cast<std::uint8_t>(binding.replicationEpoch + 1U);
+    auto& pending = plan.authorityPurge;
+    pending.binding = binding.session;
+    if (!state::activity::replication_sequence(binding.session, pending.expectedSequence)
+        || pending.expectedSequence == (std::numeric_limits<std::uint64_t>::max)()) {
+        return false;
+    }
+    static_cast<void>(state::activity::pending_member_purge(
+        binding.session, state::activity::member_context().memberKey, pending.departure));
+    plan.authorityPurge.body.epoch = static_cast<std::uint8_t>(pending.expectedSequence + 1U);
     plan.authorityPurge.sourceGeneration = binding.bindingGeneration;
     plan.authorityPurge.pending = true;
     plan.delivery = Delivery::purgeNotification;
@@ -328,7 +395,21 @@ bool prepare_authority_purge(const ActivityClientBinding& binding,
     return true;
 }
 
-/** A valid abdication changes ownership only after its frame commits. */
+/** Whether a msg-33 abdication gives up the bubble an armed host teleport moves the client in. */
+bool abdicates_state_change(const service::Request& request) noexcept {
+    service::entity_authority::Release abdication{};
+    if (!service::entity_authority::parse_abdicate(request.payload, abdication)
+        || !state::activity::membership::host_teleport_armed(request.sessionId)) {
+        return false;
+    }
+    const std::int32_t target =
+        state::activity::membership::host_teleport_target(request.sessionId);
+    return target >= 0
+           && (target >> state::activity::bubble_authority::kSliceSetToBubbleShift)
+                  == static_cast<std::int32_t>(abdication.selector);
+}
+
+/** A valid abdication or abandon changes ownership only after its frame commits. */
 bool prepare_authority_abdication(const ActivityClientBinding& binding,
                                   const RosterDecodeMap& rosterDecode,
                                   IngressAdapter adapter,
@@ -336,7 +417,10 @@ bool prepare_authority_abdication(const ActivityClientBinding& binding,
                                   ActivityPlan& plan,
                                   bool& hasTransaction) noexcept {
     service::entity_authority::Release release{};
-    const bool parsed = service::entity_authority::parse_abdicate(request.payload, release);
+    const bool abandon = adapter == IngressAdapter::authorityAbandon;
+    const bool parsed = abandon
+                            ? service::entity_authority::parse_abandon(request.payload, release)
+                            : service::entity_authority::parse_abdicate(request.payload, release);
     if (!frame_only(binding, rosterDecode, adapter, request)) {
         return false;
     }
@@ -348,6 +432,7 @@ bool prepare_authority_abdication(const ActivityClientBinding& binding,
     plan.authorityAbdication.entities = release.mask;
     plan.authorityAbdication.bubble = release.selector;
     plan.authorityAbdication.pending = true;
+    plan.authorityAbdication.abandon = abandon;
     plan.delivery = Delivery::none;
     plan.mutationDomain = MutationDomain::authorityAbdication;
     hasTransaction = true;

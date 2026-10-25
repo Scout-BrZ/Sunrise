@@ -1,6 +1,11 @@
 #include <algorithm>
+#include <array>
+#include <cstdio>
 #include <limits>
+#include <span>
 
+#include "../../core/logging/log.h"
+#include "../../core/settings/settings.h"
 #include "../../middleware/bap/activity_message/damage_monitor_auth.h"
 #include "../../middleware/bap/activity_message/darkness_zone_auth.h"
 #include "../../middleware/bap/activity_message/ghost_link_auth.h"
@@ -11,8 +16,9 @@
 #include "../../middleware/bap/activity_message/scene_events_auth.h"
 #include "../../middleware/bap/activity_message/sensor_auth_update.h"
 #include "../../middleware/bap/activity_message/squad_objective_auth.h"
-#include "../../middleware/bap/activity_message/volume_toggle_auth.h"
+#include "../../middleware/bap/activity_message/toggle_auth.h"
 #include "../../middleware/content/packages/tables/region_reader.h"
+#include "../../state/activity/bubble_authority/ambassadors.h"
 #include "../../state/activity/runtime.h"
 #include "activity_sdk_device_internal.h"
 
@@ -174,7 +180,7 @@ namespace {
     if (!state::activity::binding_matches(view.binding)) {
         return Status::staleBinding;
     }
-    (void)server::bap::activity_link_view(view.binding, link);
+    (void)server::bap::activity_link_view(view.binding, view.activityClientGeneration, link);
     switch (
         sdk::revalidate(view, view.binding, link.matchingLinks, link.activityClientGeneration)) {
     case sdk::Status::ready:
@@ -198,9 +204,14 @@ namespace {
     return Status::invalidView;
 }
 
-/** Resolves one SDK slot through a published canonical group or its exact live occurrence. */
+namespace {
+
+/**
+ * Resolves one SDK slot on the link the view names, through a published canonical group or its
+ * exact live occurrence in that link's region.
+ */
 [[nodiscard]] Status
-prepare_slot(const sdk::BoundView& view, std::uint32_t slotRow, PreparedDevice& output) noexcept {
+prepare_slot_on(const sdk::BoundView& view, std::uint32_t slotRow, PreparedDevice& output) noexcept {
     output = {};
     server::bap::ActivityLinkView link{};
     const Status live = binding_status(view, link);
@@ -315,6 +326,128 @@ prepare_slot(const sdk::BoundView& view, std::uint32_t slotRow, PreparedDevice& 
     output.target.stateLocalRoster = true;
     output.stateRow = selected->stateIndex;
     return finish_prepared(view, link, output);
+}
+
+/** Most members a shared activity routes a slot between. */
+constexpr std::size_t kRouteLinkCapacity = 8;
+
+/** @return Member key of the member that simulates a state-local target's bubble, or zero. */
+[[nodiscard]] std::uint64_t target_ambassador(const sdk::BoundView& view,
+                                              const PreparedDevice& prepared) noexcept {
+    std::uint64_t ambassador = 0;
+    if (!prepared.target.stateLocalRoster || prepared.target.stateLocalRegion < 0) {
+        return 0;
+    }
+    const auto bubble = static_cast<std::uint32_t>(prepared.target.stateLocalRegion)
+                        / tables::kSliceSetIndexFactor;
+    if (bubble >= state::activity::bubble_authority::kAmbassadorBubbleCount
+        || !state::activity::bubble_authority::bubble_ambassador(
+            view.binding.sessionId, static_cast<std::uint8_t>(bubble), ambassador)) {
+        return 0;
+    }
+    return ambassador;
+}
+
+/** Logs one slot the owner's link could not, or should not, carry. */
+void report_slot_route(std::uint32_t slotRow,
+                       const char* result,
+                       const char* reason,
+                       std::uint64_t ownerGeneration,
+                       std::uint64_t generation) noexcept {
+    std::array<char, core::log::kLineCapacity> line{};
+    const int written =
+        std::snprintf(line.data(),
+                      line.size(),
+                      "ev=activity stage=slot_route result=%s reason=%s slot=%u owner_gen=%llu "
+                      "gen=%llu",
+                      result,
+                      reason,
+                      static_cast<unsigned>(slotRow),
+                      static_cast<unsigned long long>(ownerGeneration),
+                      static_cast<unsigned long long>(generation));
+    if (written > 0) {
+        core::log::write(core::log::Channel::server,
+                         core::log::Level::info,
+                         {line.data(), static_cast<std::size_t>(written)});
+    }
+}
+
+} // namespace
+
+/**
+ * Resolves one SDK slot on the link that must carry it.
+ * A state-local target lives in one region, and only a member standing there has it. The owner's
+ * link resolves it first. When the member that simulates that bubble is another member, the slot
+ * goes to that member's link: its game is the one that reports the slot back, and a device
+ * request is applied only on a report from the link that carried it. When the owner stands
+ * nowhere near the target, every other member's link is tried, the bubble's ambassador first.
+ */
+[[nodiscard]] Status
+prepare_slot(const sdk::BoundView& view, std::uint32_t slotRow, PreparedDevice& output) noexcept {
+    const Status owner = prepare_slot_on(view, slotRow, output);
+    const bool unreachable = owner == Status::targetUnavailable;
+    if (!core::settings::get().server.activation.singlePrivateAmbassador
+        || (owner != Status::ready && !unreachable)
+        || (owner == Status::ready && !output.target.stateLocalRoster)) {
+        return owner;
+    }
+    std::array<server::bap::ActivityMemberLink, kRouteLinkCapacity> links{};
+    const std::size_t count = server::bap::activity_member_links(view.binding, std::span(links));
+    if (count < 2) {
+        return owner;
+    }
+    std::uint64_t ownerKey = 0;
+    for (std::size_t index = 0; index < count; ++index) {
+        if (links[index].activityClientGeneration == view.activityClientGeneration) {
+            ownerKey = links[index].memberKey;
+        }
+    }
+    const std::uint64_t ownerAmbassador = owner == Status::ready ? target_ambassador(view, output) : 0;
+    if (owner == Status::ready && (ownerAmbassador == 0 || ownerAmbassador == ownerKey)) {
+        return owner;
+    }
+    PreparedDevice fallback{};
+    bool hasFallback = false;
+    for (std::size_t index = 0; index < count; ++index) {
+        const server::bap::ActivityMemberLink& link = links[index];
+        if (link.activityClientGeneration == view.activityClientGeneration
+            || (owner == Status::ready && link.memberKey != ownerAmbassador)) {
+            continue;
+        }
+        sdk::BoundView routed = view;
+        routed.activityClientGeneration = link.activityClientGeneration;
+        PreparedDevice candidate{};
+        if (prepare_slot_on(routed, slotRow, candidate) != Status::ready) {
+            continue;
+        }
+        if (target_ambassador(view, candidate) == link.memberKey) {
+            report_slot_route(slotRow,
+                              "routed",
+                              unreachable ? "owner_absent" : "ambassador",
+                              view.activityClientGeneration,
+                              link.activityClientGeneration);
+            output = candidate;
+            return Status::ready;
+        }
+        if (!hasFallback) {
+            fallback = candidate;
+            hasFallback = true;
+        }
+    }
+    // The owner still carries a target it can reach; only an unreachable one takes any member.
+    if (unreachable && hasFallback) {
+        report_slot_route(slotRow,
+                          "routed",
+                          "member_in_region",
+                          view.activityClientGeneration,
+                          fallback.activityClientGeneration);
+        output = fallback;
+        return Status::ready;
+    }
+    if (unreachable) {
+        report_slot_route(slotRow, "unrouted", "no_member_in_region", view.activityClientGeneration, 0);
+    }
+    return owner;
 }
 
 /** Resolves the legacy type-23 device facade through the shared typed SDK Auth slot route. */
@@ -457,6 +590,9 @@ prepare_slot(const sdk::BoundView& view, std::uint32_t slotRow, PreparedDevice& 
         || typed(message::mission_effect::kSlotType,
                  message::mission_effect::kComponentClass,
                  message::mission_effect::kSchema)
+        || typed(message::toggle_auth::kSlotType,
+                 message::toggle_auth::kComponentClass,
+                 message::toggle_auth::kSchema)
         || typed(message::music_section::kSlotType,
                  message::music_section::kComponentClass,
                  message::music_section::kSchema)
@@ -504,22 +640,8 @@ prepare_slot(const sdk::BoundView& view, std::uint32_t slotRow, PreparedDevice& 
         slotType == middleware::bap::activity_message::scriptable_auth::kType2SlotType
         && authSchema == middleware::bap::activity_message::scriptable_auth::kType2Schema
         && middleware::bap::activity_message::scriptable_auth::validate_type2_body(body, bitCount);
-    auth::Type32VolumeBody volumeBody{};
-    bool volumeToggle = slotType == auth::kType32SlotType && authSchema == auth::kType32Schema
-                        && slot.componentClass == auth::kType32ComponentClass
-                        && auth::decode_type32_volume(body, bitCount, volumeBody)
-                        && volumeBody.registryKey == registryKey;
-    if (volumeToggle) {
-        // Validate the inner reference again at dispatch under the same SDK/owner binding.
-        const auto matches = std::count_if(slots.begin(), slots.end(), [&](const auto& target) {
-            return target.objectIndex == slot.objectIndex
-                   && target.slotType == auth::kVolumeSlotType
-                   && target.slotIndex == static_cast<std::uint16_t>(volumeBody.slotIndex);
-        });
-        volumeToggle = matches == 1;
-    }
     if (!typedSdkBody && !occupancy && !directive && !engagement && !publicEvent && !performance
-        && !combatant && !volumeToggle) {
+        && !combatant) {
         return Status::invalidBody;
     }
     return Status::ready;

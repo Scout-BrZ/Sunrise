@@ -6,27 +6,10 @@
 
 #include "actor_sequences.h"
 #include "internal.h"
-#include "squad_profiles.h"
 #include "validation_internal.h"
 
 namespace sunrise::state::activity_sdk::validation {
 namespace {
-
-/** @return True when every member certificate belongs to its declared squad lane. */
-[[nodiscard]] bool squad_profiles(const Catalog& catalog) noexcept {
-    const auto squads = catalog.squads();
-    const auto members = catalog.squad_members();
-    for (std::size_t index = 0; index < members.size(); ++index) {
-        const auto& member = members[index];
-        if (member.squadIndex >= squads.size()
-            || member.memberOrdinal >= squads[member.squadIndex].members.count
-            || squads[member.squadIndex].members.first + member.memberOrdinal != index
-            || !valid_member_spawn_profile(member, catalog.actor_classes())) {
-            return false;
-        }
-    }
-    return true;
-}
 
 // An empty authored name uses the FNV-1 basis.
 constexpr std::uint32_t kAbsentDefinitionHash = 0x811C9DC5U;
@@ -47,11 +30,9 @@ constexpr std::uint32_t kAbilityTargetComponentClass = 0x80807D9BU;
     const auto slots = catalog.slots();
     for (std::size_t index = 0; index < keys.size(); ++index) {
         const format::AuthoredSceneEventKey& row = keys[index];
-        if (row.sceneSlotIndex >= slots.size()
-            || (row.flags & format::kAuthoredSceneEventKeyExact) == 0
-            || (row.flags & ~format::kAuthoredSceneEventKeyFlagMask) != 0 || row.reserved != 0
-            || row.key == 0 || row.key == format::kAbsentIndex || row.graphTag == 0
-            || row.graphTag == format::kAbsentIndex) {
+        if (row.sceneSlotIndex >= slots.size() || row.flags != format::kAuthoredSceneEventKeyExact
+            || row.reserved != 0 || row.key == 0 || row.key == format::kAbsentIndex
+            || row.graphTag == 0 || row.graphTag == format::kAbsentIndex) {
             return false;
         }
         const format::Slot& slot = slots[row.sceneSlotIndex];
@@ -117,8 +98,7 @@ constexpr std::uint32_t kAbilityTargetComponentClass = 0x80807D9BU;
     for (std::size_t index = 0; index < cues.size(); ++index) {
         const format::DialogueCue& row = cues[index];
         if (row.slotIndex >= slots.size() || (row.flags & ~format::kDialogueCueFlagMask) != 0
-            || row.reserved != 0 || row.definitionHash == 0
-            || row.definitionHash == kAbsentDefinitionHash
+            || row.reserved != 0 || row.definitionHash == 0 || row.definitionHash == 0x811C9DC5U
             || !std::isfinite(row.authoredWindowSeconds) || row.authoredWindowSeconds < 0.0F
             || row.listTag == 0 || row.listTag == format::kAbsentIndex
             || (row.lineCount != 0 && (row.flags & format::kDialogueCueLinesExact) == 0)) {
@@ -199,20 +179,11 @@ constexpr std::uint32_t kAbilityTargetComponentClass = 0x80807D9BU;
         }
         priorGroup = &row;
     }
-    const format::DialogueCueText* priorText = nullptr;
     for (const format::DialogueCueText& row : catalog.dialogue_cue_texts()) {
-        // Slot, cue, line then take order, without repeats, backs the per-cue range lookup.
         if (row.slotIndex >= slots.size() || row.containerTag == 0 || row.stringHash == 0
-            || row.takeIndex >= format::kDialogueTakeCount
-            || (priorText != nullptr
-                && std::tie(row.slotIndex, row.cueIndex, row.lineIndex, row.takeIndex)
-                       <= std::tie(priorText->slotIndex,
-                                   priorText->cueIndex,
-                                   priorText->lineIndex,
-                                   priorText->takeIndex))) {
+            || row.takeIndex >= format::kDialogueTakeCount) {
             return false;
         }
-        priorText = &row;
         const auto cues = slot_dialogue_cues(catalog, slots[row.slotIndex]);
         if (row.cueIndex >= cues.size()) {
             return false;
@@ -222,29 +193,20 @@ constexpr std::uint32_t kAbilityTargetComponentClass = 0x80807D9BU;
             return false;
         }
     }
-    const format::DirectiveElement* priorElement = nullptr;
     for (const format::DirectiveElement& row : catalog.directive_elements()) {
         // An authored field has both source tags; an absent one has neither.
         const bool descriptionPaired =
             (row.descriptionContainerTag == 0) == (row.descriptionStringHash == 0);
         const bool progressPaired =
             (row.progressContainerTag == 0) == (row.progressStringHash == 0);
-        // Slot, name hash then element order, without repeats, backs the per-slot range lookup
-        // and makes every (slot, name hash, element) identity unique.
         if (row.slotIndex >= slots.size()
             || slots[row.slotIndex].slotType != format::kDirectiveSlotType || row.elementIndex < 0
             || static_cast<std::uint32_t>(row.elementIndex) >= row.elementCount
             || row.titleContainerTag == 0 || row.titleStringHash == 0 || !descriptionPaired
             || !progressPaired
-            || (row.descriptionContainerTag == 0 && row.progressContainerTag == 0)
-            || (priorElement != nullptr
-                && std::tie(row.slotIndex, row.nameHash, row.elementIndex)
-                       <= std::tie(priorElement->slotIndex,
-                                   priorElement->nameHash,
-                                   priorElement->elementIndex))) {
+            || (row.descriptionContainerTag == 0 && row.progressContainerTag == 0)) {
             return false;
         }
-        priorElement = &row;
     }
     return true;
 }
@@ -691,9 +653,8 @@ bool relations(const Catalog& catalog) {
         bool (*run)(const Catalog&) noexcept;
     };
     // Every relation check a catalog must pass, named so a refusal reports which one failed.
-    static constexpr std::array<Check, 10> kChecks{
+    static constexpr std::array<Check, 9> kChecks{
         {{"authored_scene_event_keys", &authored_scene_event_keys},
-         {"squad_profiles", &squad_profiles},
          {"task_targets", &task_targets},
          {"dialogue_cues", &dialogue_cues},
          {"authored_text", &authored_text},

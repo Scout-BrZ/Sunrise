@@ -1,9 +1,11 @@
 {
-  "version": 18,
+  "version": 19,
+  "multiplayer_enabled": false,
   "core": {
     "logging": {
-      "debugger_sink": true,
+      "debugger_sink": false,
       "file_sink": false,
+      "clear_on_mission_complete": true,
       "levels": {
         "core": "warn",
         "client": "warn",
@@ -14,13 +16,12 @@
     },
     "activity_sdk_generation": {
       "lua_declarations": true
-    },
-    "studio_attach": false
+    }
   },
   "steam": {
-    "language": "english",
+    "language": "brazilian",
     "user": {
-      "persona_name": "Player"
+      "persona_name": "Micagay"
     }
   },
   "client": {
@@ -36,12 +37,12 @@
     },
     "custom_bootflow_textures": true,
     "socket_menu_routing": false,
-    "reveal_lore_books": true,
-    "cheats": false,
-    "dump_package_keys": false
+    "reveal_lore_books": true
   },
   "server": {
+    "max_players": 32,
     "bap_port": 30974,
+    "bap_bind": "127.0.0.1",
     "gameplay": {
       "topology": "embedded",
       "bind_address": "127.0.0.1",
@@ -55,7 +56,13 @@
       "default_client_activation": true,
       "activity_public_membership": true,
       "prevent_ownerless_channel_close": false,
-      "mission_scripting": true
+      "mission_scripting": true,
+      "single_private_ambassador": true,
+      "peer_region_facts": true,
+      "unfiltered_shared_dialogue": true,
+      "claim_released_entities": true,
+      "purge_abandoned_entities": false,
+      "purge_state_change_entities": true
     }
   },
   "state": {

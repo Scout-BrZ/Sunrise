@@ -5,6 +5,8 @@
 #include "../../../../middleware/bap/activity_message/activity_host_control.h"
 #include "../../../../middleware/bap/activity_message/activity_patch_epoch_parser.h"
 #include "../../../../middleware/bap/activity_message/entity_authority.h"
+#include "../../../../middleware/bap/activity_message/transport_report.h"
+#include "../../../../state/activity/member_departure.h"
 #include "../../../../state/activity/membership/activity_membership_query.h"
 #include "../../../../state/activity/runtime.h"
 #include "../../../gameplay/group/group_host_sessions.h"
@@ -44,6 +46,7 @@ enum class MutationDomain : std::uint8_t {
     none,
     entitySlots,
     membership,
+    reservations,
     /** The patch epoch is kept on the connection and changes no State. */
     patchEpoch,
     /** Query answers are retained only by their exact connection generation. */
@@ -59,15 +62,7 @@ enum class BindingIntent : std::uint8_t {
     none,
     preserveCurrent,
     publicTarget,
-};
-
-/** Which membership body a join burst carries. */
-enum class JoinMembershipBody : std::uint8_t {
-    none,
-    /** The public source session's member table. */
-    publicSource,
-    /** The private session's join seed. */
-    privateSeed,
+    sharedTarget,
 };
 
 /** Join ingress metadata retained until its binding transaction commits. */
@@ -118,23 +113,37 @@ struct AuthorityAbdicationIngress final {
     std::uint64_t sourceGeneration{};
     std::uint8_t bubble{};
     bool pending{};
+    /** Msg 26: the entities are abandoned, and the bubble's grant is not given up with them. */
+    bool abandon{};
 };
 
 /** A purge request retains its exact mask and the next shared replication epoch. */
 struct AuthorityPurgeIngress final {
     middleware::bap::activity_message::host_control::PurgeAuthorityBody body{};
+    state::activity::MemberPurge departure{};
+    state::activity::SessionBinding binding{};
+    std::uint64_t expectedSequence{};
     std::uint64_t sourceGeneration{};
+    /**
+     * Bubble a msg-33 abdication gave up when the purge answers one, or -1. The bubble is still
+     * released once the purge commits, only its entities are purged instead of claimed back.
+     */
+    std::int16_t abdicatedBubble{-1};
     bool pending{};
 };
 
 /** Scalar and mask data kept after the sensitive svc8 payload view expires. */
 struct ActivityPlan final {
+    bool hasRelayConnectivityFailure{};
+    middleware::bap::activity_message::TransportReport transportReport{};
+    std::uint64_t transportBindingGeneration{};
     std::uint32_t correlation{};
     std::uint64_t sessionId{};
     state::activity::entity_slots::PendingMutation entitySlotMutation{};
     state::activity::bubble_authority::EntitySlotMask returnedEntitySlots{};
     bool hasReturnedEntitySlots{};
     state::activity::membership::PendingMutation membershipMutation{};
+    state::activity::reservations::PendingMutation reservationMutation{};
     JoinIngressDiagnostic joinIngress{};
     ClientStateIngress clientState{};
     EntitySlotsRequestedIngress entitySlotsRequested{};
@@ -151,14 +160,18 @@ struct ActivityPlan final {
     std::uint64_t joinCharacterSoid{};
     /**
      * Set when the delta moved the player to a different region.
-     * The new region has no bubble authority until a roster grants it, so the delta sends one.
+     * The new region has no bubble authority until the roster grants it, so waiting for the next
+     * roster tick leaves it empty for up to a whole interval.
      */
     bool regionMoved{};
+    /**
+     * Set when the delta moved the client's transition token, which means it is starting a load.
+     * It is the only start signal on the wire, and the roster's faster cadence runs off it.
+     */
+    bool transitionStarted{};
     Delivery delivery{};
     MutationDomain mutationDomain{};
     BindingIntent bindingIntent{};
-    /** Set by the join route; the push sends only this body. */
-    JoinMembershipBody joinMembershipBody{};
 };
 
 } // namespace sunrise::server::bap::encrypted::activity_message

@@ -6,12 +6,26 @@
 
 namespace sunrise::client::content::activity::sdk_generation::lua_artifacts::internal {
 
-/**
- * Every extracted row remains inspectable; only slot-owned runtime values can be played.
- * The collection's count and at come from the mission API table; this adds its symbol keys.
- */
+/** Every extracted row remains inspectable; only slot-owned runtime values can be played. */
 void append_actor_sequence_contract(const Source& source, std::string& output) {
-    output.append("\n---@class SunriseActorSequences\n");
+    output.append(R"lua(
+---@class SunriseActorSequence
+---@field id string
+---@field name string|nil
+---@field symbol string
+---@field source_path string|nil
+---@field key integer
+---@field kind integer
+---@field resource_tag integer
+---@field table_index integer
+---@field ordinal integer
+---@field source_offset integer
+---@field playable boolean
+
+---@class SunriseActorSequences
+---@field count integer
+---@field at fun(self: SunriseActorSequences, ordinal: integer): SunriseActorSequence|nil
+)lua");
     std::set<std::string> symbols{};
     for (const auto& row : source.actorSequenceEntries) {
         const auto symbol = text(source, row.symbol);

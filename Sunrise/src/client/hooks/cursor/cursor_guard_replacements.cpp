@@ -49,7 +49,7 @@ BOOL WINAPI clip_cursor(const RECT* bounds) noexcept {
 }
 
 /** Applies one interface-visibility edge to the pointer. */
-void apply_visibility(bool visible) noexcept {
+void apply_policy(bool visible) noexcept {
     AcquireSRWLockExclusive(&g_policyLock);
     if (g_interfaceOpen == visible) {
         ReleaseSRWLockExclusive(&g_policyLock);
@@ -72,6 +72,11 @@ void apply_visibility(bool visible) noexcept {
     if (restore) {
         (void)next(&bounds);
     }
+}
+
+/** Applies the cursor policy for the current interface visibility. */
+void apply_visibility(bool visible) noexcept {
+    apply_policy(visible);
 }
 
 } // namespace sunrise::client::hooks::cursor

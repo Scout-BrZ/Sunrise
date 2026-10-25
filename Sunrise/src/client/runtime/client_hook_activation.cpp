@@ -15,10 +15,11 @@
 #include "../content/activity/scriptable_catalog_worker.h"
 #include "../content/bootstrap/bootstrap_token_publish.h"
 #include "../content/investment/worker.h"
-#include "../content/items/packages/build.h"
 #include "../executable/image.h"
+#include "../hooks/account_registration/account_registration.h"
 #include "../hooks/assert_handler/assert_handler_lifecycle.h"
 #include "../hooks/async_io/async_io_lifetime_guard.h"
+#include "../hooks/content_resource_guard/content_resource_guard.h"
 #include "../hooks/bootflow/bootflow_hook_lifecycle.h"
 #include "../hooks/cine_probe/cine_probe.h"
 #include "../hooks/config_getter/config_getter_lifecycle.h"
@@ -27,9 +28,11 @@
 #include "../hooks/hitch_probe/hitch_probe.h"
 #include "../hooks/inactivity/inactivity_override.h"
 #include "../hooks/infinite_ammo/infinite_ammo.h"
+#include "../hooks/instance_mutex/instance_mutex_release.h"
+#include "../hooks/machine_id/machine_id_override.h"
+#include "../hooks/network/presence_publication.h"
 #include "../hooks/network/runtime.h"
 #include "../hooks/noclip/runtime.h"
-#include "../hooks/package_path/package_path_redirect.h"
 #include "../hooks/package_trust/package_trust_bypass.h"
 #include "../hooks/polled_input/runtime.h"
 #include "../hooks/retail_log/retail_log_lifecycle.h"
@@ -162,6 +165,40 @@ void clear_game_targets() noexcept {
         return false;
     }
 
+    if (core::settings::multiplayer()) {
+        const auto rollbackAdapters = []() noexcept {
+            // Each uninstall retains its native ownership when an in-flight call prevents removal.
+            bool removed = hooks::presence_publication::uninstall();
+            removed = hooks::instance_mutex::uninstall() && removed;
+            removed = hooks::machine_id::uninstall() && removed;
+            removed = hooks::account_registration::uninstall() && removed;
+            if (!removed) {
+                core::log::write(core::log::Channel::client,
+                                 core::log::Level::warn,
+                                 "ev=activate stage=adapter_rollback result=pending");
+            }
+            // Game-network hooks still own their resolved targets until normal shutdown.
+        };
+        if (!hooks::account_registration::install()) {
+            core::log::write(core::log::Channel::client,
+                             core::log::Level::error,
+                             "ev=activate stage=account_registration result=fail");
+            rollbackAdapters();
+            return false;
+        }
+        if (!hooks::machine_id::install()) {
+            rollbackAdapters();
+            return false;
+        }
+        (void)hooks::instance_mutex::install();
+        if (!hooks::presence_publication::install()) {
+            core::log::write(core::log::Channel::client,
+                             core::log::Level::error,
+                             "ev=activate stage=presence_publication result=fail");
+            rollbackAdapters();
+            return false;
+        }
+    }
     core::log::write(core::log::Channel::client,
                      core::log::Level::info,
                      "ev=activate stage=game_network result=ok");
@@ -170,7 +207,6 @@ void clear_game_targets() noexcept {
                      packageKeys ? core::log::Level::info : core::log::Level::warn,
                      packageKeys ? "ev=activate stage=package_keys result=ok"
                                  : "ev=activate stage=package_keys result=fail");
-    content::items::packages::export_keys_if_requested();
     // Diagnostic capture reports its own outcome and never demotes this stage.
     (void)hooks::retail_log::install();
     (void)hooks::assert_handler::install();
@@ -183,21 +219,20 @@ void clear_game_targets() noexcept {
     // The stock async-I/O wrapper reloads its singleton after pumping it and can observe the
     // legitimate teardown/recreate null window. This optional guard keeps the owner it pumped.
     (void)hooks::async_io::install();
+    // Protecao opcional: recurso de conteudo ausente nao deve ser desreferenciado.
+    (void)hooks::content_resource_guard::install();
     (void)hooks::config_getter::install();
-    // Mods publish before this sweep. A failure raises a notice; the mod rows stay in the manifest.
-    (void)hooks::package_path::install();
-    // Boot-step and slice-set accessors plus the lifetime gate probe; each reports its own outcome.
+    // Boot-step fixes scan for their own single-site targets; each reports its own outcome.
     (void)hooks::bootflow::install();
     // The launcher calls the Director's own selection entry points; nothing is detoured.
     (void)activity::mission_launch::install();
-    // Always attached: its hooks also carry fly, sword skate and the frame polls.
+    // The teleport hooks attach whether or not the feature is on, so the interface can enable it
+    // without a restart. Both replacements return immediately while nothing is requested.
     (void)hooks::teleport::install();
-    // Cheat hooks attach only when cheats are on; the flag is fixed for the session.
-    if (core::settings::get().client.cheats) {
-        // Noclip owns its Havok-step target, so a patch-specific miss cannot disable teleport.
-        (void)hooks::noclip::install();
-        (void)hooks::infinite_ammo::install();
-    }
+    // Noclip owns its Havok-step target, so a patch-specific miss cannot disable teleport.
+    (void)hooks::noclip::install();
+    // Attaches whether or not the feature is on, so the interface can enable it without a restart.
+    (void)hooks::infinite_ammo::install();
     // Resolves the activity config getter here; the hold itself runs on the frame tick.
     (void)hooks::inactivity::install();
     // Read-only. While the prologue-filler boot task runs, it logs once per second which

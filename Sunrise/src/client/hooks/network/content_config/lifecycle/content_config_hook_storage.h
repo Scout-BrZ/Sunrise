@@ -23,8 +23,9 @@ void clear_runtime() noexcept;
 /**
  * Removes one hook and points admitted calls at the restored target.
  * @param slot Hook handle to remove.
+ * @param replacement Replacement entry kept safe while Detours checks the threads.
  * @return True when the hook is gone after the call.
  */
-[[nodiscard]] bool detach(HookSlot slot) noexcept;
+[[nodiscard]] bool detach(HookSlot slot, void* replacement) noexcept;
 
 } // namespace sunrise::client::hooks::network::content_config::lifecycle

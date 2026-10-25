@@ -231,7 +231,7 @@ void grant_random_world_loot(std::span<const std::uint32_t> weapons,
         || titanArmour.size() != warlockArmour.size()) {
         return;
     }
-    const state::AccountState account = state::account_snapshot();
+    const state::AccountState account = state::bound_account_snapshot();
     std::span<const std::uint32_t> armour;
     for (std::size_t index = 0; index < account.characterCount; ++index) {
         if (!account.characters[index].selected) {
@@ -380,7 +380,10 @@ void grant_random_moon_loot() noexcept {
         grant_lost_ghost_reward();
         // One found ghost pays this much seasonal experience.
         constexpr std::int32_t kBaseExperienceReward = 2500;
-        (void)bap::arm_seasonal_experience_presentation(kBaseExperienceReward);
+        const bool queued = bap::arm_seasonal_experience_presentation(kBaseExperienceReward);
+        if (!queued) {
+            (void)state::grant_seasonal_experience(kBaseExperienceReward);
+        }
     }
     return outcome;
 }
@@ -452,8 +455,9 @@ static void stage_incident_grants(const message::incident::Incident& incident) n
         state::activity::membership::live_region_session(state::activity::kAbsentSessionId);
     state::activity::destination::DestinationSelection destination{};
     static_cast<void>(state::activity::destination::snapshot(destinationSession, destination));
-    const std::size_t packageLength = (std::min)(
-        static_cast<std::size_t>(destination.packageNameLength), destination.packageName.size());
+    const std::size_t packageLength =
+        (std::min)(static_cast<std::size_t>(destination.packageNameLength),
+                   destination.packageName.size());
     const std::string_view packageName(
         reinterpret_cast<const char*>(destination.packageName.data()), packageLength);
 

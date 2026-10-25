@@ -15,6 +15,34 @@ int selected() noexcept {
 
 } // namespace
 
+// Usada pela coleta da missão: repetir a solicitação enquanto ela
+// aguarda processamento não deve criar várias cópias da arma.
+bool enqueue_unique_item_reward(
+    std::uint32_t definitionHash,
+    std::uint8_t kind) noexcept {
+
+    const std::lock_guard lock(g_mutex);
+    const int owner = selected();
+
+    if (owner < 0 || definitionHash == 0) {
+        return false;
+    }
+
+    Statement row(
+        "INSERT INTO pending_rewards"
+        "(character_slot,kind,definition_hash,quantity) "
+        "SELECT ?,?,?,1 "
+        "WHERE NOT EXISTS ("
+        "SELECT 1 FROM pending_rewards "
+        "WHERE character_slot=? AND kind=? AND definition_hash=?"
+        ")");
+
+    return row.write(
+        owner, kind, definitionHash,
+        owner, kind, definitionHash);
+}
+
+
 /** Reward ownership and quantities are committed before presentation is attempted. */
 bool enqueue_reward(std::uint32_t definitionHash,
                     std::int32_t quantity,

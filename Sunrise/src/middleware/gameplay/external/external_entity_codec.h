@@ -27,8 +27,6 @@ inline constexpr std::uint16_t kNoEntityCell = 0xFFFF;
 inline constexpr std::size_t kMaximumTypePayloadBits = 16'384;
 /** Callback state can retain one complete bounded body plus its typed mirror header. */
 inline constexpr std::size_t kTypePayloadStateCapacity = kMaximumTypePayloadBits / 8U + 16U;
-/** A damage pool replicates a ten-bit level, so 1023 is full. */
-inline constexpr std::uint16_t kDamageLevelFull = 1023;
 
 /** Record flags transported by the five explicit envelope bits. */
 enum EntityRecordFlag : std::uint16_t {
@@ -60,20 +58,11 @@ struct EntityToken {
     std::uint8_t incarnation{};
 };
 
-/** @return True when a token fits its 17-bit wire identity. */
-[[nodiscard]] inline bool valid_token(const EntityToken& token) noexcept {
-    return token.slot <= kMaximumEntitySlot && token.incarnation <= kMaximumEntityIncarnation;
-}
-
 /** Fixed callback-owned semantic state for one type payload. */
 struct TypePayload {
     std::array<std::byte, kTypePayloadStateCapacity> state{};
     std::uint16_t byteCount{};
     state::gameplay::entity_identity::ActorSourceReference actorSource{};
-    /** Damage component 0x80804BEE pools 0 and 1, ten-bit levels; valid when damageKnown. */
-    std::uint16_t damageHealth{};
-    std::uint16_t damageShield{};
-    bool damageKnown{};
 };
 
 /** One generic channel-2 record and its callback-owned type state. */

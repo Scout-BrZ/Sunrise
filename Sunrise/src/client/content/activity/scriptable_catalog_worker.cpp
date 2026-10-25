@@ -279,6 +279,28 @@ namespace {
     return count;
 }
 
+/** @return True when one local row bank fits after an existing u32-indexed bank. */
+[[nodiscard]] bool can_append_rows(std::size_t existing, std::size_t incoming) noexcept {
+    // Snapshot rows are published as u32, so a bank stops at that maximum.
+    constexpr std::size_t maximum = (std::numeric_limits<std::uint32_t>::max)();
+    return existing <= maximum && incoming <= maximum - existing;
+}
+
+/** Rebases one present local row while preserving the absent sentinel. */
+[[nodiscard]] bool
+rebase_row(std::uint32_t local, std::uint32_t first, std::uint32_t& output) noexcept {
+    if (local == catalog::kNoRow) {
+        output = catalog::kNoRow;
+        return true;
+    }
+    if (local > (std::numeric_limits<std::uint32_t>::max)() - first) {
+        output = catalog::kNoRow;
+        return false;
+    }
+    output = first + local;
+    return true;
+}
+
 /** Appends one exact scenario placement and its analyzed rows to the snapshot. */
 [[nodiscard]] bool materialize_placement(BuildContext& context,
                                          const tables::Placement& placement) {
@@ -536,7 +558,6 @@ build_scenario_catalog_impl(const package_reader::Source& source,
                             AnalysisMap* sharedAnalyses,
                             internal::ContainerPlacementCache* sharedPlacements,
                             internal::StaticSpatialCache* sharedSpatial,
-                            const internal::BuildTables& tables,
                             std::uint32_t scenarioTag,
                             std::string_view scenarioName,
                             internal::BuilderCancelCheck cancel) {
@@ -603,7 +624,6 @@ build_scenario_catalog_impl(const package_reader::Source& source,
                                                            (*context->scenarioSource.scratch),
                                                            *sharedPlacements,
                                                            containers,
-                                                           tables.layouts,
                                                            scenarioName,
                                                            *output,
                                                            cancel)
@@ -611,7 +631,6 @@ build_scenario_catalog_impl(const package_reader::Source& source,
                                                            source,
                                                            (*context->scenarioSource.scratch),
                                                            containers,
-                                                           tables.layouts,
                                                            scenarioName,
                                                            *output,
                                                            cancel))) {
@@ -628,7 +647,6 @@ build_scenario_catalog_impl(const package_reader::Source& source,
                                                        (*context->scenarioSource.scratch),
                                                        *sharedSpatial,
                                                        containers,
-                                                       tables.layouts,
                                                        scenarioName,
                                                        *output,
                                                        cancel)
@@ -636,7 +654,6 @@ build_scenario_catalog_impl(const package_reader::Source& source,
                                                        source,
                                                        (*context->scenarioSource.scratch),
                                                        containers,
-                                                       tables.layouts,
                                                        scenarioName,
                                                        *output,
                                                        cancel);
@@ -649,11 +666,7 @@ build_scenario_catalog_impl(const package_reader::Source& source,
             set_step_detail(*output, step, cancelled(cancel));
             output->status = catalog::BuildStatus::failed;
         } else if (!internal::canonicalize_inline_name_evidence(*output)
-                   || !internal::resolve_names(*output,
-                                               context->inlineNames,
-                                               tables.definitions,
-                                               tables.hashNames,
-                                               cancel)) {
+                   || !internal::resolve_names(*output, context->inlineNames, cancel)) {
             set_detail(*output, "package name candidates did not fit");
             output->status = catalog::BuildStatus::failed;
         } else {
@@ -693,7 +706,6 @@ ScenarioAnalysisCache::ScenarioAnalysisCache() noexcept {
 
 ScenarioAnalysisCache::~ScenarioAnalysisCache() = default;
 
-/** Builds one scenario catalog from the tables State publishes, with no pass cache. */
 [[nodiscard]] std::shared_ptr<state::build_data::scriptables::Snapshot>
 build_scenario_catalog(const middleware::content::packages::reader::Source& source,
                        const ContainerIndex& containers,
@@ -701,16 +713,8 @@ build_scenario_catalog(const middleware::content::packages::reader::Source& sour
                        std::uint32_t scenarioTag,
                        std::string_view scenarioName,
                        BuilderCancelCheck cancel) {
-    return build_scenario_catalog_impl(source,
-                                       containers,
-                                       scratch,
-                                       nullptr,
-                                       nullptr,
-                                       nullptr,
-                                       BuildTables{},
-                                       scenarioTag,
-                                       scenarioName,
-                                       cancel);
+    return build_scenario_catalog_impl(
+        source, containers, scratch, nullptr, nullptr, nullptr, scenarioTag, scenarioName, cancel);
 }
 
 /** Builds one scenario catalog, reusing the caller's analysis caches when they exist. */
@@ -719,7 +723,6 @@ build_scenario_catalog(const middleware::content::packages::reader::Source& sour
                        const ContainerIndex& containers,
                        middleware::content::packages::reader::Scratch& scratch,
                        ScenarioAnalysisCache& analyses,
-                       const BuildTables& tables,
                        std::uint32_t scenarioTag,
                        std::string_view scenarioName,
                        BuilderCancelCheck cancel) {
@@ -734,7 +737,6 @@ build_scenario_catalog(const middleware::content::packages::reader::Source& sour
                                        shared,
                                        placements,
                                        spatial,
-                                       tables,
                                        scenarioTag,
                                        scenarioName,
                                        cancel);

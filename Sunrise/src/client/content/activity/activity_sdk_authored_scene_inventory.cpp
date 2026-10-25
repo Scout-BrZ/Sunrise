@@ -4,16 +4,160 @@
 #include <array>
 #include <cstdio>
 #include <cstring>
-#include <span>
 #include <unordered_map>
 #include <utility>
-#include <vector>
 
 #include "../../../core/logging/log.h"
 #include "../../../middleware/content/packages/tables/slot_descriptor_reader.h"
 #include "activity_sdk_authored_scene_internal.h"
 
 namespace sunrise::client::content::activity::sdk_generation::authored_scene_inventory {
+
+/** Formats one resource ID from its exact descriptor tuple. */
+bool resource_id(const topology::Snapshot& topology,
+                 const squad::DescriptorFact& descriptor,
+                 Text& output) noexcept {
+    if (descriptor.objectIndex >= topology.objects.size()
+        || descriptor.slotIndex >= topology.slots.size()) {
+        return false;
+    }
+    const topology::Object& object = topology.objects[descriptor.objectIndex];
+    const topology::Slot& slot = topology.slots[descriptor.slotIndex];
+    return format_text(output,
+                       "authored-scene-resource/%08x/%08x/%08x/%04x/%04x",
+                       static_cast<unsigned>(descriptor.configTag),
+                       static_cast<unsigned>(object.objectTag),
+                       static_cast<unsigned>(descriptor.descriptorOffset),
+                       static_cast<unsigned>(slot.slotIndex),
+                       static_cast<unsigned>(slot.slotType));
+}
+
+/** Formats one event-key ID from the resource, its graph, the scene slot and the gate. */
+bool event_key_id(const topology::Snapshot& topology,
+                  const squad::DescriptorFact& descriptor,
+                  std::uint32_t graphTag,
+                  std::uint32_t gateOffset,
+                  Text& output) noexcept {
+    if (descriptor.slotIndex >= topology.slots.size()) {
+        return false;
+    }
+    const topology::Slot& slot = topology.slots[descriptor.slotIndex];
+    return format_text(output,
+                       "authored-scene-event-key/%08x/%08x/%04x/%04x/%08x",
+                       static_cast<unsigned>(descriptor.configTag),
+                       static_cast<unsigned>(graphTag),
+                       static_cast<unsigned>(slot.slotIndex),
+                       static_cast<unsigned>(slot.slotType),
+                       static_cast<unsigned>(gateOffset));
+}
+
+/** Formats one scene-to-squad edge ID from its descriptor tuple and the squad slot it names. */
+bool edge_id(const topology::Snapshot& topology,
+             const squad::DescriptorFact& descriptor,
+             std::uint32_t squadSlotRow,
+             Text& output) noexcept {
+    if (descriptor.objectIndex >= topology.objects.size()
+        || descriptor.slotIndex >= topology.slots.size() || squadSlotRow >= topology.slots.size()) {
+        return false;
+    }
+    const topology::Object& object = topology.objects[descriptor.objectIndex];
+    const topology::Slot& slot = topology.slots[descriptor.slotIndex];
+    const topology::Slot& squad = topology.slots[squadSlotRow];
+    return format_text(output,
+                       "authored-scene-squad-edge/%08x/%08x/%08x/%04x/%04x/%04x/%04x",
+                       static_cast<unsigned>(descriptor.configTag),
+                       static_cast<unsigned>(object.objectTag),
+                       static_cast<unsigned>(descriptor.descriptorOffset),
+                       static_cast<unsigned>(slot.slotIndex),
+                       static_cast<unsigned>(slot.slotType),
+                       static_cast<unsigned>(squad.slotIndex),
+                       static_cast<unsigned>(squad.slotType));
+}
+
+/** Formats one task-to-objective target ID from its exact descriptor tuple. */
+bool task_target_id(const topology::Snapshot& topology,
+                    const squad::DescriptorFact& descriptor,
+                    Text& output) noexcept {
+    if (descriptor.objectIndex >= topology.objects.size()
+        || descriptor.slotIndex >= topology.slots.size()) {
+        return false;
+    }
+    const topology::Object& object = topology.objects[descriptor.objectIndex];
+    const topology::Slot& slot = topology.slots[descriptor.slotIndex];
+    return format_text(output,
+                       "task-target/%08x/%08x/%08x/%04x/%04x",
+                       static_cast<unsigned>(descriptor.configTag),
+                       static_cast<unsigned>(object.objectTag),
+                       static_cast<unsigned>(descriptor.descriptorOffset),
+                       static_cast<unsigned>(slot.slotIndex),
+                       static_cast<unsigned>(slot.slotType));
+}
+
+/** Tests one exact final slot shape supplied by the separate schema join. */
+bool slot_shape(const topology::Snapshot& topology,
+                const SchemaIndex& schemas,
+                std::uint32_t slotIndex,
+                std::uint32_t slotType,
+                std::uint32_t componentClass,
+                std::uint32_t senseSchema,
+                std::uint32_t authSchema) noexcept {
+    if (slotIndex >= topology.slots.size()) {
+        return false;
+    }
+    const auto found = schemas.find(slotIndex);
+    if (found == schemas.end() || found->second == nullptr || !found->second->exact) {
+        return false;
+    }
+    const topology::Slot& slot = topology.slots[slotIndex];
+    const squad::SlotSchemaFact& schema = *found->second;
+    return slot.slotType == slotType && schema.slotIndex == slotIndex
+           && schema.componentClass == componentClass && schema.senseSchema == senseSchema
+           && schema.authSchema == authSchema;
+}
+
+/** Builds and validates the unique global schema lookup. */
+bool schema_index(const topology::Snapshot& topology, const Facts& facts, SchemaIndex& output) {
+    output.clear();
+    try {
+        output.reserve(facts.slotSchemas.size());
+        for (const squad::SlotSchemaFact& schema : facts.slotSchemas) {
+            if (schema.slotIndex >= topology.slots.size()
+                || !output.emplace(schema.slotIndex, &schema).second) {
+                return false;
+            }
+        }
+        return true;
+    } catch (...) {
+        output.clear();
+        return false;
+    }
+}
+
+/** Checks the topology fields consumed by this bounded projection. */
+bool valid_topology(const topology::Snapshot& topology) noexcept {
+    if (!topology.ready || topology.objects.empty() || topology.slots.empty()) {
+        return false;
+    }
+    std::size_t nextSlot = 0;
+    for (std::size_t objectIndex = 0; objectIndex < topology.objects.size(); ++objectIndex) {
+        const topology::Object& object = topology.objects[objectIndex];
+        if (object.objectTag == 0 || object.objectTag == format::kAbsentIndex
+            || object.objectKey == 0 || object.objectKey == format::kAbsentIndex
+            || object.firstSlot != nextSlot || object.firstSlot > topology.slots.size()
+            || object.slotCount > topology.slots.size() - object.firstSlot) {
+            return false;
+        }
+        for (std::uint32_t index = object.firstSlot; index < object.firstSlot + object.slotCount;
+             ++index) {
+            const topology::Slot& slot = topology.slots[index];
+            if (slot.objectIndex != objectIndex || slot.slotIndex != index - object.firstSlot) {
+                return false;
+            }
+        }
+        nextSlot += object.slotCount;
+    }
+    return nextSlot == topology.slots.size();
+}
 
 namespace {
 
@@ -50,7 +194,7 @@ read_value(std::span<const std::byte> blob, std::size_t offset, Value& output) n
     return true;
 }
 
-/** Logs the outcome of one type-42 sensor edge: the refusing guard, or `ready`. */
+/** Names the guard that refused one type-42 sensor, so one run can say why an idle has no state. */
 void log_performance_edge(const squad::DescriptorFact& descriptor, const char* result) noexcept {
     std::array<char, 176> line{};
     const int written =
@@ -97,8 +241,7 @@ void log_scene_resource(const squad::DescriptorFact& descriptor,
 /** Logs a scene graph that yielded no event keys, and why. */
 void log_scene_graph(const squad::DescriptorFact& descriptor,
                      std::uint32_t graphTag,
-                     const char* result,
-                     core::log::Level level) noexcept {
+                     const char* result) noexcept {
     std::array<char, 176> line{};
     const int written = std::snprintf(line.data(),
                                       line.size(),
@@ -111,105 +254,40 @@ void log_scene_graph(const squad::DescriptorFact& descriptor,
     if (written > 0) {
         core::log::write(
             core::log::Channel::client,
-            level,
+            core::log::Level::warn,
             {line.data(), (std::min)(static_cast<std::size_t>(written), line.size() - 1U)});
     }
 }
 
 /**
- * Reads the gate table field of a scene graph.
+ * Finds the one typed array of gate elements in a scene graph.
  * @param blob Graph bytes.
- * @param rows Receives the offset of the first table row.
- * @param count Receives the row count.
- * @return False when the field does not hold a table of gate rows that fits the graph.
+ * @param first Receives the offset of the first element.
+ * @param count Receives the element count.
+ * @return False when the graph holds no such array, or more than one.
  */
-[[nodiscard]] bool
-read_gate_table(std::span<const std::byte> blob, std::size_t& rows, std::uint64_t& count) noexcept {
-    std::int64_t relative = 0;
-    std::uint32_t marker = 0;
-    std::uint64_t repeated = 0;
-    std::uint32_t rowClass = 0;
-    const std::size_t pointer = format::kAuthoredSceneGateTableOffset + 8U;
-    if (!read_value(blob, format::kAuthoredSceneGateTableOffset, count)
-        || !read_value(blob, pointer, relative) || relative <= 0
-        || static_cast<std::uint64_t>(relative) > blob.size() - pointer) {
-        return false;
-    }
-    // The pointer is relative to its own field and lands on the count of the array header.
-    const std::size_t header = pointer + static_cast<std::size_t>(relative);
-    if (header < 4U || !read_value(blob, header - 4U, marker)
-        || marker != format::kPackageArrayMarker || !read_value(blob, header, repeated)
-        || repeated != count || !read_value(blob, header + 8U, rowClass)
-        || rowClass != format::kAuthoredSceneGateRowClass) {
-        return false;
-    }
-    rows = header + 16U;
-    return rows <= blob.size() && count <= (blob.size() - rows) / format::kAuthoredSceneGateRowSize;
-}
-
-/**
- * Collects every port a graph block fires, ascending and unique.
- * @param blob Graph bytes.
- * @param graphTag Tag every connection list of the graph opens with.
- * @param gateLists Offsets of the gates' own connection lists, which name waiting blocks instead.
- * @param output Receives the fired ports.
- * @return False when a connection list does not fit the graph.
- */
-[[nodiscard]] bool fired_ports(std::span<const std::byte> blob,
-                               std::uint32_t graphTag,
-                               std::span<const std::size_t> gateLists,
-                               std::vector<std::uint32_t>& output) {
-    output.clear();
-    for (std::size_t offset = 0; contains(
-             blob, offset, format::kAuthoredSceneConnectionSingleOffset + sizeof(std::int32_t));
-         offset += sizeof(std::uint32_t)) {
-        std::uint32_t owner = 0;
-        std::uint32_t classId = 0;
-        if (!read_value(blob, offset, owner) || owner != graphTag
-            || !read_value(blob, offset + 4U, classId)
-            || classId != format::kAuthoredSceneConnectionClass
-            || std::find(gateLists.begin(), gateLists.end(), offset) != gateLists.end()) {
-            continue;
-        }
-        std::int32_t single = 0;
-        std::uint64_t count = 0;
-        std::int64_t relative = 0;
-        const std::size_t field = offset + format::kAuthoredSceneConnectionListOffset;
-        if (!read_value(blob, offset + format::kAuthoredSceneConnectionSingleOffset, single)
-            || !read_value(blob, offset + format::kAuthoredSceneConnectionCountOffset, count)
-            || !read_value(blob, field, relative)) {
-            return false;
-        }
-        // One target sits inline; -1 means the list carries them.
-        if (single != -1) {
-            output.push_back(static_cast<std::uint32_t>(single));
-            continue;
-        }
-        if (count == 0) {
-            continue;
-        }
-        const auto header = static_cast<std::int64_t>(field) + relative;
-        std::uint64_t repeated = 0;
+[[nodiscard]] bool find_gate_array(std::span<const std::byte> blob,
+                                   std::size_t& first,
+                                   std::uint64_t& count) noexcept {
+    bool found = false;
+    for (std::size_t offset = 0; offset + 16 <= blob.size(); offset += 4) {
+        std::uint32_t marker = 0;
         std::uint32_t elementClass = 0;
-        if (header < 0 || !read_value(blob, static_cast<std::size_t>(header), repeated)
-            || repeated != count
-            || !read_value(blob, static_cast<std::size_t>(header) + 8U, elementClass)
-            || elementClass != format::kPackageU32ArrayClass
-            || count > blob.size() / sizeof(std::uint32_t)) {
+        std::uint64_t declared = 0;
+        if (!read_value(blob, offset, marker) || marker != format::kPackageArrayMarker
+            || !read_value(blob, offset + 4, declared)
+            || !read_value(blob, offset + 12, elementClass)
+            || elementClass != format::kAuthoredSceneGateArrayClass) {
+            continue;
+        }
+        if (found) {
             return false;
         }
-        const std::size_t values = static_cast<std::size_t>(header) + 16U;
-        for (std::uint64_t index = 0; index < count; ++index) {
-            std::uint32_t port = 0;
-            if (!read_value(blob, values + static_cast<std::size_t>(index) * 4U, port)) {
-                return false;
-            }
-            output.push_back(port);
-        }
+        found = true;
+        first = offset + 20;
+        count = declared;
     }
-    std::sort(output.begin(), output.end());
-    output.erase(std::unique(output.begin(), output.end()), output.end());
-    return true;
+    return found;
 }
 
 /** Reads one tag once and retains the physical class beside its bytes. */
@@ -305,10 +383,14 @@ read_gate_table(std::span<const std::byte> blob, std::size_t& rows, std::uint64_
     return true;
 }
 
+} // namespace
+
+/** Builds both authored-scene sections from complete topology and package facts. */
 /**
  * Follows a scene resource to its event graph and appends one row per gate.
- * A graph that cannot be read, or one gate that is not a gate element, leaves the scene with no
- * keys and is logged. Only a topology inconsistency fails the build.
+ * A graph that cannot be read or holds no gate array leaves the scene without keys and is
+ * logged; a gate that is not a gate element, or a count past the capacity, is a misread graph
+ * and is logged the same way. Only a topology inconsistency fails the build.
  */
 [[nodiscard]] bool collect_event_keys(const topology::Snapshot& topology,
                                       const squad::DescriptorFact& descriptor,
@@ -318,65 +400,42 @@ read_gate_table(std::span<const std::byte> blob, std::size_t& rows, std::uint64_
                                       std::uint32_t resourceTag,
                                       std::span<const std::byte> resource,
                                       std::vector<EventKey>& output) {
-    const std::size_t start = output.size();
     std::uint32_t graphTag = 0;
     if (!read_value(resource, format::kAuthoredSceneGraphRelativeOffset, graphTag) || graphTag == 0
         || graphTag == format::kAbsentIndex) {
-        log_scene_graph(descriptor, graphTag, "unreferenced", core::log::Level::debug);
+        log_scene_graph(descriptor, graphTag, "unreferenced");
         return true;
     }
     const PackageRow* graph = nullptr;
     if (!package_row(reader, readerContext, graphTag, cache, graph) || graph == nullptr) {
-        log_scene_graph(descriptor, graphTag, "unreadable", core::log::Level::warn);
-        return true;
-    }
-    if (graph->classId != format::kAuthoredSceneGraphClass) {
-        log_scene_graph(descriptor, graphTag, "graph_class", core::log::Level::warn);
+        log_scene_graph(descriptor, graphTag, "unreadable");
         return true;
     }
     const auto blob = std::span(graph->bytes);
-    std::size_t rows = 0;
+    std::size_t first = 0;
     std::uint64_t count = 0;
-    if (!read_gate_table(blob, rows, count)) {
-        log_scene_graph(descriptor, graphTag, "gate_table", core::log::Level::warn);
+    if (!find_gate_array(blob, first, count)) {
+        log_scene_graph(descriptor, graphTag, "gate_array");
         return true;
     }
     if (count > format::kAuthoredSceneGateCapacity) {
-        log_scene_graph(descriptor, graphTag, "capacity", core::log::Level::warn);
+        log_scene_graph(descriptor, graphTag, "capacity");
         return true;
     }
-    std::vector<std::size_t> gateLists;
     for (std::uint64_t gate = 0; gate < count; ++gate) {
-        const std::size_t tableRow =
-            rows + static_cast<std::size_t>(gate) * format::kAuthoredSceneGateRowSize;
-        std::uint32_t rowOwner = 0;
-        std::uint32_t rowClass = 0;
-        std::uint64_t body = 0;
-        // A row names its body by absolute offset; the body names the row class back.
-        if (!read_value(blob, tableRow, rowOwner)
-            || !read_value(blob, tableRow + format::kAuthoredSceneGateClassOffset, rowClass)
-            || !read_value(blob, tableRow + format::kAuthoredSceneGateBodyOffset, body)
-            || rowOwner != graphTag || rowClass != format::kAuthoredSceneGateBodyClass
-            || body > blob.size() - format::kAuthoredSceneGateSize) {
-            output.resize(start);
-            log_scene_graph(descriptor, graphTag, "gate_row", core::log::Level::warn);
-            return true;
-        }
-        const auto element = static_cast<std::size_t>(body);
+        const std::size_t element =
+            first + static_cast<std::size_t>(gate) * format::kAuthoredSceneGateSize;
         std::uint32_t owner = 0;
-        std::uint32_t bodyClass = 0;
+        std::uint32_t elementClass = 0;
         std::uint32_t key = 0;
         std::int32_t ordinal = 0;
-        std::uint64_t listeners = 0;
         if (!read_value(blob, element, owner)
-            || !read_value(blob, element + format::kAuthoredSceneGateClassOffset, bodyClass)
+            || !read_value(blob, element + format::kAuthoredSceneGateClassOffset, elementClass)
             || !read_value(blob, element + format::kAuthoredSceneGateKeyOffset, key)
             || !read_value(blob, element + format::kAuthoredSceneGateOrdinalOffset, ordinal)
-            || !read_value(blob, element + format::kAuthoredSceneGateListenerCountOffset, listeners)
-            || owner != graphTag || bodyClass != format::kAuthoredSceneGateRowClass || key == 0
+            || owner != graphTag || elementClass != format::kAuthoredSceneGateClass || key == 0
             || key == format::kAbsentIndex) {
-            output.resize(start);
-            log_scene_graph(descriptor, graphTag, "gate", core::log::Level::warn);
+            log_scene_graph(descriptor, graphTag, "gate");
             return true;
         }
         EventKey row{};
@@ -390,32 +449,12 @@ read_gate_table(std::span<const std::byte> blob, std::size_t& rows, std::uint64_
         row.gateOffset = static_cast<std::uint32_t>(element);
         row.ordinal = ordinal;
         row.key = key;
-        row.flags = format::kAuthoredSceneEventKeyExact
-                    | (listeners != 0 ? format::kAuthoredSceneEventKeyListened : 0U);
+        row.flags = format::kAuthoredSceneEventKeyExact;
         output.push_back(row);
-        gateLists.push_back(element + format::kAuthoredSceneGateConnectionOffset);
-    }
-    std::vector<std::uint32_t> fired;
-    if (!fired_ports(blob, graphTag, gateLists, fired)) {
-        output.resize(start);
-        log_scene_graph(descriptor, graphTag, "connections", core::log::Level::warn);
-        return true;
-    }
-    // Port k is gate ordinal k, so a block firing port k fires that gate.
-    for (std::size_t index = start; index < output.size(); ++index) {
-        EventKey& row = output[index];
-        if (row.ordinal >= 0
-            && std::binary_search(
-                fired.begin(), fired.end(), static_cast<std::uint32_t>(row.ordinal))) {
-            row.flags |= format::kAuthoredSceneEventKeyFired;
-        }
     }
     return true;
 }
 
-} // namespace
-
-/** Builds both authored-scene sections from complete topology and package facts. */
 bool build(const topology::Snapshot& topology,
            const Facts& facts,
            squad::TagReader reader,
@@ -651,14 +690,8 @@ bool build(const topology::Snapshot& topology,
                                descriptorOffset
                                    + format::kAuthoredSceneParticipantTableClassRelativeOffset,
                                tableClass)
-                || tableClass != format::kAuthoredSceneParticipantTableClass) {
-                log_scene_resource(
-                    descriptor, resourceTag, "participant_table", core::log::Level::warn);
-                continue;
-            }
-            if (participantCount > format::kAuthoredSceneParticipantCapacity) {
-                log_scene_resource(
-                    descriptor, resourceTag, "participant_capacity", core::log::Level::warn);
+                || tableClass != format::kAuthoredSceneParticipantTableClass
+                || participantCount > format::kAuthoredSceneParticipantCapacity) {
                 continue;
             }
             for (std::uint64_t entry = 0; entry < participantCount; ++entry) {
@@ -667,24 +700,22 @@ bool build(const topology::Snapshot& topology,
                     + static_cast<std::size_t>(entry)
                           * format::kAuthoredSceneParticipantPointerSize;
                 std::uint64_t pointer = 0;
+                if (!read_value(blob, pointerField, pointer)
+                    || pointer > blob.size() - pointerField) {
+                    break;
+                }
+                const std::size_t payload = pointerField + static_cast<std::size_t>(pointer);
                 std::uint32_t blockClass = 0;
-                // A pointer or block that does not read is a misread table; the rest is dropped.
-                if (!read_value(blob, pointerField, pointer) || pointer > blob.size() - pointerField
-                    || pointerField + pointer < format::kAuthoredSceneParticipantClassSize
-                    || !read_value(blob,
-                                   pointerField + static_cast<std::size_t>(pointer)
-                                       - format::kAuthoredSceneParticipantClassSize,
-                                   blockClass)) {
-                    log_scene_resource(
-                        descriptor, resourceTag, "participant", core::log::Level::warn);
+                if (payload < format::kAuthoredSceneParticipantClassSize
+                    || !read_value(
+                        blob, payload - format::kAuthoredSceneParticipantClassSize, blockClass)) {
                     break;
                 }
                 if (blockClass != format::kAuthoredSceneSquadBlockClass) {
                     continue;
                 }
                 const std::size_t referenceField =
-                    pointerField + static_cast<std::size_t>(pointer)
-                    + format::kAuthoredSceneSquadPayloadReferenceOffset;
+                    payload + format::kAuthoredSceneSquadPayloadReferenceOffset;
                 std::uint32_t targetObjectKey = 0;
                 std::uint16_t targetSlotType = 0;
                 std::uint16_t targetSlotIndex = 0;
@@ -693,8 +724,6 @@ bool build(const topology::Snapshot& topology,
                         blob, referenceField + kTargetSlotTypeRelativeOffset, targetSlotType)
                     || !read_value(
                         blob, referenceField + kTargetSlotIndexRelativeOffset, targetSlotIndex)) {
-                    log_scene_resource(
-                        descriptor, resourceTag, "squad_block", core::log::Level::warn);
                     break;
                 }
                 if (targetSlotType != format::kSquadSlotType
@@ -715,8 +744,6 @@ bool build(const topology::Snapshot& topology,
                                    format::kSquadComponentClass,
                                    format::kSquadSenseSchema,
                                    format::kSquadAuthSchema)) {
-                    log_scene_resource(
-                        descriptor, resourceTag, "squad_unrunnable", core::log::Level::debug);
                     continue;
                 }
                 SquadEdge row{};
@@ -758,7 +785,11 @@ bool build(const topology::Snapshot& topology,
             }
         }
         std::sort(pending.resources.begin(), pending.resources.end(), resource_less);
-        std::sort(pending.eventKeys.begin(), pending.eventKeys.end(), event_key_less);
+        std::sort(pending.eventKeys.begin(),
+                  pending.eventKeys.end(),
+                  [](const EventKey& left, const EventKey& right) {
+                      return event_key_natural(left) < event_key_natural(right);
+                  });
         std::sort(pending.squadEdges.begin(), pending.squadEdges.end(), edge_less);
         std::sort(pending.taskTargets.begin(), pending.taskTargets.end(), task_less);
         pending.resources.erase(std::unique(pending.resources.begin(),

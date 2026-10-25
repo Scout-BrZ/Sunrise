@@ -8,6 +8,11 @@
 
 namespace sunrise::server::bap::encrypted::push::activity {
 
+// Permite publicar somente a transicao validada das cinematics finais de Adieu.
+[[nodiscard]] bool cinematic_arrival_publication_allowed(
+    const Session& session, const RefreshReport* refresh) noexcept;
+
+
 /** Outcome of adding one enabled SDK selected-state roster lease to a roster snapshot. */
 enum class MissionSeedRosterResult : std::uint8_t {
     inactive,

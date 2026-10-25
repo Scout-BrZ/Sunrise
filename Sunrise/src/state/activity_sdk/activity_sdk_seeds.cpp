@@ -331,7 +331,24 @@ materialize_initial_mission_seed(const BoundView& view,
         // The client builds every non-replicated placed object itself on slice load, and a host
         // owes sync records only for the replicated ones. Publishing the rest makes the client
         // build a second copy and pay its one sensor heap for it.
-        if (object.placedLeafCount != 0 && object.replicatedPlacementCount == 0) {
+        // Os controles das duas cinematicas finais de Adieu precisam entrar no roster
+        // antes da chegada. Seus atores sao locais, mas o slot de reproducao e do host.
+        // Excecao limitada ao estado, objeto, chave e schema exatos do catalogo.
+        const bool adieuFinalObject = scenario->tag == 0x80B5E01FU
+            && ((requestedRegion == 26 && object.objectTag == 0x80B5E364U
+                 && object.objectKey == 0x251FFE4EU)
+                || (requestedRegion == 27 && object.objectTag == 0x80B5E368U
+                    && object.objectKey == 0xDC3FB621U));
+        bool hostCinematicControl = false;
+        for (const format::Slot& slot : slots) {
+            hostCinematicControl = hostCinematicControl
+                || (adieuFinalObject && slot.slotType == format::kCinematicSlotType
+                    && slot.componentClass == format::kCinematicComponentClass
+                    && slot.authSchema == format::kCinematicAuthSchema
+                    && (slot.flags & format::kSlotSchemaJoinExact) != 0);
+        }
+        if (object.placedLeafCount != 0 && object.replicatedPlacementCount == 0
+            && !hostCinematicControl) {
             ++candidate.unreplicatedObjectCount;
             continue;
         }

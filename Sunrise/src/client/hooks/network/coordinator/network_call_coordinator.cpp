@@ -31,7 +31,7 @@ ingress_body(CallLease& lease, HookSlot slot, ConsumerKind consumer) noexcept {
     // this body, and the paused call is what proves it.
     if (quiescence::consume_arm(g_pauseGate)) {
         for (unsigned attempt = 0;
-             attempt < quiescence::kIngressPauseAttempts && g_pauseGate.released == 0;
+             attempt < quiescence::kIngressPauseAttempts && quiescence::held(g_pauseGate);
              ++attempt) {
             YieldProcessor();
         }
@@ -44,8 +44,9 @@ ingress_body(CallLease& lease, HookSlot slot, ConsumerKind consumer) noexcept {
     AcquireSRWLockShared(&g_lock);
     lease.original = original<void*>(slot);
     lease.accepting = g_accepting[static_cast<std::size_t>(slot)];
-    lease.httpConsumer =
-        consumer == ConsumerKind::http ? g_httpConsumer.load(std::memory_order_acquire) : nullptr;
+    if (consumer == ConsumerKind::http) {
+        lease.httpConsumer = g_httpConsumer.load(std::memory_order_acquire);
+    }
     ++g_callDepth;
     ReleaseSRWLockShared(&g_lock);
 }

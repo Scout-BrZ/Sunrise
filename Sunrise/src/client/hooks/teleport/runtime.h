@@ -44,7 +44,7 @@ void clear_targets() noexcept;
  */
 [[nodiscard]] bool install() noexcept;
 
-/** Stops Studio observers and detaches both teleport hooks; false requires a retry. */
+/** Detaches both hooks only after camera, physics and explicit sync callers have finished. */
 [[nodiscard]] bool uninstall() noexcept;
 
 /** Publishes the camera pose for the frame and the forward vector for the next physics tick. */
@@ -94,13 +94,6 @@ void apply_pending(void* component) noexcept;
 [[nodiscard]] bool owns_local_player(void* component) noexcept;
 
 /**
- * Reads the handle of the object the local player controls.
- * @param handle Receives the full handle, or the invalid sentinel.
- * @return False before the getter is found or while the player controls nothing.
- */
-[[nodiscard]] bool controlled_handle(std::uint32_t& handle) noexcept;
-
-/**
  * Reads the world position of the body a physics component drives.
  * @param component Physics component.
  * @param position Receives the three lanes.
@@ -139,5 +132,11 @@ void apply_pending(void* component) noexcept;
 
 /** Copies the last complete pose published by the camera-frame hook. */
 [[nodiscard]] bool camera_pose(CameraPose& pose) noexcept;
+
+/** Reads the native controlled handle for local-player ownership checks. */
+[[nodiscard]] bool current_controlled_handle(std::uint32_t& handle) noexcept;
+
+/** Registra componentes físicos para investigar a nave, sem alterar movimento. */
+void trace_ship_physics(void* component) noexcept;
 
 } // namespace sunrise::client::hooks::teleport

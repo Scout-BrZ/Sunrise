@@ -23,6 +23,7 @@ namespace {
 /** Slot names let an attach log be searched without a second lookup table. */
 constexpr std::array<const char*, kHandleCount> kSlotNames{
     "transport_kind",
+    "transport_kind_session",
     "authentication_status",
     "set_certificate",
     "http_execute_request",
@@ -129,13 +130,8 @@ bool uninstall_group(
     for (std::size_t offset = 0; offset < slots.size(); ++offset) {
         attached[offset] = g_handles[index(slots[offset])];
     }
-    // .srguard holds every network replacement body and its finally block.
-    const std::array protectedSpans{hooking::detour::section_span(".srguard")};
-    const hooking::detour::UninstallResult result =
-        hooking::detour::uninstall(std::span(attached).first(slots.size()),
-                                   protectedEntries,
-                                   protectedSpans,
-                                   &coordinator::idle);
+    const hooking::detour::UninstallResult result = hooking::detour::uninstall(
+        std::span(attached).first(slots.size()), protectedEntries, &coordinator::idle);
     if (result != hooking::detour::UninstallResult::removed) {
         return false;
     }

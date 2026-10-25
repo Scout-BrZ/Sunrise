@@ -4,18 +4,14 @@
 
 #include <TlHelp32.h>
 #include <detours.h>
-#include <limits>
 
 #include "../../../process/freeze/client_process_freeze.h"
 
 namespace sunrise::client::hooking::detour::transaction {
 namespace {
 
-/** Fixed storage bounds protected functions and explicit spans without suspended-thread allocation.
- */
+/** 4 protected functions per hook bound the fixed range storage, so no heap is used. */
 constexpr std::size_t kProtectedCodeLimit = 64;
-/** A protected code interval cannot require an unbounded walk while threads are suspended. */
-constexpr std::size_t kProtectedRegionLimit = 64;
 
 /** Access an enlisted thread is opened with. Detours reads and rewrites its context. */
 constexpr DWORD kEnlistAccess = THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT;
@@ -71,6 +67,7 @@ void close_threads(Threads& threads) noexcept {
     for (std::size_t index = 0; index < threads.count; ++index) {
         CloseHandle(threads.handles[index]);
     }
+    process::freeze::release_process_locks(threads.processLocks);
     threads = {};
 }
 
@@ -284,16 +281,14 @@ enum class PassResult {
 
     MEMORY_BASIC_INFORMATION entryMemory{};
     if (VirtualQuery(entry.address, &entryMemory, sizeof(entryMemory)) != sizeof(entryMemory)
-        || entryMemory.State != MEM_COMMIT || (entryMemory.Protect & PAGE_GUARD) != 0
-        || !is_executable(entryMemory.Protect)) {
+        || entryMemory.State != MEM_COMMIT || !is_executable(entryMemory.Protect)) {
         return false;
     }
 
     void* const code = DetourCodeFromPointer(entry.address, nullptr);
     MEMORY_BASIC_INFORMATION codeMemory{};
     if (code == nullptr || VirtualQuery(code, &codeMemory, sizeof(codeMemory)) != sizeof(codeMemory)
-        || codeMemory.State != MEM_COMMIT || (codeMemory.Protect & PAGE_GUARD) != 0
-        || !is_executable(codeMemory.Protect)) {
+        || codeMemory.State != MEM_COMMIT || !is_executable(codeMemory.Protect)) {
         return false;
     }
 
@@ -308,63 +303,21 @@ enum class PassResult {
     return range.begin < range.end && codeAddress >= range.begin && codeAddress < range.end;
 }
 
-/**
- * An explicit interval must fit committed executable pages from one image allocation.
- * @param span Exact owner-supplied begin and exclusive end, without thunk canonicalization.
- * @param range Receives the validated code interval.
- * @return False for empty, guarded, private, cross-image or non-executable ranges.
- */
-[[nodiscard]] bool resolve_span(const ProtectedCodeSpan& span, CodeRange& range) noexcept {
-    range = {};
-    const auto begin = reinterpret_cast<DWORD64>(span.begin);
-    const auto end = reinterpret_cast<DWORD64>(span.end);
-    if (begin == 0 || begin >= end) {
-        return false;
-    }
-    DWORD64 cursor = begin;
-    const auto* query = static_cast<const std::byte*>(span.begin);
-    void* allocation{};
-    for (std::size_t regions = 0; regions < kProtectedRegionLimit && cursor < end; ++regions) {
-        MEMORY_BASIC_INFORMATION memory{};
-        if (VirtualQuery(query, &memory, sizeof(memory)) != sizeof(memory)
-            || memory.State != MEM_COMMIT || memory.Type != MEM_IMAGE
-            || memory.AllocationBase == nullptr || (memory.Protect & PAGE_GUARD) != 0
-            || !is_executable(memory.Protect)) {
-            return false;
-        }
-        if (allocation == nullptr) {
-            allocation = memory.AllocationBase;
-        } else if (memory.AllocationBase != allocation) {
-            return false;
-        }
-        const auto region = reinterpret_cast<DWORD64>(memory.BaseAddress);
-        if (region > cursor || memory.RegionSize == 0
-            || memory.RegionSize > std::numeric_limits<DWORD64>::max() - region) {
-            return false;
-        }
-        const auto next = region + memory.RegionSize;
-        if (next <= cursor) {
-            return false;
-        }
-        const DWORD64 step = next < end ? next - cursor : end - cursor;
-        query += static_cast<std::size_t>(step);
-        cursor += step;
-    }
-    if (cursor < end) {
-        return false;
-    }
-    range = {begin, end};
-    return true;
-}
-
 } // namespace
 
 /** Starts a Detours transaction and enlists process threads to a stable snapshot. */
 bool begin(Threads& threads) noexcept {
     threads = {};
-    // The freeze gate excludes other suspenders while Detours holds process threads.
+    // DetourUpdateThread suspends immediately and allocates a thread record on each call.
+    // Own the loader and heap before the first suspension, or a suspended heap owner can
+    // block the next allocation forever. The process freezer uses the same lock order.
     process::freeze::enter_exclusive();
+    if (!process::freeze::acquire_process_locks(threads.processLocks)) {
+        process::freeze::leave_exclusive();
+        return false;
+    }
     if (DetourTransactionBegin() != NO_ERROR) {
+        close_threads(threads);
         process::freeze::leave_exclusive();
         return false;
     }
@@ -393,24 +346,16 @@ bool commit(Threads& threads) noexcept {
     return committed;
 }
 
-/** Checks every suspended instruction pointer only after validating all protected intervals. */
+/** Finds the protected function ranges and checks every suspended instruction pointer. */
 InspectionResult inspect(const Threads& threads,
-                         std::span<const ProtectedCodeEntry> entries,
-                         std::span<const ProtectedCodeSpan> spans) noexcept {
-    if ((entries.empty() && spans.empty()) || entries.size() > kProtectedCodeLimit
-        || spans.size() > kProtectedCodeLimit - entries.size()
-        || threads.count > threads.handles.size()) {
+                         std::span<const ProtectedCodeEntry> entries) noexcept {
+    if (entries.empty() || entries.size() > kProtectedCodeLimit) {
         return InspectionResult::failed;
     }
 
     std::array<CodeRange, kProtectedCodeLimit> ranges{};
     for (std::size_t index = 0; index < entries.size(); ++index) {
         if (!resolve_range(entries[index], ranges[index])) {
-            return InspectionResult::failed;
-        }
-    }
-    for (std::size_t index = 0; index < spans.size(); ++index) {
-        if (!resolve_span(spans[index], ranges[entries.size() + index])) {
             return InspectionResult::failed;
         }
     }
@@ -421,7 +366,7 @@ InspectionResult inspect(const Threads& threads,
         if (GetThreadContext(threads.handles[threadIndex], &context) == FALSE) {
             return InspectionResult::failed;
         }
-        for (std::size_t rangeIndex = 0; rangeIndex < entries.size() + spans.size(); ++rangeIndex) {
+        for (std::size_t rangeIndex = 0; rangeIndex < entries.size(); ++rangeIndex) {
             const CodeRange range = ranges[rangeIndex];
             if (context.Rip >= range.begin && context.Rip < range.end) {
                 return InspectionResult::protectedCodeActive;

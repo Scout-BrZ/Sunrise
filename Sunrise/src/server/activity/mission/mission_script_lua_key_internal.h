@@ -17,7 +17,10 @@ inline constexpr char kTimerRefCollectionMetatable[] = "sunrise.mission.timers";
 inline constexpr char kVariableRefMetatable[] = "sunrise.mission.variable_ref";
 inline constexpr char kVariableRefCollectionMetatable[] = "sunrise.mission.variables";
 
-/** One effect correlation key. A script compares keys with `matches` or stores `value`. */
+/**
+ * One effect correlation key. It has no numeric or string accessor, so a script can only compare
+ * a key an effect gave it against a key an event reports.
+ */
 struct RequestKeyHandle final {
     std::uint64_t key{};
 };
@@ -72,6 +75,15 @@ struct VariableRefCollectionHandle final {
     return true;
 }
 
+/**
+ * Reads one timer name a script supplied, refusing the runtime's reserved prefix.
+ * @return False when the name is malformed or reserved.
+ */
+[[nodiscard]] inline bool
+parse_script_timer_key(lua_State* state, int index, StateKey& output) noexcept {
+    return parse_state_key(state, index, output) && !runtime_timer_key(output);
+}
+
 void push_request_key(lua_State* state, std::uint64_t key);
 void push_timer_ref(lua_State* state, const StateKey& key);
 void push_variable_ref(lua_State* state, const StateKey& key);
@@ -79,10 +91,7 @@ void push_variable_ref(lua_State* state, const StateKey& key);
 /** Registers every locked mission-key userdata shape. */
 void register_key_metatables(lua_State* state);
 
-/** Pushes context.timers. */
-void push_timer_ref_collection(lua_State* state);
-
-/** Pushes context.variables. */
-void push_variable_ref_collection(lua_State* state);
+/** Pushes one recognized Context key member and returns whether the key was owned. */
+[[nodiscard]] bool push_key_context_member(lua_State* state, std::string_view key);
 
 } // namespace sunrise::server::activity::mission::lua_vm::detail

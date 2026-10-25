@@ -150,14 +150,14 @@ void log_manifest_served(std::size_t size) noexcept {
  * @param useTls Unused. Kept for the hook ABI.
  * @return 1 for every local completion, or -1 when the result prefix is null.
  */
-__declspec(noinline) std::int64_t enqueue_get_impl(const coordinator::CallLease& lease,
-                                                   void* resultValue,
-                                                   const char* url,
-                                                   void* responseBody,
-                                                   std::int64_t responseCapacity,
-                                                   std::uint64_t transaction,
-                                                   char flagA,
-                                                   char useTls) noexcept {
+std::int64_t enqueue_get_impl(const coordinator::CallLease& lease,
+                              void* resultValue,
+                              const char* url,
+                              void* responseBody,
+                              std::int64_t responseCapacity,
+                              std::uint64_t transaction,
+                              char flagA,
+                              char useTls) noexcept {
     if (core::settings::get().client.externalServer.enabled) {
         // The URL comes from the config getter, which answers the external route in this mode.
         const auto call = reinterpret_cast<EnqueueGet>(lease.original);
@@ -206,7 +206,6 @@ __declspec(noinline) std::int64_t enqueue_get_impl(const coordinator::CallLease&
     return kCompletedResult;
 }
 
-#pragma code_seg(push, get_guard, ".srcfg")
 /** Exact protected replacement body for the local ContentConfig GET route. */
 __declspec(noinline) std::int64_t __fastcall enqueue_get_body(void* resultValue,
                                                               const char* url,
@@ -215,19 +214,13 @@ __declspec(noinline) std::int64_t __fastcall enqueue_get_body(void* resultValue,
                                                               std::uint64_t transaction,
                                                               char flagA,
                                                               char useTls) noexcept {
-    coordinator::CallLease lease;
+    coordinator::CallLease lease{};
     coordinator::g_callIngress(lease, HookSlot::enqueueGet);
-    std::int64_t result{};
-    __try {
-        result = enqueue_get_impl(
-            lease, resultValue, url, responseBody, responseCapacity, transaction, flagA, useTls);
-    } __finally {
-        coordinator::g_callEgress(lease.tracked);
-    }
+    const std::int64_t result = enqueue_get_impl(
+        lease, resultValue, url, responseBody, responseCapacity, transaction, flagA, useTls);
+    coordinator::g_callEgress(lease.tracked);
     return result;
 }
-
-#pragma code_seg(pop, get_guard)
 
 } // namespace
 

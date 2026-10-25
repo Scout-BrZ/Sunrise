@@ -16,7 +16,17 @@ namespace {
 
 namespace topology = topology_inventory;
 
-using detail::format_text;
+/** Formats one bounded canonical identity. */
+template <typename... Values>
+[[nodiscard]] bool format_text(std::string& output, const char* pattern, Values... values) {
+    std::array<char, 192> bytes{};
+    const int count = std::snprintf(bytes.data(), bytes.size(), pattern, values...);
+    if (count < 0 || static_cast<std::size_t>(count) >= bytes.size()) {
+        return false;
+    }
+    output.assign(bytes.data(), static_cast<std::size_t>(count));
+    return true;
+}
 
 /** Inserts one unique config tag and rejects duplicate normalized definitions. */
 template <typename Row>
@@ -49,11 +59,6 @@ template <typename Row>
         row.members.count = static_cast<std::uint32_t>(source.members.size());
         row.complete = source.complete;
         row.hasInlinePointSet = source.hasInlinePointSet;
-        row.requiresSelectedRule = requires_selected_spawn_rule(source.rawReference98,
-                                                                source.rawReferenceA0,
-                                                                source.complete,
-                                                                source.inlinePointSetInspected,
-                                                                source.hasInlinePointSet);
         if (!insert_config(byConfig, row, spawnerRow)) {
             return false;
         }

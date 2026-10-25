@@ -33,11 +33,11 @@
 
 /** The four numeric fields of the version resource, in FILEVERSION order. */
 #define SUNRISE_VER_MAJOR 0
-#define SUNRISE_VER_MINOR 6
-#define SUNRISE_VER_PATCH 0
+#define SUNRISE_VER_MINOR 5
+#define SUNRISE_VER_PATCH 1
 #define SUNRISE_VER_BUILD 0
 /** The same version as display text. Windows shows this string, not the four fields. */
-#define SUNRISE_VER_STRING "0.6.0.0"
+#define SUNRISE_VER_STRING "0.5.1.0"
 
 /** SQLite schema, default rows, and upstream notice are embedded in the DLL. */
 #define IDR_INVESTMENT_SCHEMA 106
@@ -47,6 +47,3 @@
 /** Account preferences have their own schema and seed data in the save. */
 #define IDR_ACCOUNT_SETTINGS_SCHEMA 109
 #define IDR_ACCOUNT_SETTINGS_DEFAULTS 110
-
-/** A created character's starting state has its own tables and rows in the save. */
-#define IDR_CHARACTER_STARTER 111

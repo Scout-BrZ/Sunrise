@@ -2,7 +2,10 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string_view>
 
+#include "../../member_context.h"
+#include "../../member_selection.h"
 #include "../activity_membership_query.h"
 
 namespace sunrise::state::activity::membership::transactions {
@@ -70,23 +73,36 @@ inline bool equal(const Snapshot& first, const Snapshot& second) noexcept {
            && first.hasPendingLeg == second.hasPendingLeg;
 }
 
-/**
- * Applies only the present client-reported fields to a copy of the host-owned membership value.
- * @param state Current membership value, left unchanged.
- * @param update Sparse fields to apply to the copy.
- * @return Merged membership value, with revisions and identity unchanged.
- */
+// A regra mais estrita vale somente para as duas cinematicas finais de Adieu.
+// Teletransportes jogaveis, abertura e outras atividades conservam a regra existente.
+inline bool adieu_final_arrival(const SessionRecord& record,
+                                const MembershipState& state) noexcept {
+    const auto& destination = record.destination;
+    if (destination.packageNameLength > destination.packageName.size()) { return false; }
+    const std::string_view package(
+        reinterpret_cast<const char*>(destination.packageName.data()), destination.packageNameLength);
+    return package == "mission_journey" && state.hasHostTeleport
+        && (state.hostTeleport.sliceSetIndex == 26 || state.hostTeleport.sliceSetIndex == 27)
+        && state.hostTeleport.spawnSetHash == 0x811C9DC5U;
+}
+
+/** Aplica os campos recebidos, exigindo chegada atual somente no encerramento de Adieu. */
 inline MembershipState merge(const MembershipState& state,
-                             const AuthoritativeUpdate& update) noexcept {
+                             const AuthoritativeUpdate& update,
+                             bool confirmCurrentArrival = false) noexcept {
     MembershipState merged = state;
     // While the host is teleporting the client, the host owns the transition token. A stale
     // client report would revert the arm's advance, and the client would then reject the target
     // region record. The client owns the token again once the teleport is spent.
     const bool hostDrivesToken =
         state.hasHostTeleport && state.hostTeleport.state != kHostTeleportSpawnState;
-    if (update.hasTransitionToken && !hostDrivesToken) {
-        merged.transitionToken = update.transitionToken;
-        merged.hasTransitionToken = true;
+    if (update.hasTransitionToken) {
+        merged.nativeTransitionToken = update.transitionToken;
+        merged.transitionReported = true;
+        if (!hostDrivesToken) {
+            merged.transitionToken = update.transitionToken;
+            merged.hasTransitionToken = true;
+        }
     }
     if (update.hasSpawn) {
         merged.spawn = update.spawn;
@@ -94,6 +110,7 @@ inline MembershipState merge(const MembershipState& state,
     }
     if (update.hasTeleport) {
         merged.teleport = update.teleport;
+        merged.teleportReported = true;
     }
     // Both legs are kept exactly as reported, -1 included, because message 12 mirrors them back.
     // Where the player is comes from `player_region`, which prefers the current leg.
@@ -108,14 +125,24 @@ inline MembershipState merge(const MembershipState& state,
     // The client has reported the region the arm named, so the move is done and the same machine
     // owes the spawn. Its step 3 runs the spawn only while the host state reads 3, so the arm is
     // raised rather than dropped. Step 0 refuses to re-latch on 3, so this cannot re-arm.
-    if (merged.hasHostTeleport && merged.region.index >= 0
-        && merged.region.index == merged.hostTeleport.sliceSetIndex) {
+    // Uma regiao pendente ainda esta carregando. Para os videos finais, o host
+    // so libera a etapa 3 depois da chegada atual e da resposta do mesmo teletransporte.
+    const bool matchingTeleport = merged.teleportReported
+        && merged.teleport.token == merged.hostTeleport.token
+        && merged.teleport.sliceSetIndex == merged.hostTeleport.sliceSetIndex
+        && merged.teleport.spawnSetHash == merged.hostTeleport.spawnSetHash;
+    const bool arrived = confirmCurrentArrival
+        ? (merged.currentReported && merged.currentRegion.index == merged.hostTeleport.sliceSetIndex
+           && matchingTeleport && merged.teleport.state == kHostTeleportSpawnState)
+        : (merged.region.index >= 0 && merged.region.index == merged.hostTeleport.sliceSetIndex);
+    if (merged.hasHostTeleport && arrived) {
         merged.hostTeleport.state = kHostTeleportSpawnState;
     }
     // Retire the matching teleport before staging the answer so its screen can release.
     if (merged.hasHostTeleport && merged.hostTeleport.state == kHostTeleportSpawnState
         && merged.teleport.state == kClientTeleportResetState
-        && merged.teleport.token == merged.hostTeleport.token) {
+        && merged.teleport.token == merged.hostTeleport.token
+        && (!confirmCurrentArrival || matchingTeleport)) {
         merged.hasHostTeleport = false;
         merged.hostTeleport = {};
     }
@@ -163,7 +190,10 @@ inline bool equal_authoritative(const MembershipState& first,
            && equal(first.hostTeleport, second.hostTeleport)
            && equal(first.currentRegion, second.currentRegion) && equal(first.region, second.region)
            && first.currentReported == second.currentReported
-           && first.pendingReported == second.pendingReported;
+           && first.pendingReported == second.pendingReported
+           && first.transitionReported == second.transitionReported
+           && first.nativeTransitionToken == second.nativeTransitionToken
+           && first.teleportReported == second.teleportReported;
 }
 
 /**

@@ -53,13 +53,8 @@ namespace {
            && counts.recordRewards <= output.recordRewards.size()
            && counts.progressionSteps <= output.progressionSteps.size()
            && counts.seasonPassRewards <= output.seasonPassRewards.size()
-           && counts.bounties <= output.bounties.size()
-           && counts.rewardPools <= output.rewardPools.size()
-           && counts.rewardEntries <= output.rewardEntries.size()
-           && counts.rewardItems <= output.rewardItems.size()
-           && counts.rewardInstructions <= output.rewardInstructions.size()
-           && counts.rewardModifiers <= output.rewardModifiers.size()
-           && counts.rewardSockets <= output.rewardSockets.size();
+           && counts.seasonPassPackages <= output.seasonPassPackages.size()
+           && counts.bounties <= output.bounties.size();
 }
 
 /** @return The header's row counts, as platform sizes. */
@@ -99,13 +94,8 @@ namespace {
         header.recordRewardCount,
         header.progressionStepCount,
         header.seasonPassRewardCount,
+        header.seasonPassPackageCount,
         header.bountyCount,
-        header.rewardPoolCount,
-        header.rewardEntryCount,
-        header.rewardItemCount,
-        header.rewardInstructionCount,
-        header.rewardModifierCount,
-        header.rewardSocketCount,
     };
 }
 
@@ -125,12 +115,10 @@ namespace {
 
 } // namespace
 
-/** Reads the PE identity and ties it to the configured equipment and the package content. */
+/** Reads the PE identity and ties it to the configured-equipment hash. */
 bool current_build_identity(std::uint64_t configuredEquipmentHash,
-                            std::uint64_t contentHash,
                             BuildIdentity& identity) noexcept {
     identity = {};
-    identity.contentHash = contentHash;
     const HMODULE module = GetModuleHandleW(nullptr);
     if (module == nullptr) {
         return false;
@@ -199,9 +187,12 @@ LoadStatus load(const wchar_t* path,
         header.imageTimestamp,
         header.imageSize,
         header.configuredEquipmentHash,
-        header.contentHash,
     };
-    if (!(cachedBuild == expectedBuild)) {
+    // Equipment selects the client extraction inputs, so a changed loadout invalidates the cache
+    // like a changed executable does; every decoded domain and the payload checksum follow.
+    if (cachedBuild.imageTimestamp != expectedBuild.imageTimestamp
+        || cachedBuild.imageSize != expectedBuild.imageSize
+        || cachedBuild.configuredEquipmentHash != expectedBuild.configuredEquipmentHash) {
         return close_with(file, LoadStatus::stale);
     }
 

@@ -7,7 +7,8 @@
 
 namespace sunrise::server::activity::mission::lua_vm::detail {
 
-// Peer handles retain identity while their values come from the current published set.
+// One locked view per peer read. A handle addresses a row of the peer set the host last published
+// and copies nothing, so every member read re-resolves that row before it answers.
 inline constexpr char kPeerCollectionMetatable[] = "sunrise.mission.peers";
 inline constexpr char kPeerViewMetatable[] = "sunrise.mission.peer_view";
 
@@ -16,10 +17,8 @@ struct PeerCollectionHandle final {
     std::uint8_t marker{};
 };
 
-/** The row is a lookup hint; session identity must still match. */
+/** One peer session, at its zero-based row inside the published set. */
 struct PeerViewHandle final {
-    std::uint64_t sessionId{};
-    std::uint64_t sessionGeneration{};
     std::uint8_t row{};
 };
 

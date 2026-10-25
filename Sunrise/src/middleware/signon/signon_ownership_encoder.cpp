@@ -24,7 +24,7 @@ bool encode(const state::entitlements::Table& entitlements,
         if (!state::entitlements::owned_identifier(entitlements, index, identifier)) {
             continue;
         }
-        if (!writer.write_varint(kIdentifierField, identifier)) {
+        if (!writer.varint(kIdentifierField, identifier)) {
             return false;
         }
     }

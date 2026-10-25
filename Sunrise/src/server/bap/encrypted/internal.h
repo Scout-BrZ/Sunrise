@@ -29,6 +29,8 @@ namespace sunrise::server::bap::encrypted {
 enum class BodyCodec : std::uint8_t {
 
     empty,
+    registerRelayClient,
+    initiateRelayConnection,
 
     accountTranslationResponse,
 
@@ -141,12 +143,25 @@ struct SeasonPassRewardTransaction {
 
     std::unique_ptr<state::PendingSeasonPassReward> pending{};
 
-    queuez::RecordRewardGrant update{};
+    std::variant<std::monostate,
+
+                 queuez::ItemAcquisition,
+
+                 queuez::ProfileItemAcquisition,
+
+                 queuez::RecordRewardGrant>
+
+        update{};
 };
 
 /** Optional side effect produced while decoding one authenticated service body. */
 
 struct ServiceOutcome {
+    bool hasRelayRegistration{};
+    bool hasRelayConnectivityFailure{};
+    std::optional<middleware::bap::nat_relay::InitiateRelayConnection> relayInitiate;
+    activity_host_manager::PendingStartupReservations startupReservations{};
+    std::optional<state::social::NativePresence> nativePresence;
 
     bool hasSubscription{};
     /** The ws-206 reply already carries the family's first snapshot, so no push repeats it. */
@@ -412,7 +427,7 @@ void ensure_account_canonical() noexcept;
  * @param written Existing byte count, updated after each complete push is appended.
  * @param after Receives the queuez state published after caller output is copied.
  * @param armsRepush Receives whether the Family-4 companion needs its delayed second copy.
- * @param ownSnapshotAnswered True when the reply already carried this subscribe's snapshot.
+ * @param armsBannerRepush Receives whether a family-zero body needs its delayed second copy.
  */
 
 void append_queuez_notification(Scratch& scratch,
@@ -433,6 +448,7 @@ void append_queuez_notification(Scratch& scratch,
 
                                 bool& armsRepush,
 
+                                bool& armsBannerRepush,
                                 bool ownSnapshotAnswered = false) noexcept;
 
 /**
@@ -472,6 +488,30 @@ void append_queuez_notification(Scratch& scratch,
 
     queuez::SessionState& after) noexcept;
 
+/** Publishes one Season package as new residents plus their acquisition descriptors. */
+
+[[nodiscard]] bool append_season_pass_package_notification(
+
+    Scratch& scratch,
+
+    const queuez::SessionState& before,
+
+    const state::PendingDirectItemBundle& mutation,
+
+    std::uint16_t rewardIndex,
+
+    std::span<const queuez::AcquisitionPresentationRow> acquisitionPresentationRows,
+
+    std::span<const std::byte, state::kAesKeySize> key,
+
+    std::span<const std::byte, state::kBapNonceSize> nonce,
+
+    std::span<std::byte> response,
+
+    std::size_t& written,
+
+    queuez::SessionState& after) noexcept;
+
 /** Publishes every item and the claimed record in one Family-4 revision. */
 
 [[nodiscard]] bool append_record_reward_notification(
@@ -495,7 +535,8 @@ void append_queuez_notification(Scratch& scratch,
     std::size_t& written) noexcept;
 
 /**
- * Appends the family-zero banner pair once, after a family-three subscribe.
+ * Appends the family-zero banner pair as its own notification.
+ * Sent twice per boot at the same version, which is what survives the state-1 `declared` race.
  * `after` records the delivery, or a later 504 move cannot name the record it must release.
  * @param scratch Lock-owned transform buffers.
  * @param before Queuez state the pair is delivered against.
@@ -746,6 +787,42 @@ append_equipment_appearance_refresh_notification(Scratch& scratch,
 
                                                  std::size_t& written) noexcept;
 
+/** Appends the Family-0 refresh owed by a socket change on an equipped item. */
+
+[[nodiscard]] bool
+
+append_socket_appearance_refresh_notification(Scratch& scratch,
+
+                                              const queuez::CharacterAppearanceRefresh& refresh,
+
+                                              const state::PendingSocketPlug& mutation,
+
+                                              std::span<const std::byte, state::kAesKeySize> key,
+
+                                              std::array<std::byte, state::kBapNonceSize>& nonce,
+
+                                              std::span<std::byte> response,
+
+                                              std::size_t& written) noexcept;
+
+/** Appends the Family-0 character ability refresh owed by a subclass selection. */
+
+[[nodiscard]] bool
+
+append_subclass_appearance_refresh_notification(Scratch& scratch,
+
+                                                const queuez::CharacterAppearanceRefresh& refresh,
+
+                                                const state::PendingSubclassSelection& mutation,
+
+                                                std::span<const std::byte, state::kAesKeySize> key,
+
+                                                std::array<std::byte, state::kBapNonceSize>& nonce,
+
+                                                std::span<std::byte> response,
+
+                                                std::size_t& written) noexcept;
+
 /** Appends a Family-3 character record followed by the changed account roster after equip. */
 
 [[nodiscard]] bool
@@ -763,6 +840,42 @@ append_equipment_roster_refresh_notification(Scratch& scratch,
                                              std::span<std::byte> response,
 
                                              std::size_t& written) noexcept;
+
+/** Appends a Family-3 character-only appearance refresh after an equipped socket change. */
+
+[[nodiscard]] bool
+
+append_socket_roster_refresh_notification(Scratch& scratch,
+
+                                          const queuez::RosterAppearanceRefresh& refresh,
+
+                                          const state::PendingSocketPlug& mutation,
+
+                                          std::span<const std::byte, state::kAesKeySize> key,
+
+                                          std::array<std::byte, state::kBapNonceSize>& nonce,
+
+                                          std::span<std::byte> response,
+
+                                          std::size_t& written) noexcept;
+
+/** Appends a Family-3 character-only appearance refresh after a subclass selection. */
+
+[[nodiscard]] bool
+
+append_subclass_roster_refresh_notification(Scratch& scratch,
+
+                                            const queuez::RosterAppearanceRefresh& refresh,
+
+                                            const state::PendingSubclassSelection& mutation,
+
+                                            std::span<const std::byte, state::kAesKeySize> key,
+
+                                            std::array<std::byte, state::kBapNonceSize>& nonce,
+
+                                            std::span<std::byte> response,
+
+                                            std::size_t& written) noexcept;
 
 /** Refreshes the selected character's complete Family-0 appearance from committed State. */
 

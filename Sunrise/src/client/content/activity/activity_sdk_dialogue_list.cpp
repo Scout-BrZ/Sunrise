@@ -5,17 +5,15 @@
 #include <cstring>
 #include <limits>
 
-#include "../../../state/activity_sdk/format.h"
 #include "activity_sdk_dialogue_group_index.h"
 
 namespace sunrise::client::content::activity::sdk_generation::dialogue_list {
 namespace {
 
-namespace format = state::activity_sdk::format;
-
 // The cue definitions come in cue order; the content trees that follow are sorted by hash.
 constexpr std::size_t kTreeField = 0x18;
 constexpr std::size_t kTreeStride = 16;
+constexpr std::uint32_t kTreeArrayClass = 0x80808D19U;
 // Every tree object repeats the definition hash it belongs to, after a per-object id.
 constexpr std::size_t kObjectHashOffset = 4;
 // A sequence plays its children in order through an array of relative object pointers.
@@ -203,20 +201,13 @@ struct Tree final {
 
 } // namespace
 
-/**
- * Matches each cue definition to the content trees that carry its hash.
- * @param list Authored dialogue list blob.
- * @param output Receives the cues, their lines and the shared hashes; reset first.
- * @return False when the definition or tree arrays are malformed.
- */
 bool read(std::span<const std::byte> list, Snapshot& output) {
     output = {};
     std::vector<dialogue_group_index::Definition> definitions{};
     std::size_t treeRows = 0;
     std::size_t treeCount = 0;
     if (!dialogue_group_index::definitions(list, definitions)
-        || !read_array(
-            list, kTreeField, kTreeStride, format::kDialogueGroupArrayClass, treeRows, treeCount)) {
+        || !read_array(list, kTreeField, kTreeStride, kTreeArrayClass, treeRows, treeCount)) {
         return false;
     }
     std::vector<Tree> trees(treeCount);
@@ -245,7 +236,7 @@ bool read(std::span<const std::byte> list, Snapshot& output) {
     for (std::size_t index = 0; index < definitions.size(); ++index) {
         Cue& cue = output.cues[index];
         cue.definitionHash = definitions[index].hash;
-        cue.windowSeconds = definitions[index].authoredWindowSeconds;
+        cue.seconds = definitions[index].authoredWindowSeconds;
         const auto range = std::equal_range(trees.begin(),
                                             trees.end(),
                                             Tree{cue.definitionHash, 0},
@@ -255,7 +246,6 @@ bool read(std::span<const std::byte> list, Snapshot& output) {
         std::size_t matches = 0;
         bool malformed = false;
         std::vector<Line> matched{};
-        std::vector<Line> unmatched{};
         for (auto tree = range.first; tree != range.second; ++tree) {
             Walk walk{};
             walk.definitionHash = cue.definitionHash;
@@ -264,11 +254,9 @@ bool read(std::span<const std::byte> list, Snapshot& output) {
                 malformed = true;
                 continue;
             }
-            if (std::fabs(seconds - cue.windowSeconds) <= kSecondsTolerance) {
+            if (std::fabs(seconds - cue.seconds) <= kSecondsTolerance) {
                 ++matches;
                 matched = std::move(walk.lines);
-            } else {
-                unmatched = std::move(walk.lines);
             }
         }
         const std::size_t candidates = static_cast<std::size_t>(range.second - range.first);
@@ -276,17 +264,10 @@ bool read(std::span<const std::byte> list, Snapshot& output) {
             cue.status = CueStatus::missing;
         } else if (matches == 1) {
             cue.status = CueStatus::resolved;
-        } else if (malformed) {
-            cue.status = CueStatus::malformed;
-        } else if (candidates == 1) {
-            // A sole tree is the cue's content even when its length disagrees; keep its lines.
-            cue.status = CueStatus::mismatched;
-            matched = std::move(unmatched);
         } else {
-            cue.status = CueStatus::ambiguous;
+            cue.status = candidates > 1 && !malformed ? CueStatus::ambiguous : CueStatus::malformed;
         }
-        if ((cue.status != CueStatus::resolved && cue.status != CueStatus::mismatched)
-            || matched.size() > (std::numeric_limits<std::uint32_t>::max)()
+        if (matches != 1 || matched.size() > (std::numeric_limits<std::uint32_t>::max)()
             || output.lines.size() > (std::numeric_limits<std::uint32_t>::max)() - matched.size()) {
             continue;
         }

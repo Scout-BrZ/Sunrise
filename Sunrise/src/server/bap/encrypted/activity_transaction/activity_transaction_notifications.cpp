@@ -1,10 +1,12 @@
 #include "activity_transaction_notifications.h"
 
+#include "../../../../core/logging/log.h"
 #include "../../../../middleware/secure_channel/runtime.h"
 #include "../../../gameplay/gameplay_advertisement.h"
 #include "../bap_connection_publication.h"
 #include "../push/activity/activity_arrival.h"
 #include "../push/activity/activity_global_state_push.h"
+#include "../push/activity/activity_member_departure_push.h"
 #include "../push/activity/activity_membership_push.h"
 #include "../push/activity/activity_message_push.h"
 #include "../push/activity/activity_notification_frame.h"
@@ -51,7 +53,8 @@ namespace {
  * @param nonce Local send nonce advanced only by complete staged notifications.
  * @param response Lock-owned complete-frame staging storage.
  * @param written Existing staged byte count, updated only by complete notifications.
- * @return True only when the complete requested snapshot was staged.
+ * @return True when the available snapshot was staged; a missing epoch defers only the roster,
+ * and a region still allocating its host row defers membership and the roster together.
  */
 [[nodiscard]] bool stage_refresh(Session& session,
                                  Scratch& scratch,
@@ -65,37 +68,57 @@ namespace {
     const auto initialWritten = written;
     const bool initialRosterDebt = session.activityRosterOwedForEpoch;
     const bool needsMembership = session.activity.role == ActivityClientRole::privateCurrent;
+    // A mission script that declares its initial region moves the arrival after the join burst,
+    // so the refresh can name a region whose host row does not exist yet. That wait is transient:
+    // the next keepalive sees the changed arrival, allocates the row and publishes membership
+    // with the roster behind it. Refusing here instead would close the link.
+    const bool membershipHeld = needsMembership && activity.membershipMutation.hasSnapshot
+                                && advertisement_pending(session, activity);
     const bool membershipReady =
-        !needsMembership
-        || (activity.membershipMutation.hasSnapshot && !advertisement_pending(session, activity));
+        !needsMembership || (activity.membershipMutation.hasSnapshot && !membershipHeld);
+    const bool hasEpoch =
+        session.activityPatchEpoch.seen
+        && session.activityPatchEpoch.bindingGeneration == session.activity.bindingGeneration;
     const push::activity::RefreshReport refresh{activity.membershipMutation.bubbleIndex,
                                                 activity.membershipMutation.requestedRevision};
     const bool complete =
-        membershipReady
+        (membershipReady || membershipHeld)
         && push::activity::append_global_state_notification(
             scratch, session.activity.session, key, nonce, response, written)
         && push::activity::append_world_globals_notification(
             scratch, session.activity.session.sessionId, key, nonce, response, written)
-        && (!needsMembership
+        && (!needsMembership || membershipHeld
             || push::activity::append_membership_notification(
                 scratch, session, activity, key, nonce, response, written))
-        && push::activity::append_roster_notification(session,
-                                                      scratch,
-                                                      key,
-                                                      nonce,
-                                                      response,
-                                                      written,
-                                                      nullptr,
-                                                      nullptr,
-                                                      true,
-                                                      &refresh,
-                                                      allowEntityRetirement);
+        // The roster binds to the player membership publishes, so it waits with membership.
+        && (!hasEpoch || membershipHeld
+            || push::activity::append_roster_notification(session,
+                                                          scratch,
+                                                          key,
+                                                          nonce,
+                                                          response,
+                                                          written,
+                                                          nullptr,
+                                                          nullptr,
+                                                          true,
+                                                          &refresh,
+                                                          allowEntityRetirement));
     if (!complete) {
         push::activity::discard_staged_roster(session);
         discard_staged_advertisement(session);
         session.activityRosterOwedForEpoch = initialRosterDebt;
         nonce = initialNonce;
         written = initialWritten;
+    } else if (membershipHeld) {
+        // Type 52 must not answer ahead of the held membership, so no epoch debt is recorded.
+        core::log::write(core::log::Channel::server,
+                         core::log::Level::info,
+                         "ev=activity stage=refresh result=membership_held "
+                         "reason=no_host_session");
+    } else if (!hasEpoch) {
+        // Joint launches can request refresh before type 52 supplies the patch epoch. Deliver
+        // globals and membership now; type 52 answers the remaining roster debt on this link.
+        session.activityRosterOwedForEpoch = true;
     }
     return complete;
 }
@@ -183,7 +206,7 @@ namespace {
  * @param nonce Local send nonce advanced only by complete staged notifications.
  * @param response Lock-owned complete-frame staging storage.
  * @param written Existing staged byte count, updated only by complete notifications.
- * @return True when every requested notification is staged.
+ * @return True when required notifications are staged; refresh roster debt may await an epoch.
  */
 bool stage_notifications(Session& session,
                          Scratch& scratch,
@@ -204,14 +227,24 @@ bool stage_notifications(Session& session,
         const auto& purge = activity.authorityPurge;
         if (!purge.pending || purge.sourceGeneration != session.activity.bindingGeneration
             || activity.sessionId != session.activity.session.sessionId
-            || activity_link_count_locked(session.activity.session) != 1
-            || purge.body.epoch
-                   != static_cast<std::uint8_t>(session.activity.replicationEpoch + 1U)) {
+            || activity_link_count_locked(session.activity.session,
+                                          session.activity.bindingGeneration)
+                   != 1
+            || purge.body.epoch != static_cast<std::uint8_t>(purge.expectedSequence + 1U)) {
             return false;
         }
         std::array<std::byte, control::kPurgeAuthorityByteCount> body{};
         std::size_t bodySize = 0;
-        if (!control::encode_purge_authority(purge.body, body, bodySize)
+        if (!push::activity::append_replication_steps(session,
+                                                      scratch,
+                                                      purge.expectedSequence,
+                                                      purge.departure.memberKey ? &purge.departure
+                                                                                : nullptr,
+                                                      key,
+                                                      nonce,
+                                                      response,
+                                                      written)
+            || !control::encode_purge_authority(purge.body, body, bodySize)
             || !push::activity::append_notification_frame(scratch,
                                                           activity.sessionId,
                                                           control::kPurgeAuthorityMessageType,

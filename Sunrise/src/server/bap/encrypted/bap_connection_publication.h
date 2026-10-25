@@ -11,17 +11,24 @@ namespace sunrise::server::bap::encrypted {
 
 /** Connection fields one request may publish, captured before its transaction commits. */
 struct ConnectionFields {
+    activity_host_manager::PendingStartupReservations startupReservations{};
+    bool answersActivityStartup{};
+    middleware::bap::activity_message::TransportReport transportReport{};
+    std::uint64_t transportBindingGeneration{};
     middleware::bap::activity_message::patch_epoch::PatchEpoch patchEpoch{};
     activity_message::JoinIngressDiagnostic joinIngress{};
     /** The join carries the only member key the client ever sends. */
     std::uint64_t joinMemberKey{};
+    std::uint32_t joinCorrelation{};
     /** The join also names the character the player signed in on. */
     std::uint64_t joinCharacterSoid{};
     bool retainsPatchEpoch{};
     /** Set when this transaction commits one client-authored type-23 identity. */
     bool receivesClientIdentity{};
-    /** Set by a join alone; publication then resets the connection's roster state. */
+    /** Set by a join alone, which re-arms the roster warm-up the new container needs. */
     bool joinsActivity{};
+    /** Shared native joins commit their exact BC identity atomically with the owned lease. */
+    bool sharedJoin{};
 };
 
 /** Reserves one process-lifetime ActivityClient generation without wrapping. */
@@ -60,7 +67,7 @@ void discard_staged_advertisement(Session& session) noexcept;
 void release_activity_connection(Session& session) noexcept;
 
 /**
- * Arms the owed ability refresh and Family-4 and family-two re-pushes the publication names.
+ * Arms the owed Family-4 and banner re-pushes when the queuez publication asks for them.
  * @param session Connection-owned re-push timers.
  * @param queuezPublication Staged queuez publication.
  */

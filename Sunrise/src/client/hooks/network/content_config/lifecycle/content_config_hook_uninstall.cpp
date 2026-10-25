@@ -54,7 +54,8 @@ bool uninstall() noexcept {
     }
 
     AcquireSRWLockExclusive(&g_lifecycleLock);
-    if (coordinator::active_calls() != 0 || !lifecycle::detach(HookSlot::contentTick)) {
+    if (coordinator::active_calls() != 0
+        || !lifecycle::detach(HookSlot::contentTick, tick::entry_point())) {
         ReleaseSRWLockExclusive(&g_lifecycleLock);
         finish_transition();
         return false;
@@ -68,7 +69,7 @@ bool uninstall() noexcept {
     AcquireSRWLockExclusive(&g_lifecycleLock);
     const bool removed = coordinator::active_calls() == 0
                          && gate::restore(lifecycle::g_gateOwnership)
-                         && lifecycle::detach(HookSlot::enqueueGet);
+                         && lifecycle::detach(HookSlot::enqueueGet, request::entry_point());
     if (removed) {
         lifecycle::clear_runtime();
     }

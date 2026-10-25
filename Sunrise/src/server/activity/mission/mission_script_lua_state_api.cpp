@@ -1,14 +1,10 @@
 #include <algorithm>
-#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <cstdio>
 #include <limits>
 #include <string_view>
 
-#include "../../../core/logging/log.h"
-#include "mission_script_lua_dispatch.h"
 #include "mission_script_lua_internal.h"
 
 namespace sunrise::server::activity::mission::lua_vm::detail {
@@ -134,8 +130,8 @@ void push_variable_value(lua_State* state, const VariableValue& value) {
 [[nodiscard]] int state_timer(lua_State* state) {
     static_cast<void>(luaL_checkudata(state, 1, kStateMetatable));
     StateKey key{};
-    if (!parse_state_key(state, 2, key)) {
-        return luaL_argerror(state, 2, "mission timer name is invalid");
+    if (!parse_script_timer_key(state, 2, key)) {
+        return luaL_argerror(state, 2, "mission timer name is invalid or reserved");
     }
     const CallFrame& frame = active_frame(state);
     bool found = false;
@@ -148,23 +144,6 @@ void push_variable_value(lua_State* state, const VariableValue& value) {
     }
     return 1;
 }
-
-/** State view members in table order. */
-constexpr std::array<Binding<Impl>, std::size(api::kStateMembers)> kStateBindings{{
-    {"phase",
-     nullptr,
-     [](lua_State* state, const Impl& impl) {
-         const CallFrame& frame = active_frame(state);
-         lua_pushinteger(state, frame.candidate.phaseChanged ? frame.candidate.phase : impl.phase);
-     }},
-    {"revision",
-     nullptr,
-     [](lua_State* state, const Impl& impl) { push_u64_string(state, impl.stateRevision); }},
-    {"variable", &state_variable},
-    {"has_variable", &state_has_variable},
-    {"timer", &state_timer},
-}};
-static_assert(bound_to<Impl>(api::kStateMembers, kStateBindings));
 
 } // namespace
 
@@ -181,49 +160,6 @@ static_assert(bound_to<Impl>(api::kStateMembers, kStateBindings));
     frame.candidate.phaseChanged = true;
     return 0;
 }
-/** Logs one staged variable write, so the gate state a controller keeps in variables is visible. */
-void log_variable_write(const StateKey& key, const VariableValue& value) noexcept {
-    std::array<char, 32> scalar{};
-    std::string_view text{};
-    int scalarWritten = 0;
-    switch (value.kind) {
-    case VariableValueKind::boolean:
-        text = value.booleanValue ? "true" : "false";
-        break;
-    case VariableValueKind::integer:
-        scalarWritten = std::snprintf(
-            scalar.data(), scalar.size(), "%lld", static_cast<long long>(value.integerValue));
-        break;
-    case VariableValueKind::real:
-        scalarWritten = std::snprintf(scalar.data(), scalar.size(), "%.6g", value.realValue);
-        break;
-    case VariableValueKind::string:
-        text = {value.stringValue.data(),
-                (std::min)(std::size_t{value.stringLength}, value.stringValue.size())};
-        break;
-    }
-    if (scalarWritten > 0) {
-        text = {scalar.data(),
-                (std::min)(static_cast<std::size_t>(scalarWritten), scalar.size() - 1)};
-    }
-    const std::string_view name = state_key_view(key);
-    std::array<char, core::log::kLineCapacity> line{};
-    const int written =
-        std::snprintf(line.data(),
-                      line.size(),
-                      "ev=mission_script stage=variable result=set name=%.*s value=%.*s",
-                      static_cast<int>(name.size()),
-                      name.data(),
-                      static_cast<int>(text.size()),
-                      text.data());
-    if (written > 0) {
-        core::log::write(
-            core::log::Channel::server,
-            core::log::Level::debug,
-            {line.data(), (std::min)(static_cast<std::size_t>(written), line.size() - 1)});
-    }
-}
-
 /** Stages one variable write that commits with the enclosing callback. */
 [[nodiscard]] int context_set_variable(lua_State* state) {
     static_cast<void>(luaL_checkudata(state, 1, kContextMetatable));
@@ -249,10 +185,9 @@ void log_variable_write(const StateKey& key, const VariableValue& value) noexcep
         ++frame.candidate.variableCount;
     }
     frame.candidate.variables[row] = {key, value};
-    log_variable_write(key, value);
     return 0;
 }
-/** Stages one variable removal that commits with the enclosing callback. */
+/** Remove uma variavel na transacao atual. */
 [[nodiscard]] int context_clear_variable(lua_State* state) {
     static_cast<void>(luaL_checkudata(state, 1, kContextMetatable));
     StateKey key{};
@@ -273,12 +208,20 @@ void log_variable_write(const StateKey& key, const VariableValue& value) noexcep
     lua_pushboolean(state, found ? 1 : 0);
     return 1;
 }
+
+/** Retorna a quantidade de variaveis na transacao atual. */
+[[nodiscard]] int context_variable_count(lua_State* state) {
+    static_cast<void>(luaL_checkudata(state, 1, kContextMetatable));
+    CallFrame& frame = active_frame(state);
+    lua_pushinteger(state, static_cast<lua_Integer>(frame.candidate.variableCount));
+    return 1;
+}
 /** Arms or replaces one timer at an absolute authoritative deadline. */
 [[nodiscard]] int context_start_timer(lua_State* state) {
     static_cast<void>(luaL_checkudata(state, 1, kContextMetatable));
     StateKey key{};
-    if (!parse_state_key(state, 2, key)) {
-        return luaL_argerror(state, 2, "mission timer name is invalid");
+    if (!parse_script_timer_key(state, 2, key)) {
+        return luaL_argerror(state, 2, "mission timer name is invalid or reserved");
     }
     const lua_Integer delay = luaL_checkinteger(state, 3);
     if (delay < 0
@@ -316,8 +259,8 @@ void log_variable_write(const StateKey& key, const VariableValue& value) noexcep
 [[nodiscard]] int context_cancel_timer(lua_State* state) {
     static_cast<void>(luaL_checkudata(state, 1, kContextMetatable));
     StateKey key{};
-    if (!parse_state_key(state, 2, key)) {
-        return luaL_argerror(state, 2, "mission timer name is invalid");
+    if (!parse_script_timer_key(state, 2, key)) {
+        return luaL_argerror(state, 2, "mission timer name is invalid or reserved");
     }
     CallFrame& frame = active_frame(state);
     bool found = false;
@@ -336,8 +279,23 @@ void log_variable_write(const StateKey& key, const VariableValue& value) noexcep
 /** Reads one StateView member: phase, revision, or an authorized query. */
 [[nodiscard]] int state_index(lua_State* state) {
     static_cast<void>(luaL_checkudata(state, 1, kStateMetatable));
-    const Impl* const impl = impl_from_state(state);
-    return dispatch<Impl>(state, kStateBindings, lua_string_view(state, 2), *impl);
+    Impl* const impl = impl_from_state(state);
+    const std::string_view key = lua_string_view(state, 2);
+    if (key == "phase") {
+        const CallFrame& frame = active_frame(state);
+        lua_pushinteger(state, frame.candidate.phaseChanged ? frame.candidate.phase : impl->phase);
+    } else if (key == "revision") {
+        push_u64_string(state, impl->stateRevision);
+    } else if (key == "variable") {
+        lua_pushcfunction(state, &state_variable);
+    } else if (key == "has_variable") {
+        lua_pushcfunction(state, &state_has_variable);
+    } else if (key == "timer") {
+        lua_pushcfunction(state, &state_timer);
+    } else {
+        lua_pushnil(state);
+    }
+    return 1;
 }
 
 void register_state_metatables(lua_State* state) {

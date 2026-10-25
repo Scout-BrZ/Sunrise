@@ -10,6 +10,7 @@
 #include "../../middleware/bap/activity_message/activity_patch_epoch_parser.h"
 #include "../../middleware/bap/activity_message/replicate_membership.h"
 #include "../../middleware/bap/activity_message/sensor_auth_update.h"
+#include "../../middleware/bap/activity_message/transport_report.h"
 #include "../../middleware/bap/frame.h"
 #include "../../middleware/content/packages/tables/scenario_reader.h"
 #include "../../state/activity/bubble_authority/definition.h"
@@ -19,20 +20,22 @@
 #include "../../state/build_data/scenarios/definition.h"
 #include "../../state/gameplay/external/squad_entity_retirement.h"
 #include "../../state/runtime/runtime.h"
+#include "../../state/social/steam_roster.h"
 #include "../activity/host_runtime.h"
 #include "activity_authority_query_owner.h"
 #include "activity_authority_reset_owner.h"
+#include "activity_link_selection.h"
+#include "encrypted/activity_host_manager/activity_startup_reservations.h"
 #include "encrypted/queuez/definition.h"
+#include "encrypted/queuez/public_subscriptions.h"
+#include "nat_relay_service.h"
 #include "runtime.h"
-
-namespace sunrise::state::investment::store {
-class Transaction;
-}
 
 namespace sunrise::server::bap {
 
 /** One session per transport peer slot, so a connection id indexes this array directly. */
 inline constexpr std::size_t kSessionCount = client::network::kBapConnectionCount;
+static_assert(state::matchmaking::kContextCapacity >= kSessionCount);
 /**
  * A delivered activity frame defers the next silence-prevention write.
  * This is the host's own period. It is not the floor handed to the client, which is a separate
@@ -43,6 +46,9 @@ inline constexpr std::uint64_t kActivityKeepaliveIntervalMs = 2'000;
 /** Counts matching authenticated links while the caller already owns the BAP lock. */
 [[nodiscard]] std::size_t
 activity_link_count_locked(const state::activity::SessionBinding& binding) noexcept;
+/** Counts the exact authenticated recipient generation for read-only content projection. */
+[[nodiscard]] std::size_t activity_link_count_locked(const state::activity::SessionBinding& binding,
+                                                     std::uint64_t recipientGeneration) noexcept;
 
 // Top-level groups the client can hold; the largest installed scenario has 78 in every state.
 inline constexpr std::size_t kScenarioWideGroupCapacity =
@@ -50,6 +56,11 @@ inline constexpr std::size_t kScenarioWideGroupCapacity =
 
 /** Fixed scratch storage owned by the lock, kept off the Client thread's stack. */
 struct Scratch {
+    /** Reused account image and distinct decode staging; callers hold the BAP session lock. */
+    state::AccountState accountImage{};
+    state::AccountState accountDecode{};
+    /** Copy the live directory before mutation and commit only after the reply fits. */
+    state::social::Hub socialDirectory{};
     std::array<std::byte, client::network::kBapFrameCapacity> plaintext{};
     std::array<std::byte, client::network::kBapFrameCapacity> responseBody{};
     std::array<std::byte, client::network::kBapFrameCapacity> responsePayload{};
@@ -134,9 +145,17 @@ struct RosterPublication {
     state::activity::bubble_authority::Grant grant{};
     state::gameplay::squad_entity_retirement::RetirementPlan entityRetirement{};
     /** Epochs remain staged until both retirement and roster frames reach the caller. */
+    std::uint64_t retirementSequence{};
     std::uint8_t retirementPriorEpoch{};
     std::uint8_t retirementBaseEpoch{};
     std::uint8_t retirementEpoch{};
+    /**
+     * Entities given up in the granted bubble, handed back with the grant on the retirement
+     * epoch above. The two never ride one body.
+     */
+    state::activity::bubble_authority::EntitySlotMask claimEntities{};
+    std::uint8_t claimBubble{};
+    bool hasClaim{};
     bool priorRosterOwedForEpoch{};
     /** Exact decode identities carried by this staged complete roster snapshot. */
     RosterDecodeMap decodeMap{};
@@ -162,6 +181,10 @@ struct RosterPublication {
     std::uint8_t squadStateSequence{};
     /** Activity Host state revision carried by this body. */
     std::uint64_t hostStateRevision{};
+    /** Scriptable Auth estate revision read before this body copied the estate. */
+    std::uint64_t estateRevision{};
+    /** Highest estate dialogue serial this body replays to a link that did not hear it live. */
+    std::uint64_t dialogueSerial{};
     /** SDK selected-state roster lease revision carried by this body. */
     std::uint64_t missionSeedRevision{};
     /** Type-17 lifetime state carried for that revision. */
@@ -236,6 +259,9 @@ struct MissionSeedLease {
     std::uint64_t bindingGeneration{};
     std::uint64_t revision{};
     std::uint64_t publishedRevision{};
+    // Revisao efetivamente montada com os dados da cinematic antes da chegada completa.
+    // Nao e confirmacao de envio; o commit do roster continua responsavel por isso.
+    std::uint64_t cinematicArrivalPublicationRevision{};
     /**
      * Every authored region this lease has selected, in selection order. The peer's registered set
      * only grows: a group is torn down by a changed state byte, never by being left out, and every
@@ -282,7 +308,9 @@ struct ActivityClientBinding {
     std::uint64_t hostGeneration{};
     /** Changes on every bind and rejoin, even when the session id stays the same. */
     std::uint64_t bindingGeneration{};
-    /** Epoch this host authored in the accepted join result. */
+    /** Last sequence queued on this ordered connection, not proof of client application. */
+    std::uint64_t replicationSequence{};
+    /** Low byte of the last sequence queued on this connection. */
     std::uint8_t replicationEpoch{};
     /** Private: last citizen region. Public: immutable region captured by the host binding. */
     std::int32_t advertisedRegion{-1};
@@ -327,9 +355,6 @@ struct ReplicationEpochPublication {
     bool staged{};
 };
 
-/** Logs one refused reward stage with its native index and a specific reason. */
-void report_reward_refusal(const char* stage, std::uint16_t index, const char* reason) noexcept;
-
 /** Which inventory one world reward lands in. */
 enum class WorldRewardKind : std::uint8_t {
     item,
@@ -339,7 +364,6 @@ enum class WorldRewardKind : std::uint8_t {
 /** One reward earned in world, held until a Family-4 peer can publish it. */
 struct WorldRewardRequest {
     std::uint64_t id{};
-    std::uint32_t definitionHash{};
     std::int32_t quantity{};
     std::uint16_t itemDefinitionIndex{};
     WorldRewardKind kind{};
@@ -349,11 +373,17 @@ enum class CharacterRefreshScope : std::uint8_t { none, records, recordsAndRoste
 
 /** Mutable transport state owned by one BAP connection. */
 struct Session {
+    /** Actual BAP TCP source; never accepted from published native address bytes. */
+    std::uint32_t remoteAddress{};
+    nat_relay::State relay{};
+    state::AccountHandle accountHandle{state::kInvalidAccount};
+    std::uint64_t activityAdvertisementHostGeneration{};
     std::uint64_t acquisitionPresentationUntilTick{};
     std::array<encrypted::queuez::AcquisitionPresentationRow,
                encrypted::queuez::kAcquisitionPresentationRowCapacity>
         acquisitionPresentationRows{};
     std::uint32_t id{};
+    std::uint32_t activityRosterGroups{};
     std::int32_t pendingSeasonalExperienceAmount{};
     std::uint32_t pendingSeasonalExperienceMutationSerial{};
     bool authenticated{};
@@ -376,8 +406,15 @@ struct Session {
     std::uint64_t activityKeepaliveDueTick{};
     /** Client member key from the join request. It seeds the membership id. */
     std::uint64_t activityMemberKey{};
+    /** Sparse native transport report owned by this exact activity binding. */
+    middleware::bap::activity_message::TransportReport activityTransport{};
+    encrypted::activity_host_manager::PendingStartupReservations activityStartupReservations{};
     /** Binding generation whose entity-slot join committed, including a zero member key. */
     std::uint64_t activityJoinGeneration{};
+    /** Original native join correlation used for member-set rejoin notifications. */
+    std::uint32_t activityJoinCorrelation{};
+    std::array<std::uint64_t, state::activity::entity_slots::kMemberLeaseRowCount>
+        activityMemberSet{};
     /**
      * Character the join request named, or zero when it carried none.
      * The roster's participation key must be the character the client signed in on. The client
@@ -431,7 +468,11 @@ struct Session {
      * The client reported it is leaving, so no later roster may go out on that link.
      */
     std::uint64_t activityLeftGeneration{};
-    /** Region-rebuild epoch. Nothing advances it, so it stays zero and moves no group. */
+    /**
+     * Region-rebuild epoch, folded into every group's identity. It advances once per region
+     * transition so every group's revision byte moves and the client re-registers the groups for
+     * the region it entered. Without that move, object intents into the new bubble are refused.
+     */
     std::uint8_t activityRosterRegionEpoch{};
     /** Bubble the epoch was stamped for; a change in it is the region transition. */
     std::int32_t activityRosterRegionBubble{-1};
@@ -441,6 +482,31 @@ struct Session {
     std::uint8_t activityRosterState{};
     /** Latest Activity Host revision staged into this connection's transport output. */
     std::uint64_t activityHostStateRevision{};
+    /**
+     * Scriptable Auth estate revision the last delivered roster carried. A scripted change is
+     * answered on the owning link only, so any other link in the activity lags it until the
+     * keepalive republishes that link's roster.
+     */
+    std::uint64_t activityEstateRevision{};
+    /** Estate revision last tried; a roster that cannot be built retries on the keepalive only. */
+    std::uint64_t activityEstateAttemptedRevision{};
+    /**
+     * Highest dialogue serial this link is settled for: sent to it, or played while it was absent.
+     * A dialogue body is a pulse the client replays on every apply, so each line goes to a present
+     * member exactly once and this withholds it from every later roster.
+     */
+    std::uint64_t activityDialogueSerial{};
+    /** Serial the roster being built would advance the cursor above to; staged with the body. */
+    std::uint64_t activityDialogueSerialBuilt{};
+    /**
+     * The line this link carries, by estate serial, and the client's transition count when that
+     * line first rode in a body, or -1. Each load builds a fresh dialogue sensor that would take a
+     * carried line as new, so a line rides along only until the client starts its next load.
+     */
+    std::uint64_t activityDialogueHeardSerial{};
+    std::int16_t activityDialogueHeardToken{-1};
+    /** Dialogue serial last tried; a line whose roster cannot be built retries on the keepalive. */
+    std::uint64_t activityDialogueAttemptedSerial{};
     /** The delivered roster carries the team wait bit; the arrival report is answered while set. */
     bool activityRosterAwaitClientSync{};
     /** One bounded authority-mask readback owned by this exact ActivityClient generation. */
@@ -455,7 +521,11 @@ struct Session {
     AdvertisementRetains activityAdvertisementHeld{};
     /** Host rows retained by a staged membership body until publication is known. */
     AdvertisementPublication activityAdvertisementStaged{};
-    /** Reason code of the last logged roster outcome; a refusal logs only when it changes. */
+    /**
+     * Reason code of the last logged roster outcome.
+     * The push runs every second, so a refusal is logged only when the reason changes. One flag
+     * for every reason hides the second failure behind the first.
+     */
     std::uint8_t activityRosterReason{};
     /** What one staged roster body owes, and what to put back if it never reaches the caller. */
     RosterPublication activityRosterStaged{};
@@ -467,13 +537,14 @@ struct Session {
     MissionSeedLease activityMissionSeed{};
     /** Queuez versions and residents published only through this authenticated peer. */
     encrypted::queuez::SessionState queuez{};
+    encrypted::public_queuez::Subscriptions publicSubscriptions{};
     /** Tick count after which the owed Family-4 re-push may go out. */
     std::uint64_t family4RepushDueTick{};
     /** Root the owed re-push must use. */
     std::uint64_t family4RepushRoot{};
     /** True while one Family-4 re-push is still owed to this peer. */
     bool family4RepushArmed{};
-    /** Tick count after which the banner re-push the cinematic hold armed may go out. */
+    /** Tick count after which the owed banner re-push may go out. */
     std::uint64_t bannerRepushDueTick{};
     /** Root the owed banner re-push must use. */
     std::uint64_t bannerRepushRoot{};
@@ -483,6 +554,14 @@ struct Session {
     std::uint64_t socialRosterRepushRoot{};
     /** True while one family-two re-push is still owed to this peer. */
     bool socialRosterRepushArmed{};
+    /** Social registration this link owns. Zero until a sync request registers it. */
+    std::uint64_t socialSerial{};
+    /** Publication stamp this link has already been told about, for feed and notice alike. */
+    state::social::Stamp socialSentStamp{};
+    /** Latest shared-account generation this peer has received. */
+    std::uint64_t accountGeneration{};
+    /** Newest shared-account generation owed as a full cross-peer refresh. */
+    std::uint64_t accountResyncGeneration{};
     /** Set by encrypted processing only after one account mutation commits and is copied out. */
     bool accountMutationPublished{};
     /** True while another peer's account mutation still needs a full local refresh. */
@@ -530,7 +609,7 @@ unique_activity_link_locked(const state::activity::SessionBinding& binding,
 session_scenario_layout(const Session& session,
                         state::build_data::scenarios::Definition& output) noexcept;
 
-/** Commits saved world rewards with no presentation until one must wait. */
+/** Commits every queued world reward with no presentation and empties the queue. */
 void drain_world_rewards() noexcept;
 
 /** Arms every other Family-4 peer after the origin publishes a complete account mutation. */
@@ -549,18 +628,13 @@ void arm_acquisition_presentation_hold(Session& session) noexcept;
 [[nodiscard]] bool arm_world_profile_item_acquisition(std::uint16_t itemDefinitionIndex,
                                                       std::int32_t quantity) noexcept;
 
-/** Reads the oldest saved world reward that can still be granted, retiring rows that cannot. */
+/** Reads the oldest queued world reward without removing it. */
 [[nodiscard]] bool current_world_reward(WorldRewardRequest& request) noexcept;
 
 /** Removes the world reward returned by current_world_reward. */
 [[nodiscard]] bool complete_world_reward(std::uint64_t id) noexcept;
 
-/** Deletes an ungrantable reward on the caller's open savepoint, commits, and logs why. */
-[[nodiscard]] bool retire_world_reward(state::investment::store::Transaction& transaction,
-                                       const WorldRewardRequest& request,
-                                       const char* reason) noexcept;
-
-/** Grants the oldest saved reward with no flyout, retiring rewards that can never be granted. */
+/** Commits the queued reward with no flyout once its presentation cannot be built. */
 void settle_world_reward() noexcept;
 
 /** Queues one transient XP item update so the native HUD presents a seasonal XP gain. */
@@ -615,13 +689,13 @@ namespace encrypted {
                            std::size_t& written) noexcept;
 
 /**
- * Publishes the next due reward, refresh, re-push or keepalive, at most one per call.
+ * Sends the owed Family-4 re-push once its delay has passed.
  * @param session Auth, nonce and queuez state owned by the connection.
  * @param scratch Transform buffers owned by the lock, kept off the Client thread stack.
  * @param response Whole-frame storage owned by the caller.
  * @param written Gets the encoded notification size in bytes.
  * @param touchesScratch Set before any scratch buffer is used.
- * @return True when one whole notification is published.
+ * @return True when a whole Family-4 notification is published.
  */
 [[nodiscard]] bool consume_deferred(Session& session,
                                     Scratch& scratch,

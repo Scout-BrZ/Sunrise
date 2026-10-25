@@ -1,5 +1,4 @@
 #include <algorithm>
-#include <array>
 #include <charconv>
 #include <cstddef>
 #include <cstdint>
@@ -8,8 +7,6 @@
 #include <tuple>
 
 #include "../../../state/activity/membership/definition.h"
-#include "../../../state/mods/definition.h"
-#include "mission_script_lua_dispatch.h"
 #include "mission_script_lua_internal.h"
 #include "mission_script_lua_names.h"
 #include "mission_script_lua_peer_internal.h"
@@ -20,16 +17,6 @@
 namespace sunrise::server::activity::mission::lua_vm::detail {
 namespace {
 
-// Table entries of the context members this file implements.
-constexpr const api::MemberSpec& kActivateObjects =
-    api::member(api::Receiver::context, "activate_objects");
-constexpr const api::MemberSpec& kCompleteMission =
-    api::member(api::Receiver::context, "complete_mission");
-constexpr const api::MemberSpec& kRestartCheckpoint =
-    api::member(api::Receiver::context, "restart_checkpoint");
-constexpr const api::MemberSpec& kHoldSpawn = api::member(api::Receiver::context, "hold_spawn");
-constexpr const api::MemberSpec& kSelectState = api::member(api::Receiver::context, "select_state");
-
 /**
  * Groups exact authored objects by native owner and reserves bounded output batches.
  * @param state Lua call holding the context and named object list.
@@ -37,10 +24,11 @@ constexpr const api::MemberSpec& kSelectState = api::member(api::Receiver::conte
  */
 [[nodiscard]] int context_activate_objects(lua_State* state) {
     static_cast<void>(luaL_checkudata(state, 1, kContextMetatable));
-    refuse_unknown_arguments(state, kActivateObjects);
-    const bool active =
-        optional_boolean_argument(state, boolean_option(kActivateObjects, "active"));
-    lua_getfield(state, 2, required_key(kActivateObjects, "slots", api::ValueKind::list));
+    // Only these named arguments belong to this API.
+    static constexpr std::array<std::string_view, 2> kDeclared{"slots", "active"};
+    refuse_unknown_arguments(state, kDeclared);
+    const bool active = optional_boolean_argument(state, "active", true);
+    lua_getfield(state, 2, "slots");
     luaL_checktype(state, -1, LUA_TTABLE);
     const int list = lua_gettop(state);
     const std::size_t count = lua_rawlen(state, list);
@@ -114,12 +102,24 @@ constexpr const api::MemberSpec& kSelectState = api::member(api::Receiver::conte
 
 /**
  * Completes this attempt through the native lifetime owner.
- * @param state Lua call holding the context and empty argument table.
+ * @param state Lua call holding
+ * the context and empty argument table.
  * @return One RequestKey.
  */
+// Solicita o controlador nativo; nao permite completar a missao por temporizador.
+[[nodiscard]] int context_begin_adieu_ending(lua_State* state) {
+    static_cast<void>(luaL_checkudata(state, 1, kContextMetatable));
+    static constexpr std::array<std::string_view, 0> kDeclared{};
+    refuse_unknown_arguments(state, kDeclared);
+    Intent intent{}; intent.kind=IntentKind::beginAdieuEnding;
+    return queue_intent(state, active_frame(state), intent);
+}
+
 [[nodiscard]] int context_complete_mission(lua_State* state) {
     static_cast<void>(luaL_checkudata(state, 1, kContextMetatable));
-    refuse_unknown_arguments(state, kCompleteMission);
+    // Only these named arguments belong to this API.
+    static constexpr std::array<std::string_view, 0> kDeclared{};
+    refuse_unknown_arguments(state, kDeclared);
     if (impl_from_state(state)->attempt.complete) {
         return luaL_error(state, "mission attempt is already complete");
     }
@@ -145,20 +145,18 @@ constexpr const api::MemberSpec& kSelectState = api::member(api::Receiver::conte
  */
 [[nodiscard]] int context_restart_checkpoint(lua_State* state) {
     static_cast<void>(luaL_checkudata(state, 1, kContextMetatable));
-    refuse_unknown_arguments(state, kRestartCheckpoint);
-    const lua_Integer region = checked_integer_argument(
-        state, required_key(kRestartCheckpoint, "region", api::ValueKind::integer));
-    const lua_Integer hash = checked_integer_argument(
-        state, required_key(kRestartCheckpoint, "spawn_set_hash", api::ValueKind::integer));
+    // Only these named arguments belong to this API.
+    static constexpr std::array<std::string_view, 3> kDeclared{
+        "region", "spawn_set_hash", "release_request"};
+    refuse_unknown_arguments(state, kDeclared);
+    const lua_Integer region = optional_integer_argument(state, "region", -1);
+    const lua_Integer hash = optional_integer_argument(state, "spawn_set_hash", 0);
     if (region < 0 || region > ::sunrise::state::activity::membership::kMaximumSliceSetIndex
         || hash <= 0 || hash >= (std::numeric_limits<std::uint32_t>::max)()) {
         return luaL_error(state, "checkpoint requires an authored region and spawn-set hash");
     }
     std::uint64_t release = 0;
-    lua_getfield(
-        state,
-        2,
-        optional_key(kRestartCheckpoint, "release_request", api::ValueKind::decimalString));
+    lua_getfield(state, 2, "release_request");
     if (!lua_isnil(state, -1)) {
         std::size_t length = 0;
         const char* const value = luaL_checklstring(state, -1, &length);
@@ -184,8 +182,10 @@ constexpr const api::MemberSpec& kSelectState = api::member(api::Receiver::conte
  */
 [[nodiscard]] int context_hold_spawn(lua_State* state) {
     static_cast<void>(luaL_checkudata(state, 1, kContextMetatable));
-    refuse_unknown_arguments(state, kHoldSpawn);
-    lua_getfield(state, 2, required_key(kHoldSpawn, "active", api::ValueKind::boolean));
+    // Only these named arguments belong to this API.
+    static constexpr std::array<std::string_view, 1> kDeclared{"active"};
+    refuse_unknown_arguments(state, kDeclared);
+    lua_getfield(state, 2, "active");
     if (!lua_isboolean(state, -1)) {
         return luaL_argerror(state, 2, "hold_spawn requires an active boolean");
     }
@@ -216,9 +216,66 @@ constexpr const api::MemberSpec& kSelectState = api::member(api::Receiver::conte
     return 1;
 }
 
+/** Collects one authored ground item through the mission request queue and inventory flow. */
+[[nodiscard]] int context_collect_weapon(lua_State* state) {
+    static_cast<void>(luaL_checkudata(state, 1, kContextMetatable));
+    static constexpr std::array<std::string_view, 2> kDeclared{"slot", "definition_hash"};
+    refuse_unknown_arguments(state, kDeclared);
+
+    SlotDefinition definition{};
+    lua_getfield(state, 2, "slot");
+    const bool resolved = !lua_isnil(state, -1) && resolve_slot(state, lua_gettop(state), definition);
+    lua_pop(state, 1);
+    if (!resolved) {
+        return luaL_argerror(state, 2, "collect_weapon requires a valid slot");
+    }
+    namespace format = ::sunrise::state::activity_sdk::format;
+    if (definition.slotType != format::kObjectSlotType
+        || definition.componentClass != format::kObjectComponentClass
+        || definition.senseSchema != format::kObjectSenseSchema
+        || definition.authSchema != format::kObjectAuthSchema
+        || (definition.flags & format::kSlotSchemaJoinExact) == 0) {
+        return luaL_argerror(state, 2, "collect_weapon requires an exact authored object slot");
+    }
+
+    lua_getfield(state, 2, "definition_hash");
+    if (!lua_isinteger(state, -1)) {
+        lua_pop(state, 1);
+        return luaL_argerror(state, 2, "collect_weapon requires an integer definition_hash");
+    }
+    const lua_Integer definitionHash = lua_tointeger(state, -1);
+    lua_pop(state, 1);
+    if (definitionHash <= 0
+        || static_cast<std::uint64_t>(definitionHash)
+               > static_cast<std::uint64_t>((std::numeric_limits<std::uint32_t>::max)())) {
+        return luaL_argerror(state, 2, "collect_weapon definition_hash is outside u32");
+    }
+
+    // A coleta precisa partir da interação com o próprio objeto.
+    // Uma atualização de estado ou um timer não autoriza a entrega.
+    CallFrame& frame = active_frame(state);
+    const auto* event = frame.event;
+
+    if (event == nullptr
+        || event->kind != host::EventKind::objectInteracted
+        || event->slotObjectTag != definition.objectTag
+        || event->firstRegistryKey != definition.registryKey
+        || event->firstSlotIndex != definition.slotIndex) {
+        return luaL_error(
+            state,
+            "collect_weapon requires an interaction with the requested object");
+}
+    Intent intent{};
+    intent.kind = IntentKind::collectWeapon;
+    intent.firstRow = definition.nativeRow;
+    intent.objectTag = definition.objectTag;
+    intent.registryKey = definition.registryKey;
+    intent.definitionHash = static_cast<std::uint32_t>(definitionHash);
+    return queue_intent(state, frame, intent);}
+
 } // namespace
 
-/** Resolves the squad one Lua argument names, by one-based row or by id. */
+/** Resolves the squad one Lua argument names, by handle or by index. */
 [[nodiscard]] bool resolve_squad(lua_State* state, int selector, SquadDefinition& output) {
     Impl* const impl = impl_from_state(state);
     if (impl == nullptr) {
@@ -237,7 +294,7 @@ constexpr const api::MemberSpec& kSelectState = api::member(api::Receiver::conte
                impl->definitions.context, lua_string_view(state, selector), output);
 }
 
-/** Resolves the scene one Lua argument names, by one-based row or by id. */
+/** Resolves the scene one Lua argument names, by handle or by index. */
 [[nodiscard]] bool resolve_scene(lua_State* state, int selector, SceneDefinition& output) {
     Impl* const impl = impl_from_state(state);
     if (impl == nullptr) {
@@ -256,7 +313,7 @@ constexpr const api::MemberSpec& kSelectState = api::member(api::Receiver::conte
                impl->definitions.context, lua_string_view(state, selector), output);
 }
 
-/** Resolves the slot one Lua argument names, by one-based row or by id. */
+/** Resolves the slot one Lua argument names, by handle or by index. */
 [[nodiscard]] bool resolve_slot(lua_State* state, int selector, SlotDefinition& output) {
     Impl* const impl = impl_from_state(state);
     if (impl == nullptr) {
@@ -318,8 +375,7 @@ resolve_message_name(lua_State* state, std::string_view name, ActivityMessageDef
 [[nodiscard]] int context_select_state(lua_State* state) {
     static_cast<void>(luaL_checkudata(state, 1, kContextMetatable));
     luaL_checktype(state, 2, LUA_TTABLE);
-    lua_getfield(
-        state, 2, table_field_key(kSelectState, "state", "region_index", api::ValueKind::integer));
+    lua_getfield(state, 2, "region_index");
     if (!lua_isinteger(state, -1)) {
         return luaL_argerror(state, 2, "generated mission state has no integer region_index");
     }
@@ -338,12 +394,20 @@ resolve_message_name(lua_State* state, std::string_view name, ActivityMessageDef
         return 0;
     }
     if (lua_istable(state, 3)) {
-        refuse_unknown_fields(state, 3, api::find_argument(kSelectState, "options").fields);
-        lua_getfield(
-            state,
-            3,
-            table_field_key(
-                kSelectState, "options", "retire_placed_props", api::ValueKind::boolean, true));
+        // O destino e opcional; chamadas antigas continuam sem override.
+        lua_getfield(state, 3, "spawn_set_hash");
+        if (!lua_isnil(state, -1)) {
+            if (!lua_isinteger(state, -1)) {
+                return luaL_argerror(state, 3, "spawn_set_hash must be an integer");
+            }
+            const lua_Integer spawn = lua_tointeger(state, -1);
+            if (spawn <= 0 || static_cast<std::uint64_t>(spawn) >= 0xFFFFFFFFULL) {
+                return luaL_argerror(state, 3, "spawn_set_hash must be between 1 and 0xFFFFFFFE");
+            }
+            intent.stateSpawnSetHash = static_cast<std::uint32_t>(spawn);
+        }
+        lua_pop(state, 1);
+        lua_getfield(state, 3, "retire_placed_props");
         if (!lua_isnil(state, -1) && !lua_isboolean(state, -1)) {
             return luaL_argerror(state, 3, "retire_placed_props must be a boolean");
         }
@@ -353,117 +417,75 @@ resolve_message_name(lua_State* state, std::string_view name, ActivityMessageDef
     return queue_intent(state, frame, intent);
 }
 
-namespace {
-
-namespace mods = ::sunrise::state::mods;
-
-/** Reads one declared value of the program's mod at each access, so a change applies at once. */
-[[nodiscard]] int mod_config_index(lua_State* state) {
-    static_cast<void>(luaL_checkudata(state, 1, kModConfigMetatable));
-    const Impl* const impl = impl_from_state(state);
+/** Lua index for the mission context: its collections, phase, variables and timers. */
+[[nodiscard]] int context_index(lua_State* state) {
+    static_cast<void>(luaL_checkudata(state, 1, kContextMetatable));
+    Impl* const impl = impl_from_state(state);
     const std::string_view key = lua_string_view(state, 2);
-    mods::ConfigValue value{};
-    if (impl->identity.readModConfig == nullptr
-        || !impl->identity.readModConfig(impl->identity.modId.data(), key, value)) {
+    if (key == "sdk_build_id") {
+        lua_pushstring(state, impl->identity.sdkBuildId.data());
+    } else if (key == "activity_id") {
+        lua_pushstring(state, impl->identity.activityId.data());
+    } else if (key == "activity_row") {
+        lua_pushinteger(state, impl->identity.activityRow);
+    } else if (key == "definition_hash") {
+        lua_pushinteger(state, impl->identity.definitionHash);
+    } else if (key == "activity_role") {
+        lua_pushstring(state, impl->identity.publicTarget ? "public" : "private");
+    } else if (key == "player_key") {
+        push_u64_string(state, impl->identity.playerKey);
+    } else if (key == "sdk") {
+        push_activity(state);
+    } else if (key == "lifetime") {
+        push_lifetime(state);
+    } else if (key == "attempt_generation") {
+        push_u64_string(state, impl->attempt.generation);
+    } else if (key == "mission_complete") {
+        lua_pushboolean(state, impl->attempt.complete);
+    } else if (key == "begin_adieu_ending") {
+        lua_pushcfunction(state, &context_begin_adieu_ending);
+    } else if (key == "complete_mission") {
+        lua_pushcfunction(state, &context_complete_mission);
+    } else if (key == "activate_objects") {
+        lua_pushcfunction(state, &context_activate_objects);
+    } else if (key == "cohort") {
+        lua_pushcfunction(state, &context_cohort);
+    } else if (key == "peers") {
+        push_peers(state);
+    } else if (key == "squad") {
+        lua_pushcfunction(state, &context_squad);
+    } else if (key == "scene") {
+        lua_pushcfunction(state, &context_scene);
+    } else if (key == "slot") {
+        lua_pushcfunction(state, &context_slot);
+    } else if (key == "hold_spawn") {
+        lua_pushcfunction(state, &context_hold_spawn);
+    } else if (key == "collect_weapon") {
+        lua_pushcfunction(state, &context_collect_weapon);
+    } else if (key == "select_state") {
+        lua_pushcfunction(state, &context_select_state);
+    } else if (key == "restart_checkpoint") {
+        lua_pushcfunction(state, &context_restart_checkpoint);
+    } else if (key == "set_phase") {
+        lua_pushcfunction(state, &context_set_phase);
+    } else if (key == "set_variable") {
+        lua_pushcfunction(state, &context_set_variable);
+    } else if (key == "clear_variable") {
+        lua_pushcfunction(state, &context_clear_variable);
+    } else if (key == "variable_count") {
+        lua_pushcfunction(state, &context_variable_count);
+    } else if (key == "start_timer") {
+        lua_pushcfunction(state, &context_start_timer);
+    } else if (key == "cancel_timer") {
+        lua_pushcfunction(state, &context_cancel_timer);
+    } else if (!push_key_context_member(state, key)) {
         lua_pushnil(state);
-        return 1;
-    }
-    switch (value.type) {
-    case mods::ConfigType::integer:
-        lua_pushinteger(state, value.integer);
-        break;
-    case mods::ConfigType::floating: {
-        // The shortest text of the float round-trips, so 1.1 reaches Lua as 1.1, not float noise.
-        std::array<char, 32> text{};
-        double number = value.floating;
-        const auto written = std::to_chars(text.data(), text.data() + text.size(), value.floating);
-        if (written.ec == std::errc{}) {
-            static_cast<void>(std::from_chars(text.data(), written.ptr, number));
-        }
-        lua_pushnumber(state, number);
-        break;
-    }
-    case mods::ConfigType::boolean:
-        lua_pushboolean(state, value.boolean ? 1 : 0);
-        break;
     }
     return 1;
 }
 
-using ContextBinding = Binding<Impl>;
-
-/** Context members in table order. */
-constexpr std::array<ContextBinding, std::size(api::kContextMembers)> kContextBindings{{
-    {"sdk_build_id",
-     nullptr,
-     [](lua_State* state, const Impl& impl) {
-         lua_pushstring(state, impl.identity.sdkBuildId.data());
-     }},
-    {"activity_id",
-     nullptr,
-     [](lua_State* state, const Impl& impl) {
-         lua_pushstring(state, impl.identity.activityId.data());
-     }},
-    {"activity_row",
-     nullptr,
-     [](lua_State* state, const Impl& impl) { lua_pushinteger(state, impl.identity.activityRow); }},
-    {"definition_hash",
-     nullptr,
-     [](lua_State* state, const Impl& impl) {
-         lua_pushinteger(state, impl.identity.definitionHash);
-     }},
-    {"activity_role",
-     nullptr,
-     [](lua_State* state, const Impl& impl) {
-         lua_pushstring(state, impl.identity.publicTarget ? "public" : "private");
-     }},
-    {"player_key",
-     nullptr,
-     [](lua_State* state, const Impl& impl) { push_u64_string(state, impl.identity.playerKey); }},
-    {"sdk", nullptr, [](lua_State* state, const Impl&) { push_activity(state); }},
-    {"lifetime", nullptr, [](lua_State* state, const Impl&) { push_lifetime(state); }},
-    {"attempt_generation",
-     nullptr,
-     [](lua_State* state, const Impl& impl) { push_u64_string(state, impl.attempt.generation); }},
-    {"mission_complete",
-     nullptr,
-     [](lua_State* state, const Impl& impl) { lua_pushboolean(state, impl.attempt.complete); }},
-    {"complete_mission", &context_complete_mission},
-    {"activate_objects", &context_activate_objects},
-    {"cohort", &context_cohort},
-    {"peers", nullptr, [](lua_State* state, const Impl&) { push_peers(state); }},
-    {"squad", &context_squad},
-    {"scene", &context_scene},
-    {"slot", &context_slot},
-    {"hold_spawn", &context_hold_spawn},
-    {"select_state", &context_select_state},
-    {"restart_checkpoint", &context_restart_checkpoint},
-    {"set_phase", &context_set_phase},
-    {"set_variable", &context_set_variable},
-    {"clear_variable", &context_clear_variable},
-    {"start_timer", &context_start_timer},
-    {"cancel_timer", &context_cancel_timer},
-    // A script no mod ships gets the handle too; every key it reads is nil.
-    {"mod_config", nullptr, [](lua_State* state, const Impl&) { push_mod_config(state); }},
-    {"timers", nullptr, [](lua_State* state, const Impl&) { push_timer_ref_collection(state); }},
-    {"variables",
-     nullptr,
-     [](lua_State* state, const Impl&) { push_variable_ref_collection(state); }},
-}};
-static_assert(bound_to<Impl>(api::kContextMembers, kContextBindings));
-
-} // namespace
-
-/** Lua index for the mission context: its collections, phase, variables and timers. */
-[[nodiscard]] int context_index(lua_State* state) {
-    static_cast<void>(luaL_checkudata(state, 1, kContextMetatable));
-    const Impl* const impl = impl_from_state(state);
-    return dispatch<Impl>(state, kContextBindings, lua_string_view(state, 2), *impl);
-}
-
 void register_context_metatables(lua_State* state) {
     register_metatable(state, kContextMetatable, &context_index);
-    register_metatable(state, kModConfigMetatable, &mod_config_index);
     register_population_metatables(state);
 }
 

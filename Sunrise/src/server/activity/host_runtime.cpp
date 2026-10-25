@@ -3,11 +3,14 @@
  * Helpers here need the Host runtime lock; the entry points take it themselves.
  */
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdio>
 #include <limits>
+#include <memory>
 #include <new>
+#include <string_view>
 #include <vector>
 
 #include "../../core/logging/log.h"
@@ -20,7 +23,8 @@ namespace sunrise::server::activity::host {
 namespace detail {
 
 SRWLOCK g_lock{SRWLOCK_INIT};
-std::array<Instance, kInstanceCapacity> g_instances{};
+std::array<std::unique_ptr<Instance>, kInstanceCapacity> g_instances{};
+std::array<Type31Continuation, kType31ContinuationCapacity> g_type31Continuations{};
 std::vector<PendingInput> g_pending{};
 std::array<Event, kEventCapacity> g_events{};
 std::size_t g_pendingRead{};
@@ -49,11 +53,66 @@ std::uint64_t g_overwrittenEvents{};
 
 /** Finds one exact instance while the runtime lock is held. */
 [[nodiscard]] Instance* find_instance(const state::activity::SessionBinding& binding) noexcept {
-    for (Instance& instance : g_instances) {
+    for (auto& owned : g_instances) {
+        if (!owned) {
+            continue;
+        }
+        Instance& instance = *owned;
         if (instance.occupied && same_binding(instance.view.binding, binding)) {
             return &instance;
         }
     }
+    return nullptr;
+}
+
+/** @return True when destination and ClientRef identify the same persistent type-31 counter. */
+[[nodiscard]] bool same_type31_continuation(const Type31Continuation& entry,
+                                            const state::activity::destination::DestinationSelection&
+                                                destination,
+                                            const ScriptableTarget& target) noexcept {
+    const auto& storedTarget = entry.target;
+    return entry.occupied && entry.packageNameLength == destination.packageNameLength
+           && entry.activityIndex == destination.activityIndex
+           && std::equal(entry.packageName.begin(),
+                         entry.packageName.begin() + entry.packageNameLength,
+                         destination.packageName.begin())
+           && storedTarget.objectTag == target.objectTag
+           && storedTarget.registryKey == target.registryKey
+           && storedTarget.slotIndex == target.slotIndex
+           && storedTarget.slotType == target.slotType
+           && storedTarget.authSchema == target.authSchema;
+}
+
+middleware::bap::activity_message::scriptable_auth::Type31GenerationGuard*
+find_or_reserve_type31_continuation(
+    const state::activity::destination::DestinationSelection& destination,
+    const ScriptableTarget& target) noexcept {
+    if (destination.packageNameLength == 0
+        || destination.packageNameLength > destination.packageName.size()) {
+        core::log::write(core::log::Channel::server,
+                         core::log::Level::error,
+                         "ev=activity stage=type31_continuation result=invalid_destination");
+        return nullptr;
+    }
+    for (Type31Continuation& entry : g_type31Continuations) {
+        if (same_type31_continuation(entry, destination, target)) {
+            return &entry.guard;
+        }
+    }
+    for (Type31Continuation& entry : g_type31Continuations) {
+        if (!entry.occupied) {
+            entry.packageName = destination.packageName;
+            entry.packageNameLength = destination.packageNameLength;
+            entry.activityIndex = destination.activityIndex;
+            entry.target = target;
+            entry.guard = {};
+            entry.occupied = true;
+            return &entry.guard;
+        }
+    }
+    core::log::write(core::log::Channel::server,
+                     core::log::Level::error,
+                     "ev=activity stage=type31_continuation result=capacity_exhausted");
     return nullptr;
 }
 
@@ -137,13 +196,17 @@ bool append_pending(const PendingInput& pending) noexcept {
     return true;
 }
 
-/** Allocates one diagnostic instance without evicting a binding active in this service slice. */
+/** Reuses a safe inactive record before admitting a new lifetime-owned activity record. */
 [[nodiscard]] Instance* ensure_instance(const state::activity::SessionBinding& binding) noexcept {
     if (Instance* const current = find_instance(binding); current != nullptr) {
         return current;
     }
     Instance* selected = nullptr;
-    for (Instance& instance : g_instances) {
+    for (auto& owned : g_instances) {
+        if (!owned) {
+            continue;
+        }
+        Instance& instance = *owned;
         if (!instance.occupied) {
             selected = &instance;
             break;
@@ -154,10 +217,27 @@ bool append_pending(const PendingInput& pending) noexcept {
             selected = &instance;
         }
     }
-    if (selected == nullptr) {
-        return nullptr;
+    if (selected != nullptr) {
+        clear_instance(*selected);
+    } else {
+        for (auto& owned : g_instances) {
+            if (owned) {
+                continue;
+            }
+            owned.reset(new (std::nothrow) Instance{});
+            if (!owned) {
+                core::log::write(core::log::Channel::server,
+                                 core::log::Level::error,
+                                 "ev=activity stage=instance result=no_memory");
+                return nullptr;
+            }
+            selected = owned.get();
+            break;
+        }
+        if (selected == nullptr) {
+            return nullptr;
+        }
     }
-    clear_instance(*selected);
     selected->occupied = true;
     selected->view.binding = binding;
     selected->view.lifetimeState = kDefaultLifetimeState;
@@ -391,14 +471,20 @@ bool request_auth_state(const state::activity::SessionBinding& binding,
     return true;
 }
 
-/** Applies queued client and operator events on the server service slice. */
 void service(std::uint64_t now) noexcept {
     std::array<state::activity::SessionBinding, state::activity::kSessionCapacity> bindings{};
     std::size_t bindingCount = 0;
-    static_cast<void>(state::activity::snapshot_retained_bindings(bindings, bindingCount));
+    // Uma fotografia incompleta nao permite decidir que uma sessao perdeu seus donos.
+    if (!state::activity::snapshot_retained_bindings(bindings, bindingCount)) {
+        return;
+    }
 
     AcquireSRWLockExclusive(&g_lock);
-    for (Instance& instance : g_instances) {
+    for (auto& owned : g_instances) {
+        if (!owned) {
+            continue;
+        }
+        Instance& instance = *owned;
         bool active = false;
         for (std::size_t index = 0; index < bindingCount; ++index) {
             if (same_binding(instance.view.binding, bindings[index])) {
@@ -419,10 +505,13 @@ void service(std::uint64_t now) noexcept {
     }
     for (std::size_t index = 0; index < bindingCount; ++index) {
         Instance* const instance = ensure_instance(bindings[index]);
-        if (instance != nullptr) {
-            instance->view.active = true;
-            touch(*instance);
+        if (instance == nullptr) {
+            // Preserve accepted input and its ordering until every retained owner has storage.
+            ReleaseSRWLockExclusive(&g_lock);
+            return;
         }
+        instance->view.active = true;
+        touch(*instance);
     }
     while (g_pendingRead < g_pending.size()) {
         const PendingInput pending = g_pending[g_pendingRead];
@@ -458,14 +547,48 @@ void service(std::uint64_t now) noexcept {
     }
     g_pending.clear();
     g_pendingRead = 0;
+    // Libera os dados locais de Adieu somente depois de processar a fila e perder
+    // todos os donos da sessao. Um wipe mantem a sessao ativa e nao entra aqui.
+    // Nao e uma chamada de descarga dos recursos internos do cliente.
+    for (auto& owned : g_instances) {
+        if (!owned) { continue; }
+        const Instance& instance = *owned;
+        if (!instance.occupied || instance.view.active || instance.view.outputPending
+            || instance.view.scriptableReservationPending || instance.view.incidentsPending != 0
+            || instance.pendingScriptableTailCount != 0) {
+            continue;
+        }
+        const auto& destination = instance.view.binding.destination;
+        if (destination.packageNameLength > destination.packageName.size()) { continue; }
+        const std::string_view package(
+            reinterpret_cast<const char*>(destination.packageName.data()), destination.packageNameLength);
+        if (package != "mission_journey") { continue; }
+        std::array<char, 192> line{};
+        const int written = std::snprintf(line.data(), line.size(),
+            "ev=activity stage=adieu_cleanup result=host_state_released session=%llu auth=%zu",
+            static_cast<unsigned long long>(instance.view.binding.sessionId),
+            instance.scriptableAuthEstate.size());
+        if (written > 0 && static_cast<std::size_t>(written) < line.size()) {
+            core::log::write(core::log::Channel::server, core::log::Level::info,
+                {line.data(), static_cast<std::size_t>(written)});
+        }
+        // Destruir a instancia libera tambem a capacidade dos vetores retidos.
+        owned.reset();
+    }
     ReleaseSRWLockExclusive(&g_lock);
 }
 
 /** Copies the latest complete diagnostic view. */
 void snapshot(DiagnosticsSnapshot& output) noexcept {
-    output = {};
+    // The server-wide snapshot is too large for a temporary on a native game thread.
+    std::destroy_at(&output);
+    std::construct_at(&output);
     AcquireSRWLockShared(&g_lock);
-    for (const Instance& instance : g_instances) {
+    for (const auto& owned : g_instances) {
+        if (!owned) {
+            continue;
+        }
+        const Instance& instance = *owned;
         if (instance.occupied && output.instanceCount < output.instances.size()) {
             output.instances[output.instanceCount] = instance.view;
             ++output.instanceCount;
@@ -612,10 +735,11 @@ void note_auth_transport_staged(const state::activity::SessionBinding& binding,
 void reset() noexcept {
     AcquireSRWLockExclusive(&g_lock);
     g_eventGeneration = next_nonzero(g_eventGeneration);
-    for (Instance& instance : g_instances) {
-        clear_instance(instance);
+    for (auto& owned : g_instances) {
+        owned.reset();
     }
-    std::vector<PendingInput>{}.swap(g_pending);
+    // Reuse the queue storage; constructing an empty vector may allocate Debug bookkeeping.
+    g_pending.clear();
     for (Event& event : g_events) {
         event = {};
     }

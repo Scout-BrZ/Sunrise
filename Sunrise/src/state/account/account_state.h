@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "account_presence.h"
 #include "inventory/inventory_state.h"
 #include "settings/settings_state.h"
 
@@ -11,10 +12,6 @@ namespace sunrise::state {
 
 /** One account can own at most the 3 playable character slots. */
 inline constexpr std::size_t kCharacterCapacity = 3;
-/** The character record's own appearance-header block size, record byte order. */
-inline constexpr std::size_t kAppearanceHeaderSize = 36;
-/** Opaque authored appearance header, ready to memcpy into either character encoder's block. */
-using AppearanceHeader = std::array<std::uint8_t, kAppearanceHeaderSize>;
 /** A server-authored dismantle policy: a few rows per rarity and gear class. */
 inline constexpr std::size_t kDismantleRewardPolicyCapacity = 32;
 /** Native sentinel used when a character has no title equipped. */
@@ -82,10 +79,6 @@ enum class CharacterClass : std::uint8_t {
     /** Wire value 2 is a Warlock character. */
     warlock = 2,
 };
-
-/** Number of character classes represented on the wire. */
-inline constexpr std::size_t kCharacterClassCount =
-    static_cast<std::size_t>(CharacterClass::warlock) + 1;
 
 /** Default movement entry. Each subclass offers 3, as entries 4, 5 and 6 of its group. */
 inline constexpr std::uint8_t kDefaultMovementAbilityEntry = 4;
@@ -173,16 +166,13 @@ struct CharacterState {
     account::inventory::CharacterStacks stacks;
     /** Next row generation; equip transactions consume two values for the two moved items. */
     std::uint32_t nextInventorySerial{};
-    /** Authored appearance header captured at creation. Meaningless without its own `race`. */
-    AppearanceHeader appearanceHeader{};
-    /** False for a character predating appearance capture; both encoders fall back to the
-     * fixed default header when this is unset. */
-    bool appearanceHeaderValid{};
 };
 
 /** Call-local account snapshot shared by backend object families. */
 struct AccountState {
     std::uint64_t primarySoid{};
+    /** Public identity supplied by the local platform adapter or the owning peer's projection. */
+    AccountPresence presence{};
     /** Economy rows come from the investment store. */
     std::array<DismantleRewardPolicy, kDismantleRewardPolicyCapacity> dismantleRewards{};
     std::size_t dismantleRewardCount{};
@@ -200,6 +190,12 @@ struct AccountState {
 namespace account {
 
 [[nodiscard]] bool valid(const AccountState& state) noexcept;
+
+/** Checks settings-authored State before runtime-only profile stack SOIDs are assigned. */
+[[nodiscard]] bool valid_authored(const AccountState& state) noexcept;
+
+/** Validates public character data without requiring another account's private preferences. */
+[[nodiscard]] bool valid_public(const AccountState& state) noexcept;
 
 [[nodiscard]] std::uint64_t selected_character_soid(const AccountState& state) noexcept;
 

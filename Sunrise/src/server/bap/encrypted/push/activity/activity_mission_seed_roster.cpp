@@ -357,6 +357,104 @@ struct SceneSeedRefusal final {
 
 } // namespace
 
+// Excecao restrita aos estados finais de Adieu, com cinematic exata no catalogo.
+// Nao aplica a politica a estados jogaveis, outras missoes ou estados sem o slot esperado.
+[[nodiscard]] static bool adieu_final_cinematic_state(
+    const sdk::BoundView& view, const ActivityMissionSeedPlan& plan) noexcept {
+    const auto* scenario = sdk::bound_scenario(view);
+    if (scenario == nullptr || scenario->tag != 0x80B5E01FU
+        || plan.scenarioRow != view.scenarioRow || plan.activityRow != view.activityRow
+        || (plan.effectiveRegion != 26U && plan.effectiveRegion != 27U)) {
+        return false;
+    }
+    const std::uint32_t objectTag = plan.effectiveRegion == 26U ? 0x80B5E364U : 0x80B5E368U;
+    const auto objects = view.catalog->objects();
+    const auto slots = view.catalog->slots();
+    for (const auto& occurrence : view.catalog->occurrences()) {
+        if (occurrence.scenarioIndex != view.scenarioRow || occurrence.stateIndex != plan.stateRow
+            || occurrence.objectIndex >= objects.size()) { continue; }
+        const auto& object = objects[occurrence.objectIndex];
+        if (object.objectTag != objectTag || object.slots.first > slots.size()
+            || object.slots.count > slots.size() - object.slots.first) { continue; }
+        for (const auto& slot : slots.subspan(object.slots.first, object.slots.count)) {
+            if (slot.slotType == sdk::format::kCinematicSlotType
+                && slot.componentClass == sdk::format::kCinematicComponentClass
+                && slot.authSchema == sdk::format::kCinematicAuthSchema
+                && (slot.flags & sdk::format::kSlotSchemaJoinExact) != 0) { return true; }
+        }
+    }
+    return false;
+}
+
+// A mesma politica protege a montagem do roster e sua porta de envio.
+bool cinematic_arrival_publication_allowed(
+    const Session& session, const RefreshReport* refresh) noexcept {
+    const auto& lease = session.activityMissionSeed;
+    if (!lease.configured || !lease.regionArrivalPending
+        || lease.bindingGeneration != session.activity.bindingGeneration) { return false; }
+    const auto placement = client_placement(session, refresh);
+    const auto catalog = sdk::snapshot();
+    sdk::BoundView view{};
+    const sdk::Selection selection{session.activity.session, 1, session.activity.bindingGeneration};
+    const sdk::Status status = sdk::resolve(catalog, selection, view);
+    const auto* scenario = status == sdk::Status::ready ? sdk::bound_scenario(view) : nullptr;
+    const bool authored = status == sdk::Status::ready && adieu_final_cinematic_state(view, lease.plan);
+    const unsigned reason = session.activity.role != ActivityClientRole::privateCurrent ? 6U
+        : placement.currentRegion >= 0 ? 1U
+        : placement.region != static_cast<std::int32_t>(lease.plan.effectiveRegion) ? 2U
+        // Durante o carregamento, o refresh pode informar bolha 0 ou -1.
+        // O destino confirmado e o plano autoral definem a bolha; o builder ainda valida hostedBubbles.
+        : lease.plan.effectiveRegion / middleware::content::packages::tables::kSliceSetIndexFactor
+              != lease.plan.bubbleOrdinal ? 3U
+        : status != sdk::Status::ready ? 4U
+        : !authored ? 5U : 0U;
+    // Diagnostico limitado aos finais de Adieu; registra apenas mudancas da validacao.
+    const auto& destination = session.activity.session.destination;
+    const std::string_view package(
+        reinterpret_cast<const char*>(destination.packageName.data()),
+        destination.packageNameLength <= destination.packageName.size() ? destination.packageNameLength : 0);
+    if (package == "mission_journey" && (lease.plan.effectiveRegion == 26U || lease.plan.effectiveRegion == 27U)) {
+        const std::array<std::uint64_t, 7> signature{
+            session.activity.bindingGeneration, lease.revision, reason,
+            static_cast<std::uint64_t>(placement.currentRegion),
+            static_cast<std::uint64_t>(placement.region),
+            static_cast<std::uint64_t>(placement.bubble), lease.plan.effectiveRegion};
+        static thread_local std::array<std::uint64_t, 7> previous{};
+        if (signature != previous) {
+            previous = signature;
+            std::uint32_t cinematicObject = 0, cinematicKey = 0;
+            if (status == sdk::Status::ready) {
+                const auto objects = view.catalog->objects();
+                const auto slots = view.catalog->slots();
+                for (const auto& occurrence : view.catalog->occurrences()) {
+                    if (occurrence.stateIndex != lease.plan.stateRow || occurrence.objectIndex >= objects.size()) { continue; }
+                    const auto& object = objects[occurrence.objectIndex];
+                    if (object.slots.first > slots.size() || object.slots.count > slots.size() - object.slots.first) { continue; }
+                    for (const auto& slot : slots.subspan(object.slots.first, object.slots.count)) {
+                        if (slot.slotType == sdk::format::kCinematicSlotType) {
+                            cinematicObject = object.objectTag; cinematicKey = object.objectKey;
+                        }
+                    }
+                }
+            }
+            std::array<char, 384> detail{};
+            const int size = std::snprintf(detail.data(), detail.size(),
+                "ev=activity stage=cinematic_gate reason=%u role=%u current=%d pending=%d bubble=%d target=%u target_bubble=%u sdk=%u tag=%08X activity=%u/%u scenario=%u/%u object=%08X key=%08X revision=%llu",
+                reason, static_cast<unsigned>(session.activity.role),
+                placement.currentRegion, placement.region, placement.bubble,
+                lease.plan.effectiveRegion, lease.plan.bubbleOrdinal, static_cast<unsigned>(status),
+                scenario ? scenario->tag : 0U, lease.plan.activityRow, view.activityRow,
+                lease.plan.scenarioRow, view.scenarioRow, cinematicObject, cinematicKey,
+                static_cast<unsigned long long>(lease.revision));
+            if (size > 0 && static_cast<std::size_t>(size) < detail.size()) {
+                core::log::write(core::log::Channel::server, core::log::Level::debug,
+                    {detail.data(), static_cast<std::size_t>(size)});
+            }
+        }
+    }
+    return reason == 0U;
+}
+
 /** Adds the destination's generated selected-state roster to the initial publication. */
 MissionSeedRosterResult append_initial_mission_seed(Session& session,
                                                     Scratch& scratch,
@@ -370,6 +468,8 @@ MissionSeedRosterResult append_initial_mission_seed(Session& session,
         lease = {};
     }
 
+    // Cada corpo precisa comprovar novamente que materializou a revisao antecipada.
+    lease.cinematicArrivalPublicationRevision = 0;
     const bool adopting = !lease.configured;
     if (adopting && session.activityRosterSends != 0) {
         return MissionSeedRosterResult::inactive;
@@ -406,7 +506,11 @@ MissionSeedRosterResult append_initial_mission_seed(Session& session,
         && mission_seed_arrival_window_closed(heldRegion, lease.plan.effectiveRegion)) {
         lease.regionArrivalPending = false;
     }
-    const bool arrivalWindow = !adopting && lease.regionArrivalPending;
+    // So publica antecipadamente depois de descarregar o mundo anterior e confirmar
+    // a perna de destino. A vinculacao e o catalogo acima continuam sendo validados.
+    const bool cinematicArrival = !adopting
+        && cinematic_arrival_publication_allowed(session, refresh);
+    const bool arrivalWindow = !adopting && lease.regionArrivalPending && !cinematicArrival;
     if (arrivalWindow) {
         // Publication holds the previous plan until the client instantiates the selected region.
         // Name both regions, because a wait that never ends looks the same as a slow one.
@@ -572,7 +676,7 @@ MissionSeedRosterResult append_initial_mission_seed(Session& session,
             publicRegion = isPublic;
         }
     }
-    const bool transitionPublication = mission_seed_transition_subset_only(
+    const bool transitionPublication = !cinematicArrival && mission_seed_transition_subset_only(
         lease.fullSetPublished, lease.scriptSelected, publicRegion, heldRegion, selectedRegion);
     for (std::size_t source = 0; source < foldGroupCount; ++source) {
         const layouts::RosterGroup& candidate = materialized[source];
@@ -783,6 +887,19 @@ MissionSeedRosterResult append_initial_mission_seed(Session& session,
             core::log::write(core::log::Channel::server,
                              core::log::Level::info,
                              {line.data(), static_cast<std::size_t>(written)});
+        }
+    }
+    if (cinematicArrival && !transitionPublication) {
+        // Somente depois de validar e instalar todos os grupos e seeds deste corpo.
+        lease.cinematicArrivalPublicationRevision = revision;
+        std::array<char, 128> detail{};
+        const int size = std::snprintf(detail.data(), detail.size(),
+            "ev=activity stage=cinematic_arrival_publication region=%u revision=%llu",
+            selectedRegion, static_cast<unsigned long long>(revision));
+        if (lease.publishedRevision != revision
+            && size > 0 && static_cast<std::size_t>(size) < detail.size()) {
+            core::log::write(core::log::Channel::server, core::log::Level::debug,
+                {detail.data(), static_cast<std::size_t>(size)});
         }
     }
     lease.fullSetPublished = lease.fullSetPublished || !transitionPublication;

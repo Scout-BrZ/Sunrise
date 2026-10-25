@@ -50,6 +50,8 @@ inline constexpr std::size_t kSquadObjectiveGroupCount = 24;
 /** Distinct exact ClientRef counters retained for one activity generation. */
 inline constexpr std::size_t kScriptableGuardCapacity =
     state::build_data::scenarios::kRosterSlotCapacity;
+/** Delivered dialogue lines a lagging fireteam member can still replay; a chosen bound. */
+inline constexpr std::size_t kDialoguePulseCapacity = 64;
 /** State-local SDK groups are carried with the request instead of indexing the baseline census. */
 inline constexpr std::uint16_t kGeneratedRosterGroupIndex = 0xFFFFU;
 /** No generated SDK object backs this ordinary canonical roster target. */
@@ -59,8 +61,7 @@ inline constexpr std::uint8_t kDefaultLifetimeState = 3;
 /** Lifetime state that shows the loading presentation and refuses the native spawn gate. */
 inline constexpr std::uint8_t kLoadingLifetimeState = 4;
 /** Highest lifetime state inside the client's jump table. */
-inline constexpr std::uint8_t kMaximumLifetimeState =
-    middleware::bap::activity_message::sensor_auth_update::kMaximumLifetimeState;
+inline constexpr std::uint8_t kMaximumLifetimeState = 10;
 
 /** Events visible at the Activity Host boundary. */
 enum class EventKind : std::uint8_t {
@@ -146,15 +147,15 @@ enum class EventKind : std::uint8_t {
     deviceState = 39,
     /** An accepted client report moved the held region to another authored region. */
     regionChanged = 40,
-    /** A watched authored scene newly reported one of its output gates; from one msg 6 body. */
-    sceneOutput = 41,
-    /** Validated type-30 level or explicit continuity invalidation. */
-    triggerState = 42,
+    /** One dialogue cue reached the transport queue; this is not a Host feed row. */
+    dialogueStaged = 41,
+    /** A staged cue's authored duration elapsed on its runtime timer; not a Host feed row. */
+    dialogueFinished = 42,
 };
 
 /** Kinds are numbered without gaps, so the last one plus one is the count. */
 inline constexpr std::size_t kEventKindCount =
-    static_cast<std::size_t>(EventKind::triggerState) + 1U;
+    static_cast<std::size_t>(EventKind::dialogueFinished) + 1U;
 
 /**
  * Terminal delivery outcome of one script-requested effect.
@@ -501,8 +502,8 @@ struct Event final {
     /** Absolute service tick committed when the timer was armed. */
     std::uint64_t timerDeadlineTick{};
     /** Stable timer identity allocated by authoritative Mission State. */
-    std::uint64_t timerSequence{};
-    /** Durable intent sequence the effect call returned to the script. */
+    std::uint64_t
+        timerSequence{}; /** Durable intent sequence the effect call returned to the script. */
     std::uint64_t effectRequestKey{};
     /** Peer session id, for sessionJoined and sessionLeft events. */
     std::uint64_t peerSessionId{};
@@ -528,10 +529,6 @@ struct Event final {
     std::int32_t triggerValue{};
     /** True when the whole watched set is inside the volume. */
     bool triggerAll{};
-    /** For triggerState events: whether a level was reported, and the volume's occupancy. */
-    bool triggerAvailable{}, triggerOccupied{};
-    /** trigger_observation::Continuity of the report, for triggerState events. */
-    std::uint8_t triggerContinuity{};
     /** Health and shield fractions, for damageState events. Negative until published. */
     float damageHealth{-1.0F};
     float damageShield{-1.0F};
@@ -575,11 +572,6 @@ struct Event final {
     bool squadObjectiveCostQualified{};
     /** Per-slot member counts the client published, for squadState events. */
     std::array<std::int32_t, kSquadSlotCapacity> squadSlotCounts{};
-    /** Spawn generation the squad Sense echoes from its placement Auth; not the record counter. */
-    std::int32_t squadSpawnGeneration{};
-    bool squadHasSpawnGeneration{};
-    /** An alive count was reported for this squad; until then the counts are zero placeholders. */
-    bool squadPopulationAvailable{};
     /** Alive members the client published. Six bits on the wire, so 0 through 63. */
     std::int32_t squadAliveCount{};
     /** Alive count this observation replaced, for entityDied events. */
@@ -594,18 +586,8 @@ struct Event final {
     std::uint8_t squadSlotOrdinal{};
     /** Client flag written on its actor death or removal path. The meaning is unproved. */
     bool squadRemovalFlag{};
-    /** Msg-6 record counter plus one; not a squad or actor lifetime identity. */
-    std::uint32_t senseGenerationPlusOne{};
-    bool hasSenseGeneration{};
-    /** First report of this squad or object generation; it never proves a death. */
-    bool initialObservation{};
-    /** Authored entry index and spawn-mask words, for objectState events. */
-    std::int32_t objectEntryIndex{};
-    std::array<std::uint32_t, 2> objectSpawnMask{};
-    /** Activation token the authored scene echoed, for sceneFinished and sceneOutput events. */
+    /** Activation token the completed authored scene echoed, for sceneFinished events. */
     std::int32_t sceneActivationToken{};
-    /** Output gate key the scene newly reported, for sceneOutput events. */
-    std::uint32_t sceneOutputKey{};
     /** Task counter the client published, for objectiveProgress events. Clamped to 80. */
     std::int32_t objectiveTaskCount{};
     /** Counter that task held before it rose. */
@@ -669,6 +651,14 @@ struct Event final {
     std::uint32_t playerTriggerResolvedObjectId{};
     std::int16_t playerTriggerSlotIndex{-1};
     std::int8_t playerTriggerSlotType{-1};
+    /** Type-53 source and cue of a dialogueStaged or dialogueFinished event. */
+    std::uint32_t dialogueSlotRow{};
+    std::uint32_t dialogueRegistryKey{};
+    /** Play time of the cue, from the SDK dialogue cue row. */
+    std::uint32_t dialogueDurationMs{};
+    std::uint16_t dialogueCue{};
+    std::int16_t dialogueSlotIndex{-1};
+    std::int8_t dialogueSlotType{-1};
     /** Type-6 source ClientRef carried by a schema-0x808087BF cinematic incident. */
     std::uint32_t cinematicRegistryKey{};
     std::uint64_t cinematicRuntimeObjectId{};
@@ -772,6 +762,8 @@ struct InstanceSnapshot final {
     std::uint64_t scriptableReservedRevision{};
     std::uint32_t senseCount{};
     std::uint32_t outputAttempts{};
+    std::uint32_t incidentsReceived{};
+    std::uint32_t incidentsQueued{};
     std::uint32_t incidentsPending{};
     std::uint32_t senseObservationCount{};
     std::uint32_t senseObservationValueCount{};
@@ -901,6 +893,13 @@ struct PendingScriptableOverride final {
     /** Activity lifetime state for a lifetime request; ignored by every other kind. */
     std::uint8_t lifetimeState{kDefaultLifetimeState};
     bool sdkCompiled{};
+    /** Estate revision this body was retained at; zero while it is only pending. */
+    std::uint64_t estateSerial{};
+    /**
+     * A dialogue line held by the client until the player enters its filter volume. It plays
+     * then, not when it is sent, so a member still loading at send time can still hear it.
+     */
+    bool dialogueFiltered{};
 };
 
 /**
@@ -933,6 +932,75 @@ pending_scriptable_tail(const state::activity::SessionBinding& binding,
                                           std::uint64_t activityClientGeneration,
                                           std::vector<PendingScriptableOverride>& output) noexcept;
 
+/**
+ * Reads the ActivityClient generation the binding's scripted output is authorized for: the pending
+ * body's, else the most recently delivered one's.
+ * @return False when nothing scripted has named an owner yet.
+ */
+[[nodiscard]] bool scriptable_owner_generation(const state::activity::SessionBinding& binding,
+                                               std::uint64_t& generation) noexcept;
+
+/**
+ * Reads the oldest delivered dialogue line one link has not heard.
+ * @param afterSerial The link's cursor; only lines retained past it are considered.
+ * @param listenerGeneration The link's own generation; lines it heard live are passed over.
+ * @return False when the link has heard every line the log still holds.
+ */
+[[nodiscard]] bool next_dialogue_pulse(const state::activity::SessionBinding& binding,
+                                       std::uint64_t afterSerial,
+                                       std::uint64_t listenerGeneration,
+                                       PendingScriptableOverride& output) noexcept;
+
+/**
+ * Reads the newest delivered dialogue line one link has already heard.
+ * A body without the dialogue sensor puts the sensor back to its defaults on the client, and a
+ * line that arrives and is cleared within one client frame never plays. Every later body carries
+ * the line heard last instead; its fire sequence is already played, so it does not play again.
+ * @param heardSerial The link's cursor; lines retained up to it were heard.
+ * @param listenerGeneration The link's own generation; the lines it delivered were heard live.
+ * @return False when the link has heard no line the log still holds.
+ */
+[[nodiscard]] bool heard_dialogue_pulse(const state::activity::SessionBinding& binding,
+                                        std::uint64_t heardSerial,
+                                        std::uint64_t listenerGeneration,
+                                        PendingScriptableOverride& output) noexcept;
+
+/** @return True when a dialogue line delivered past afterSerial waits for a filter volume. */
+[[nodiscard]] bool dialogue_filtered_after(const state::activity::SessionBinding& binding,
+                                           std::uint64_t afterSerial) noexcept;
+
+/** @return The serial of the newest delivered dialogue line, or zero when none was delivered. */
+[[nodiscard]] std::uint64_t
+latest_dialogue_serial(const state::activity::SessionBinding& binding) noexcept;
+
+/** @return The binding's estate revision, zero before anything was delivered or when absent. */
+[[nodiscard]] std::uint64_t
+scriptable_estate_revision(const state::activity::SessionBinding& binding) noexcept;
+
+/** What one attempt to share an interactable object's use did. */
+enum class InteractionLatchStatus : std::uint8_t {
+    /** The retained body now names the use at a newer row revision; every link republishes it. */
+    republished,
+    /** No interactable body is retained for that slot, so there is nothing to share. */
+    absent,
+    /** The retained body does not have the interactable layout. */
+    malformed,
+};
+
+/**
+ * Shares one member's use of an interactable object with every member.
+ * A client latches a use on its own copy of the object; the other members' clients only learn of
+ * it from a row revision newer than theirs. The retained body's row is latched at the next
+ * revision, so every member's next roster carries the use and every client closes the object.
+ * @param binding Exact activity session.
+ * @param target The object slot the use was reported on.
+ * @param revision Receives the row revision the body now carries.
+ */
+[[nodiscard]] InteractionLatchStatus
+share_interaction_latch(const state::activity::SessionBinding& binding,
+                        const ScriptableTarget& target,
+                        std::uint32_t& revision) noexcept;
+
 /** Queues a native objective decision after both SDK slot identities are validated. */
 [[nodiscard]] bool
 request_squad_objective(const state::activity::SessionBinding& binding,
@@ -943,41 +1011,11 @@ request_squad_objective(const state::activity::SessionBinding& binding,
                         std::uint64_t expectedActivityClientGeneration,
                         const ScriptableOutputReservation& reservation) noexcept;
 
-/** Names the gate that declined one ingress submission. */
-enum class IngressRefusal : std::uint8_t {
-    /** The submission was queued. */
-    none,
-    /** The named session no longer matches a live binding. */
-    binding,
-    /** The submission carried no source generation to bind it to. */
-    generation,
-    /** The shared codec refused a bounded outer field. */
-    payload,
-    /** The pending-input ring held no free slot. */
-    queue,
-};
+/** Queues one owned msg-6 prefix for the Activity Host service. */
+[[nodiscard]] bool submit_sense(const SenseInput& input) noexcept;
 
-/**
- * Names the ingress gate that declined, for the skip diagnostic. Every name starts with
- * `host_ingress_refused`.
- * @param refusal Gate reported by one failed submission.
- * @return Stable reason name.
- */
-[[nodiscard]] const char* ingress_refusal_name(IngressRefusal refusal) noexcept;
-
-/**
- * Queues one owned msg-6 prefix for the Activity Host service.
- * @param input Owned prefix and the binding it arrived on.
- * @return The gate that declined, or IngressRefusal::none once queued.
- */
-[[nodiscard]] IngressRefusal submit_sense(const SenseInput& input) noexcept;
-
-/**
- * Queues one owned, outer-valid client msg 19 for the Activity Host service.
- * @param input Parsed incident and the binding it arrived on.
- * @return The gate that declined, or IngressRefusal::none once queued.
- */
-[[nodiscard]] IngressRefusal submit_incident(const IncidentInput& input) noexcept;
+/** Queues one owned, outer-valid client msg 19 for the Activity Host service. */
+[[nodiscard]] bool submit_incident(const IncidentInput& input) noexcept;
 
 /** Queues one committed client msg-22 numeric after-image for the Activity Host service. */
 [[nodiscard]] bool submit_client_state_change(const ClientStateChangeInput& input) noexcept;
@@ -1095,13 +1133,15 @@ actor_squad_binding_status(const state::activity::SessionBinding& binding,
     std::uint64_t expectedActivityClientGeneration,
     const ScriptableOutputReservation* reservation = nullptr) noexcept;
 
-/** Queues one type-31 arm, or a disarm, for an exact package-derived ClientRef. */
+/** Queues one generation-bound type-31 arm or disarm for an exact package-derived ClientRef. */
 [[nodiscard]] bool request_type31_override(const state::activity::SessionBinding& binding,
                                            const ScriptableTarget& target,
+                                           std::uint64_t expectedActivityClientGeneration,
                                            const ScriptableOutputReservation* reservation = nullptr,
                                            bool enabled = true) noexcept;
 
-/** Queues one type-31 pulse carried by the exact generated group in the current activity seed. */
+/** Queues one type-31 arm/disarm carried by the exact generated group in the current activity seed.
+ */
 [[nodiscard]] bool request_state_local_type31_override(
     const state::activity::SessionBinding& binding,
     const ScriptableTarget& target,
@@ -1230,7 +1270,10 @@ withdraw_scriptable_output(const state::activity::SessionBinding& binding,
                            std::uint64_t intentSequence,
                            std::uint64_t expectedRevision) noexcept;
 
-/** Applies queued client and operator events on the server service slice. */
+/**
+ * Applies queued client and operator events after admitting every retained activity's storage.
+ * A record allocation or capacity failure leaves the ordered input queue intact for a later slice.
+ */
 void service(std::uint64_t now) noexcept;
 
 /** Copies the latest complete diagnostic view. */
@@ -1294,18 +1337,18 @@ void read_mission_inputs_after(MissionInputCursor after, MissionInputRead& outpu
 [[nodiscard]] bool pending_incident(const state::activity::SessionBinding& binding,
                                     PendingIncident& output) noexcept;
 
-/** Reads the one pending typed ClientRef body without changing its counter. */
-[[nodiscard]] bool pending_scriptable_override(const state::activity::SessionBinding& binding,
-                                               PendingScriptableOverride& output) noexcept;
-
 /**
  * Reads an override for one exact ActivityClient generation.
- * A state-local request authorized by another generation is atomically canceled here.
+ * A request authorized by another generation remains pending for its own client.
  */
 [[nodiscard]] bool
 pending_scriptable_override_for_activity_client(const state::activity::SessionBinding& binding,
                                                 std::uint64_t activityClientGeneration,
                                                 PendingScriptableOverride& output) noexcept;
+
+/** Withdraws only queued and unstaged controls authorized by a retiring native client. */
+void retire_scriptable_client(const state::activity::SessionBinding& binding,
+                              std::uint64_t generation) noexcept;
 
 /** Cancels the exact instance's raw incident before any later transport staging. */
 [[nodiscard]] bool cancel_pending_incident(const state::activity::SessionBinding& binding) noexcept;

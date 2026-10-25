@@ -168,13 +168,13 @@ bool collect_rows(const reader::Source& source, Storage& storage, const char*& r
     storage.rowPatch.fill(0);
     packages::reader::ScanResult scan{};
     if (!packages::reader::scan_class_entries(
-            source, packages::tables::kScenarioClass, &collect_tag, &storage, scan)) {
+            source.directory, packages::tables::kScenarioClass, &collect_tag, &storage, scan)) {
         reason = "sweep";
         return false;
     }
     packages::named_tags::DirectoryResult names{};
     if (!packages::named_tags::extract_directory(
-            source.directory, source.installedOnly, &collect_named, &storage, names)) {
+            source.directory, &collect_named, &storage, names)) {
         reason = "names";
         return false;
     }
@@ -211,7 +211,9 @@ bool resolve_pending(const reader::Source& source,
         const std::size_t row = storage.resolveCursor;
         storage.resolveCursor = (storage.resolveCursor + 1) % storage.rowCount;
         ++visited;
-        if (storage.resolved[row] != 0) {
+        // Apenas os candidatos presentes no conjunto instalado entram na meta.
+        if (storage.resolved[row] != 0
+            || live_tag(storage, storage.rows[row].tag) == nullptr) {
             continue;
         }
         ++reads;
@@ -225,28 +227,12 @@ bool resolve_pending(const reader::Source& source,
            || GetTickCount64() >= storage.resolveDeadlineTick;
 }
 
-/** Reads the bubble layout of every row once, with no budget and no retry window. */
-void resolve_all(const reader::Source& source,
-                 reader::Scratch& scratch,
-                 Storage& storage) noexcept {
-    for (std::size_t row = 0; row < storage.rowCount; ++row) {
-        if (storage.resolved[row] == 0
-            && resolve_row(source, scratch, storage, storage.rows[row])) {
-            storage.resolved[row] = 1;
-            ++storage.resolvedCount;
-        }
-    }
-}
-
 /**
- * Re-arms the resolve window so a pass that read nothing tries the whole row set again.
- * The rows and the name match are kept: only the per-row read outcome is cleared, because every
- * read failed for one reason, the block keys were not ready yet.
- * @param storage Pass storage whose resolve state is cleared.
+ * Abre outra janela apenas para as leituras pendentes.
+ * Preserva as linhas recuperadas e sua contagem; nao repete leituras bem-sucedidas.
+ * @param storage Estado da coleta que conserva os resultados anteriores.
  */
 void rearm_resolve(Storage& storage) noexcept {
-    storage.resolved.fill(0);
-    storage.resolvedCount = 0;
     storage.resolveCursor = 0;
     storage.resolveDeadlineTick = GetTickCount64() + kResolveWindowMs;
     ++storage.resolveRounds;

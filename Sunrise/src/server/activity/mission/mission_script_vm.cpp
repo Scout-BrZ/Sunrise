@@ -1,14 +1,28 @@
 #include <algorithm>
+#include <charconv>
 #include <cstddef>
 #include <cstring>
 #include <limits>
 #include <new>
+#include <string_view>
 
-#include "mission_api.h"
 #include "mission_script_lua_resolve.h"
 #include "mission_script_vm_internal.h"
 
 namespace sunrise::server::activity::mission::lua_vm {
+namespace detail {
+
+struct VmAccess final {
+    [[nodiscard]] static Impl& get(Vm& vm) noexcept {
+        return *std::launder(reinterpret_cast<Impl*>(vm.storage_.data()));
+    }
+
+    [[nodiscard]] static const Impl& get(const Vm& vm) noexcept {
+        return *std::launder(reinterpret_cast<const Impl*>(vm.storage_.data()));
+    }
+};
+
+} // namespace detail
 namespace {
 
 using detail::CallFrame;
@@ -19,33 +33,15 @@ using detail::impl_from_state;
 using detail::raise_lua_error;
 using detail::VmAccess;
 
+/** Runtime timer names that close a staged dialogue cue follow the reserved prefix with this. */
+constexpr std::string_view kDialogueTimerKind = "dialogue/";
+
 static_assert(sizeof(Impl) <= kVmStorageByteCapacity);
 static_assert(alignof(Impl) <= alignof(std::max_align_t));
-
-/** Lua's buffer loader needs the UTF-8 file signature removed from its compile view. */
-[[nodiscard]] std::span<const char> compile_source(std::span<const char> source) noexcept {
-    /** UTF-8 permits these three bytes before the first source character. */
-    constexpr std::string_view kSignature = "\xEF\xBB\xBF";
-    return source.size() >= kSignature.size()
-                   && std::equal(kSignature.begin(), kSignature.end(), source.begin())
-               ? source.subspan(kSignature.size())
-               : source;
-}
 
 /** Reads only an already-interned Lua string; coercing arbitrary errors can allocate. */
 [[nodiscard]] const char* existing_error(lua_State* state, const char* fallback) noexcept {
     return lua_type(state, -1) == LUA_TSTRING ? lua_tostring(state, -1) : fallback;
-}
-
-/** @return The key of one program table entry. */
-[[nodiscard]] consteval const char* program_key(std::string_view name) {
-    return api::find_field(api::kProgramEntries, name).name.data();
-}
-
-/** @return The key of one field of program.initial_state. */
-[[nodiscard]] consteval const char* initial_state_key(std::string_view name) {
-    return api::find_field(api::find_field(api::kProgramEntries, "initial_state").fields, name)
-        .name.data();
 }
 
 /** Instructions between budget checks. Every lua_sethook call must charge this same count. */
@@ -87,7 +83,7 @@ void instruction_hook(lua_State* state, lua_Debug*) {
     impl.initialStateRegion = -1;
     impl.initialStateSpawnSet = 0;
     impl.hasInitialState = false;
-    lua_pushstring(state, program_key("initial_state"));
+    lua_pushliteral(state, "initial_state");
     lua_rawget(state, program);
     if (lua_isnil(state, -1)) {
         lua_pop(state, 1);
@@ -97,7 +93,7 @@ void instruction_hook(lua_State* state, lua_Debug*) {
         lua_pop(state, 1);
         return false;
     }
-    lua_pushstring(state, initial_state_key("region_index"));
+    lua_pushliteral(state, "region_index");
     lua_rawget(state, -2);
     if (!lua_isinteger(state, -1)) {
         lua_pop(state, 2);
@@ -114,7 +110,7 @@ void instruction_hook(lua_State* state, lua_Debug*) {
     impl.hasInitialState = true;
     lua_pop(state, 1);
     // The arrival and every host move carry this spawn set as the client's spawn-point filter.
-    lua_pushstring(state, initial_state_key("spawn_set_hash"));
+    lua_pushliteral(state, "spawn_set_hash");
     lua_rawget(state, -2);
     if (!lua_isnil(state, -1)) {
         if (!lua_isinteger(state, -1)) {
@@ -133,7 +129,7 @@ void instruction_hook(lua_State* state, lua_Debug*) {
     lua_pop(state, 1);
     // The optional omit list names generated slots whose objects stay out of every seed.
     impl.initialStateOmissionCount = 0;
-    lua_pushstring(state, initial_state_key("omit"));
+    lua_pushliteral(state, "omit");
     lua_rawget(state, -2);
     const bool hasOmit = !lua_isnil(state, -1);
     if (hasOmit) {
@@ -164,8 +160,61 @@ void instruction_hook(lua_State* state, lua_Debug*) {
     return true;
 }
 
-// One callback per EventKind, in EventKind order; the table owns the names.
-static_assert(std::size(api::kEvents) == host::kEventKindCount);
+// One callback name per EventKind, in EventKind order. The index is the kind.
+inline constexpr std::array<const char*, host::kEventKindCount> kEventHandlerNames{{
+    "on_event_sensor_sense_updated",
+    "on_event_client_state_changed",
+    "on_event_client_message_received",
+    "on_event_auth_state_committed",
+    "on_event_auth_state_transport_staged",
+    "on_event_auth_state_canceled",
+    "on_event_incident_received",
+    "on_event_incident_queued",
+    "on_event_incident_transport_staged",
+    "on_event_incident_canceled",
+    "on_event_incident_refused",
+    "on_event_scriptable_override_committed",
+    "on_event_scriptable_override_transport_staged",
+    "on_event_scriptable_override_canceled",
+    "on_event_operator_refused",
+    "on_event_timer_elapsed",
+    "on_event_effect_result",
+    "on_event_phase_entered",
+    "on_event_trigger_entered",
+    "on_event_trigger_exited",
+    "on_event_squad_state",
+    "on_event_entity_spawned",
+    "on_event_entity_died",
+    "on_event_scene_finished",
+    "on_event_objective_progress",
+    "on_event_entity_slots_requested",
+    "on_event_session_joined",
+    "on_event_session_left",
+    "on_event_player_trigger",
+    "on_event_cinematic_started",
+    "on_event_cinematic_terminated",
+    "on_event_ghost_link_state",
+    "on_event_actor_path_state",
+    "on_event_object_interacted",
+    "on_event_cinematic_skip_requested",
+    "on_event_fireteam_state",
+    "on_event_object_state",
+    "on_event_damage_state",
+    "on_event_squad_provoked",
+    "on_event_device_state",
+    "on_event_region_changed",
+    "on_event_dialogue_staged",
+    "on_event_dialogue_finished",
+}};
+
+static_assert([] {
+    for (const auto* name : kEventHandlerNames) {
+        if (name == nullptr) {
+            return false;
+        }
+    }
+    return true;
+}());
 
 /** Captures immutable callback references while table access remains inside lua_pcall. */
 [[nodiscard]] int capture_program(lua_State* state) {
@@ -173,28 +222,23 @@ static_assert(std::size(api::kEvents) == host::kEventKindCount);
     if (impl == nullptr || lua_type(state, 1) != LUA_TTABLE) {
         return luaL_error(state, "mission chunk must return one program table");
     }
-    for (const std::string_view key : api::kRefusedProgramKeys) {
-        lua_pushlstring(state, key.data(), key.size());
-        lua_rawget(state, 1);
-        const bool refused = !lua_isnil(state, -1);
-        lua_pop(state, 1);
-        if (refused) {
-            // The keys are string literals, so data() is null-terminated.
-            return luaL_error(
-                state, "%s is unsupported; use one on_event_<type> callback", key.data());
-        }
+    lua_pushliteral(state, "on_event");
+    lua_rawget(state, 1);
+    const bool genericEventHandler = !lua_isnil(state, -1);
+    lua_pop(state, 1);
+    if (genericEventHandler) {
+        return luaL_error(state, "on_event is unsupported; use one on_event_<type> callback");
     }
     if (!capture_initial_state(state, 1, *impl)) {
         return luaL_error(state,
                           "initial_state must be a generated state with an integer region_index");
     }
-    if (!capture_handler(state, 1, program_key("on_start"), impl->startReference)
-        || !capture_handler(state, 1, program_key("on_load"), impl->loadReference)) {
+    if (!capture_handler(state, 1, "on_start", impl->startReference)
+        || !capture_handler(state, 1, "on_load", impl->loadReference)) {
         return luaL_error(state, "mission entries must be functions or nil");
     }
-    for (std::size_t index = 0; index < std::size(api::kEvents); ++index) {
-        if (!capture_handler(
-                state, 1, api::kEvents[index].callback.data(), impl->eventReferences[index])) {
+    for (std::size_t index = 0; index < kEventHandlerNames.size(); ++index) {
+        if (!capture_handler(state, 1, kEventHandlerNames[index], impl->eventReferences[index])) {
             return luaL_error(state, "mission event entries must be functions or nil");
         }
     }
@@ -291,7 +335,8 @@ void initialize_candidate(const Impl& impl, Candidate& candidate) noexcept {
 
 /** Consumes only the exact active timer represented by an internal elapsed event. */
 [[nodiscard]] bool consume_elapsed_timer(Candidate& candidate, const host::Event& event) noexcept {
-    if (event.kind != host::EventKind::timerElapsed) {
+    if (event.kind != host::EventKind::timerElapsed
+        && event.kind != host::EventKind::dialogueFinished) {
         return true;
     }
     for (std::size_t index = 0; index < candidate.timerCount; ++index) {
@@ -308,6 +353,51 @@ void initialize_candidate(const Impl& impl, Candidate& candidate) noexcept {
         return true;
     }
     return false;
+}
+
+/**
+ * Arms or replaces the runtime timer that closes the cue a dialogueStaged event reports.
+ * The timer commits with this callback even when the program has no handler for the event. A full
+ * timer table or an exhausted timer sequence leaves the cue without a timer; the runtime logs the
+ * full table before it dispatches.
+ */
+void arm_dialogue_timer(Candidate& candidate,
+                        const host::Event& event,
+                        std::uint64_t now) noexcept {
+    StateKey key{};
+    if (event.kind != host::EventKind::dialogueStaged
+        || !dialogue_timer_key(event.dialogueSlotRow, event.dialogueCue, key)
+        || candidate.nextTimerSequence == state::activity::mission::kAbsentTimerSequence) {
+        return;
+    }
+    const std::string_view name(key.bytes.data(), key.length);
+    std::size_t row = 0;
+    while (row < candidate.timerCount
+           && std::string_view(candidate.timers[row].key.bytes.data(),
+                               candidate.timers[row].key.length)
+                  < name) {
+        ++row;
+    }
+    const bool replaces = row < candidate.timerCount && same_key(candidate.timers[row].key, key);
+    if (!replaces) {
+        if (candidate.timerCount == candidate.timers.size()) {
+            return;
+        }
+        for (std::size_t move = candidate.timerCount; move > row; --move) {
+            candidate.timers[move] = candidate.timers[move - 1];
+        }
+        ++candidate.timerCount;
+    }
+    const std::uint64_t sequence = candidate.nextTimerSequence;
+    candidate.nextTimerSequence = sequence == (std::numeric_limits<std::uint64_t>::max)()
+                                      ? state::activity::mission::kAbsentTimerSequence
+                                      : sequence + 1;
+    const std::uint64_t delay = event.dialogueDurationMs;
+    candidate.timers[row] = {key,
+                             now > (std::numeric_limits<std::uint64_t>::max)() - delay
+                                 ? (std::numeric_limits<std::uint64_t>::max)()
+                                 : now + delay,
+                             sequence};
 }
 
 /** Publishes one callback candidate without allowing its revision to wrap. */
@@ -379,6 +469,9 @@ void initialize_candidate(const Impl& impl, Candidate& candidate) noexcept {
         impl.faulted = true;
         return CallStatus::scriptError;
     }
+    if (event != nullptr) {
+        arm_dialogue_timer(frame.candidate, *event, now);
+    }
     frame.handler = handler;
     frame.event = event;
     frame.clientMessage = clientMessage;
@@ -392,12 +485,9 @@ void initialize_candidate(const Impl& impl, Candidate& candidate) noexcept {
     lua_sethook(impl.state, nullptr, 0, 0);
     impl.frame = nullptr;
 
-    if (result != LUA_OK || frame.moduleOwnershipFailed) {
+    if (result != LUA_OK) {
         detail::set_error(
-            impl,
-            frame.moduleOwnershipFailed
-                ? "module source ownership unavailable"
-                : existing_error(impl.state, "mission callback failed with a non-string error"));
+            impl, existing_error(impl.state, "mission callback failed with a non-string error"));
         lua_settop(impl.state, 0);
         collect_after_transaction(impl);
         ++impl.refusedCallbacks;
@@ -441,43 +531,6 @@ bool rebind(Vm& vm, const ProgramIdentity& identity, const DefinitionApi& defini
     return true;
 }
 
-/** The scratch arena is freed before return, so a failed check leaves no Lua state behind. */
-bool check_syntax(std::span<const char> source,
-                  const char* chunkName,
-                  std::span<char> error) noexcept {
-    const auto report = [error](std::string_view text) noexcept {
-        if (error.empty()) {
-            return;
-        }
-        const std::size_t length = (std::min)(text.size(), error.size() - 1);
-        std::copy_n(text.data(), length, error.data());
-        error[length] = '\0';
-    };
-    const auto text = compile_source(source);
-    if (text.empty() || source.size() > kSourceByteCapacity) {
-        report("mission source is empty or exceeds 128 KiB");
-        return false;
-    }
-    detail::Arena arena{};
-    if (!detail::arena_initialize(arena)) {
-        report("mission arena block could not be taken from the heap");
-        return false;
-    }
-    lua_State* const state = lua_newstate(&detail::arena_allocate, &arena);
-    if (state == nullptr) {
-        detail::arena_release(arena);
-        report("Lua state exceeded its fixed arena");
-        return false;
-    }
-    const int compiled = luaL_loadbufferx(state, text.data(), text.size(), chunkName, "t");
-    if (compiled != LUA_OK) {
-        report(existing_error(state, "mission compile failed with a non-string error"));
-    }
-    lua_close(state);
-    detail::arena_release(arena);
-    return compiled == LUA_OK;
-}
-
 /** Compiles and validates one build-bound text chunk in a fresh arena. */
 OpenStatus open(Vm& vm,
                 const ProgramIdentity& identity,
@@ -486,8 +539,7 @@ OpenStatus open(Vm& vm,
     Impl& impl = VmAccess::get(vm);
     detail::destroy_state(impl);
     impl.arenaBytesAfterClose = 0;
-    const auto text = compile_source(source);
-    if (text.empty() || source.size() > kSourceByteCapacity) {
+    if (source.empty() || source.size() > kSourceByteCapacity) {
         detail::set_error(impl, "mission source is empty or exceeds 128 KiB");
         impl.faulted = true;
         return OpenStatus::sourceTooLarge;
@@ -541,7 +593,7 @@ OpenStatus open(Vm& vm,
         return status;
     }
     const int compiled =
-        luaL_loadbufferx(impl.state, text.data(), text.size(), identity.activityId.data(), "t");
+        luaL_loadbufferx(impl.state, source.data(), source.size(), identity.activityId.data(), "t");
     if (compiled != LUA_OK) {
         detail::set_error(
             impl, existing_error(impl.state, "mission compile failed with a non-string error"));
@@ -558,13 +610,10 @@ OpenStatus open(Vm& vm,
     const int executed = lua_pcall(impl.state, 0, 1, 0);
     lua_sethook(impl.state, nullptr, 0, 0);
     impl.frame = nullptr;
-    if (executed != LUA_OK || loadFrame.moduleOwnershipFailed) {
+    if (executed != LUA_OK) {
         detail::set_error(
             impl,
-            loadFrame.moduleOwnershipFailed
-                ? "module source ownership unavailable"
-                : existing_error(impl.state,
-                                 "mission initialization failed with a non-string error"));
+            existing_error(impl.state, "mission initialization failed with a non-string error"));
         const OpenStatus status = executed == LUA_ERRMEM || loadFrame.memoryExceeded
                                       ? OpenStatus::outOfMemory
                                       : OpenStatus::runtimeError;
@@ -781,6 +830,15 @@ bool initial_state_omissions(const Vm& vm,
     return true;
 }
 
+/** @return True when one mission timer is armed under this exact state key. */
+bool timer_armed(const Vm& vm, const StateKey& key) noexcept {
+    const Impl& impl = VmAccess::get(vm);
+    return impl.active
+           && std::any_of(impl.timers.begin(),
+                          impl.timers.begin() + static_cast<std::ptrdiff_t>(impl.timerCount),
+                          [&](const MissionTimer& timer) { return same_key(timer.key, key); });
+}
+
 /** Copies the next unread outbox action without consuming it; false when none is pending. */
 bool pending_intent(const Vm& vm, Intent& output) noexcept {
     const Impl& impl = VmAccess::get(vm);
@@ -812,6 +870,81 @@ bool snapshot_intents(const Vm& vm, std::vector<Intent>& output) noexcept {
         return false;
     }
     return true;
+}
+
+bool runtime_timer_key(const StateKey& key) noexcept {
+    return key.length <= key.bytes.size()
+           && std::string_view(key.bytes.data(), key.length).starts_with(kRuntimeTimerPrefix);
+}
+
+bool dialogue_timer_key(std::uint32_t slotRow, std::uint16_t cue, StateKey& output) noexcept {
+    output = {};
+    // sunrise/dialogue/<slot row>/<cue>, both in decimal; the longest name fits the key storage.
+    char* cursor = output.bytes.data();
+    char* const end = output.bytes.data() + output.bytes.size() - 1;
+    const auto append = [&](std::string_view text) {
+        if (static_cast<std::size_t>(end - cursor) < text.size()) {
+            return false;
+        }
+        cursor = std::copy(text.begin(), text.end(), cursor);
+        return true;
+    };
+    if (!append(kRuntimeTimerPrefix) || !append(kDialogueTimerKind)) {
+        output = {};
+        return false;
+    }
+    auto written = std::to_chars(cursor, end, slotRow);
+    if (written.ec != std::errc{}) {
+        output = {};
+        return false;
+    }
+    cursor = written.ptr;
+    if (!append("/")) {
+        output = {};
+        return false;
+    }
+    written = std::to_chars(cursor, end, cue);
+    if (written.ec != std::errc{}) {
+        output = {};
+        return false;
+    }
+    output.length = static_cast<std::uint8_t>(written.ptr - output.bytes.data());
+    return true;
+}
+
+bool parse_dialogue_timer_key(const StateKey& key,
+                              std::uint32_t& slotRow,
+                              std::uint16_t& cue) noexcept {
+    slotRow = 0;
+    cue = 0;
+    if (!runtime_timer_key(key)) {
+        return false;
+    }
+    std::string_view name(key.bytes.data(), key.length);
+    name.remove_prefix(kRuntimeTimerPrefix.size());
+    if (!name.starts_with(kDialogueTimerKind)) {
+        return false;
+    }
+    name.remove_prefix(kDialogueTimerKind.size());
+    const std::size_t separator = name.find('/');
+    if (separator == std::string_view::npos) {
+        return false;
+    }
+    // Only the canonical decimal spelling dialogue_timer_key writes is accepted.
+    const auto canonical = [](std::string_view digits) {
+        return !digits.empty() && (digits.size() == 1 || digits.front() != '0');
+    };
+    const std::string_view slotDigits = name.substr(0, separator);
+    const std::string_view cueDigits = name.substr(separator + 1);
+    if (!canonical(slotDigits) || !canonical(cueDigits)) {
+        return false;
+    }
+    const auto slotRead =
+        std::from_chars(slotDigits.data(), slotDigits.data() + slotDigits.size(), slotRow);
+    const auto cueRead =
+        std::from_chars(cueDigits.data(), cueDigits.data() + cueDigits.size(), cue);
+    return slotRead.ec == std::errc{} && slotRead.ptr == slotDigits.data() + slotDigits.size()
+           && cueRead.ec == std::errc{} && cueRead.ptr == cueDigits.data() + cueDigits.size();
 }
 
 /** Copies complete durable script state without changing its revision. */
@@ -851,6 +984,12 @@ void consume_intent(Vm& vm) noexcept {
         impl.outbox.clear();
         impl.outboxRead = 0;
     }
+}
+
+void discard_intents(Vm& vm) noexcept {
+    Impl& impl = VmAccess::get(vm);
+    std::vector<Intent>{}.swap(impl.outbox);
+    impl.outboxRead = 0;
 }
 
 void fault(Vm& vm, std::string_view reason) noexcept {

@@ -1,4 +1,6 @@
+#include <array>
 #include <cstdint>
+#include <cstdio>
 #include <limits>
 #include <string_view>
 
@@ -253,6 +255,7 @@ void clear_delivery(RuntimeInstance& instance) noexcept {
     instance.expectedScriptableRevision = 0;
     instance.deliveryDeadline = 0;
     instance.firstIntentAttempt = 0;
+    instance.nextIntentAttempt = 0;
     instance.intentAttempts = 0;
     instance.lastIntentStatus = (std::numeric_limits<std::uint16_t>::max)();
     instance.deliveryStage = DeliveryStage::idle;
@@ -328,6 +331,37 @@ void report_intent_status(RuntimeInstance& instance,
 
 namespace {
 
+/**
+ * Queues the dialogueStaged event of one staged cue; its dispatch arms the timer that finishes it.
+ * A cue the catalog has no cue row for is logged and gets no timer.
+ */
+void queue_dialogue_staged(RuntimeInstance& instance, const lua_vm::Intent& intent) noexcept {
+    host::Event event{};
+    event.kind = host::EventKind::dialogueStaged;
+    event.binding = instance.view.binding;
+    event.sequence = intent.requestKey;
+    event.sourceGeneration = instance.view.activityClientGeneration;
+    event.missionSequence = instance.lastMissionSequence;
+    if (intent.secondRow > (std::numeric_limits<std::uint16_t>::max)()
+        || !describe_dialogue_cue(
+            instance, intent.firstRow, static_cast<std::uint16_t>(intent.secondRow), event)) {
+        std::array<char, 48> fields{};
+        const int written = std::snprintf(fields.data(),
+                                          fields.size(),
+                                          "slot_row=%u cue=%u",
+                                          static_cast<unsigned>(intent.firstRow),
+                                          static_cast<unsigned>(intent.secondRow));
+        log_line(core::log::Level::warn,
+                 &instance,
+                 "dialogue",
+                 "cue_undefined",
+                 written > 0 ? std::string_view(fields.data(), static_cast<std::size_t>(written))
+                             : std::string_view{});
+        return;
+    }
+    push_program_event(instance, event);
+}
+
 /** Clears one VM and State head only after the same Host revision reached transport. */
 void complete_delivery(RuntimeInstance& instance) noexcept {
     lua_vm::Intent intent{};
@@ -363,6 +397,7 @@ void complete_delivery(RuntimeInstance& instance) noexcept {
                 return;
             }
             instance.deliveryDeadline = 0;
+            instance.nextIntentAttempt = 0;
             instance.lastIntentStatus = (std::numeric_limits<std::uint16_t>::max)();
             instance.deliveryStage = DeliveryStage::idle;
             return;
@@ -391,6 +426,7 @@ void complete_delivery(RuntimeInstance& instance) noexcept {
                 return;
             }
             instance.deliveryDeadline = 0;
+            instance.nextIntentAttempt = 0;
             instance.lastIntentStatus = (std::numeric_limits<std::uint16_t>::max)();
             instance.deliveryStage = DeliveryStage::idle;
             return;
@@ -472,6 +508,9 @@ void complete_delivery(RuntimeInstance& instance) noexcept {
     case lua_vm::IntentKind::playDialogueCue:
         result = "dialogue_staged";
         break;
+    case lua_vm::IntentKind::beginAdieuEnding:
+        result = "adieu_ending_started";
+        break;
     case lua_vm::IntentKind::selectMissionState:
         result = "state_selected";
         break;
@@ -479,6 +518,9 @@ void complete_delivery(RuntimeInstance& instance) noexcept {
     ++instance.intentsTransportStaged;
     log_line(core::log::Level::info, &instance, "delivery", result);
     queue_effect_result(instance, intent, host::EffectOutcome::transportStaged);
+    if (intent.kind == lua_vm::IntentKind::playDialogueCue) {
+        queue_dialogue_staged(instance, intent);
+    }
     clear_delivery(instance);
 }
 
@@ -704,6 +746,9 @@ void retire_script_event(RuntimeInstance& instance) noexcept {
             instance.scriptEventRead = 0;
         }
     }
+    instance.firstScriptEventAttempt = 0;
+    instance.nextScriptEventAttempt = 0;
+    instance.scriptEventAttempts = 0;
 }
 
 /**

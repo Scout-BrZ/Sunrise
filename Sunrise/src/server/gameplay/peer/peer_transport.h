@@ -146,6 +146,11 @@ void deliver(const state::gameplay::Endpoint& from,
 [[nodiscard]] bool
 remote_address(std::uint64_t sessionId,
                std::array<std::byte, state::gameplay::kNetAddrBlobSize>& output) noexcept;
+/** Resolves the native address of the exact endpoint carrying this group. */
+[[nodiscard]] bool
+remote_address(const state::gameplay::Endpoint& endpoint,
+               std::uint64_t sessionId,
+               std::array<std::byte, state::gameplay::kNetAddrBlobSize>& output) noexcept;
 
 /** Host-reestablish is the widest out-of-band body currently emitted. */
 inline constexpr std::size_t kOutOfBandBodyCapacity = 136;
@@ -238,16 +243,10 @@ open_external_common(const state::gameplay::Endpoint& endpoint,
                                                    std::uint8_t expectedEpoch,
                                                    std::uint8_t nextEpoch) noexcept;
 
-/**
- * Reports whether all native gates permit one outbound external body.
- * TODO: no caller until the channel-2 per-type contribution builder lands.
- */
+/** Reports whether all native gates permit one outbound external body. */
 [[nodiscard]] bool external_outbound_eligible(std::uint64_t groupSessionId) noexcept;
 
-/**
- * @return True once that session's link holds a bound view and has finished connecting.
- * TODO: no caller until the channel-2 per-type contribution builder lands.
- */
+/** @return True once that session's link holds a bound view and has finished connecting. */
 [[nodiscard]] bool view_bound(std::uint64_t sessionId) noexcept;
 
 /**
@@ -275,8 +274,10 @@ struct LinkIdentity final {
 [[nodiscard]] bool link_identity(std::uint64_t sessionId, LinkIdentity& output) noexcept;
 
 /**
- * Sends any owed acknowledgement.
- * Without it the peer keeps retransmitting every reliable message it has sent.
+ * Sends any owed acknowledgement. Without it the peer keeps retransmitting every reliable
+ * message it has sent. A concurrent or reentrant call returns without changing owed work.
+ * The active slice owns one reusable peer snapshot; sends still validate the live channel
+ * before transmission.
  * @param now Monotonic tick count in milliseconds.
  */
 void service(std::uint64_t now) noexcept;
@@ -286,6 +287,8 @@ void service(std::uint64_t now) noexcept;
  * @param sessionId Group session the link carries.
  */
 void drop(std::uint64_t sessionId) noexcept;
+/** Removes one group from its exact endpoint, preserving other members' links. */
+void drop(const state::gameplay::Endpoint& endpoint, std::uint64_t sessionId) noexcept;
 
 /**
  * Drops every link at one endpoint.

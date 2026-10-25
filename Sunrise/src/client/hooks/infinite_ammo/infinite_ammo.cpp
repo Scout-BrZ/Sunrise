@@ -180,17 +180,13 @@ bool install() noexcept {
     return true;
 }
 
-/** Detaches every detour. A failed detach keeps the handles, so the detours still reach the
- *  originals. */
+/** Detaches every detour. */
 void uninstall() noexcept {
     if (g_handles[kReservesSlot].original == nullptr) {
         return;
     }
-    if (!hooking::detour::uninstall(g_handles)) {
-        core::log::write(core::log::Channel::client,
-                         core::log::Level::warn,
-                         "ev=infinite_ammo stage=uninstall result=fail");
-    }
+    (void)hooking::detour::uninstall(g_handles);
+    g_handles = {};
 }
 
 } // namespace sunrise::client::hooks::infinite_ammo

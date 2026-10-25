@@ -120,17 +120,13 @@ void clear_rich_presence() noexcept {
 
 /** Serves one retained rich-presence value back to the local user. */
 const char* rich_presence_value(std::string_view key) noexcept {
-    // A copy, not the table: a writer on another thread may change the table after the unlock.
-    thread_local std::array<char, kRichPresenceValueSize> copy{};
     AcquireSRWLockShared(&runtime::storage::g_stateLock);
     const SteamState& state = runtime::storage::g_state.steam;
     const std::size_t index = find_rich_presence(state, key);
-    const bool found = index < state.richPresenceCount;
-    if (found) {
-        copy = state.richPresence[index].value;
-    }
+    const char* result =
+        index < state.richPresenceCount ? state.richPresence[index].value.data() : kEmptyText;
     ReleaseSRWLockShared(&runtime::storage::g_stateLock);
-    return found ? copy.data() : kEmptyText;
+    return result;
 }
 
 /** Reports how many rich-presence pairs the local user currently publishes. */
@@ -146,17 +142,13 @@ const char* rich_presence_key(int index) noexcept {
     if (index < 0) {
         return kEmptyText;
     }
-    // A copy, not the table: a writer on another thread may change the table after the unlock.
-    thread_local std::array<char, kRichPresenceKeySize> copy{};
     AcquireSRWLockShared(&runtime::storage::g_stateLock);
     const SteamState& state = runtime::storage::g_state.steam;
     const auto slot = static_cast<std::size_t>(index);
-    const bool found = slot < state.richPresenceCount;
-    if (found) {
-        copy = state.richPresence[slot].key;
-    }
+    const char* result =
+        slot < state.richPresenceCount ? state.richPresence[slot].key.data() : kEmptyText;
     ReleaseSRWLockShared(&runtime::storage::g_stateLock);
-    return found ? copy.data() : kEmptyText;
+    return result;
 }
 
 /** Retains one achievement unlock keyed by its resolved API name. */

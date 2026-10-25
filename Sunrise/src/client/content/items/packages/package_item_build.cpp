@@ -15,9 +15,9 @@
 #include "../../scenarios/scenario_build.h"
 #include "../../spawn_sets/spawn_set_build.h"
 #include "../../vendors/vendor_build.h"
+#include "../../quests/red_war_quest_build.h"
 #include "build.h"
 #include "internal.h"
-#include "package_reward_build.h"
 #include "package_socket_plug_build.h"
 
 namespace sunrise::client::content::items::packages {
@@ -35,13 +35,12 @@ namespace {
            && state::build_data::ability_buckets_ready()
            && state::build_data::socket_entry_buckets_ready()
            && state::build_data::progression_definitions_ready()
-           && state::build_data::season_pass_ready() && reward_definitions_settled()
+           && state::build_data::season_pass_ready()
            && state::build_data::repeatable_bounties_ready()
            && state::build_data::record_definitions_ready()
            && state::build_data::node_definitions_ready()
            && state::build_data::sobject_definitions_ready()
-           && state::build_data::investment_constants_ready()
-           && state::build_data::starter_sets_ready() && exotic_catalysts_settled();
+           && state::build_data::investment_constants_ready() && exotic_catalysts_settled();
 }
 
 } // namespace
@@ -86,6 +85,8 @@ bool build() noexcept {
         (void)content::spawn_sets::build(packageSource, storage.scratch);
         (void)content::hash_names::build(packageSource, storage.scratch);
         (void)content::vendors::build(packageSource, storage.scratch);
+        // Metadados opcionais da jornada, inclusive quando os itens vieram do cache.
+        (void)content::quests::build(packageSource, storage.scratch);
         if (ready()) {
             SecureZeroMemory(&keys, sizeof keys);
             return true;
@@ -128,8 +129,7 @@ bool build() noexcept {
             if (!state::build_data::item_definitions_ready()
                 || !state::build_data::record_definitions_ready()
                 || !state::build_data::node_definitions_ready()
-                || !state::build_data::season_pass_ready() || !reward_definitions_settled()
-                || !exotic_catalysts_settled()) {
+                || !state::build_data::season_pass_ready() || !exotic_catalysts_settled()) {
                 reason = "unlock_maps";
                 if (!read_unlock_slot_maps(
                         source, storage, std::span<const std::byte>{storage.root})) {
@@ -187,18 +187,11 @@ bool build() noexcept {
                         std::span(storage.progressionSteps).first(storage.progressionStepCount));
                 }
             }
-            // Pass rows bind through the reward condition tables, which load before the pools.
-            if (!reward_definitions_settled() || !state::build_data::season_pass_ready()) {
-                (void)storage.rewardBuild.load(
-                    source, storage.scratch, storage.root, storage.slotMaps);
-            }
-            if (!state::build_data::season_pass_ready() && storage.rewardBuild.conditions.loaded()
-                && build_season_pass(source, storage, std::span<const std::byte>{storage.root})
-                && !state::build_data::publish_season_pass(
-                    std::span(storage.seasonPassRewards).first(storage.seasonPassRewardCount))) {
-                core::log::write(core::log::Channel::client,
-                                 core::log::Level::warn,
-                                 "ev=pkg stage=season_pass result=fail reason=publish");
+            if (!state::build_data::season_pass_ready()
+                && build_season_pass(source, storage, std::span<const std::byte>{storage.root})) {
+                (void)state::build_data::publish_season_pass(
+                    std::span(storage.seasonPassRewards).first(storage.seasonPassRewardCount),
+                    std::span(storage.seasonPassPackages).first(storage.seasonPassPackageCount));
             }
             // Records are read before nodes: a node's lore-book flag and its parent bar come
             // from the records it owns, so the record rows must already be in pass storage.
@@ -228,12 +221,6 @@ bool build() noexcept {
                                               extracted)) {
                     (void)state::build_data::publish_investment_constants(extracted);
                 }
-            }
-            if (!state::build_data::starter_sets_ready()) {
-                (void)build_starter_sets(source,
-                                         storage.scratch,
-                                         std::span<const std::byte>{storage.root},
-                                         storage.child);
             }
             reason = "slot";
             if (!tables::slot_tag(

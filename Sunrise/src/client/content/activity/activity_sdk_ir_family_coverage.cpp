@@ -294,10 +294,7 @@ std::string_view stable_name(Status status) noexcept {
     return {};
 }
 
-/**
- * Renders the ledger as the JSON coverage report.
- * @return False when the ledger does not close or an allocation fails.
- */
+/** Renders the ledger as the JSON coverage report. @return False when the buffer is short. */
 bool render_json(const Ledger& ledger,
                  std::string& output,
                  Failure& failure,

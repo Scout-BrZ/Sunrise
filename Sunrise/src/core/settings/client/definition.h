@@ -2,11 +2,14 @@
 
 #include "../../ui/runtime/settings.h"
 #include "external/definition.h"
+#include "server_endpoint/definition.h"
 
 namespace sunrise::core::settings::client {
 
 /** Read-only Client settings parsed by Core. */
 struct Settings {
+    server_endpoint::Settings serverEndpoint;
+    std::uint64_t machineId{};
     /** In-game UI visibility and input policy. */
     ui::runtime::Settings userInterface;
     /** Points the Client at a server outside this process. Off answers everything in process. */
@@ -20,10 +23,6 @@ struct Settings {
      * On by default; a client stand-in until the unlock banks carry every gate the nodes read.
      */
     bool revealLoreBooks{true};
-    /** Unlocks the cheat tools. A session with them unlocked saves no progress. */
-    bool cheats{false};
-    /** Writes the installed package keys for Sunrise Studio at startup when requested. */
-    bool dumpPackageKeys{false};
 };
 
 } // namespace sunrise::core::settings::client

@@ -4,7 +4,6 @@
 #include <cwchar>
 #include <limits>
 
-#include "core/filesystem/path.h"
 #include "core/threading/data_mutex.h"
 #include "handle_cache.h"
 
@@ -56,7 +55,7 @@ acquire(std::span<FileSlot> slots, std::uint64_t& counter, const Path& path) noe
             return slot.file;
         }
     }
-    const HANDLE file = CreateFileW(core::path::extended(path.chars.data()).c_str(),
+    const HANDLE file = CreateFileW(path.chars.data(),
                                     GENERIC_READ,
                                     FILE_SHARE_READ,
                                     nullptr,

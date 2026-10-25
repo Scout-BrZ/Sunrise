@@ -29,17 +29,15 @@ enum class CueStatus : std::uint8_t {
     ambiguous,
     /** No tree carries the definition hash. */
     missing,
-    /** A tree carrying the definition hash is malformed. */
+    /** The matched tree is malformed or its duration differs from the authored one. */
     malformed,
-    /** The one tree carrying the definition hash differs from the authored duration. */
-    mismatched,
 };
 
-/** One cue in list order. Lines are present only for resolved and mismatched cues. */
+/** One cue in list order. Lines are present only for resolved cues. */
 struct Cue final {
     std::uint32_t definitionHash{};
-    /** Authored window from the definition row; a tree must last as long to resolve. */
-    float windowSeconds{};
+    /** Authored total: a sequence adds its children, a selection lasts its longest branch. */
+    float seconds{};
     std::uint32_t firstLine{};
     std::uint32_t lineCount{};
     CueStatus status{CueStatus::missing};

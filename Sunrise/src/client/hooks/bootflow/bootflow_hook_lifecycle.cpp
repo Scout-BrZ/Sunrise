@@ -13,8 +13,9 @@ std::atomic_bool g_installed{false};
 } // namespace
 
 /**
- * Finds the boot-step accessor and the slice-set sample targets, and attaches the lifetime probe.
- * @return True when all three are ready.
+ * Finds the boot-step accessor and the slice-set sample targets.
+ * Nothing is detoured: the boot steps run as shipped and the host answers them.
+ * @return True when both targets were found.
  */
 bool install() noexcept {
     const bool worldStep = install_world_step();
@@ -24,7 +25,7 @@ bool install() noexcept {
     return worldStep && sliceSet && probe;
 }
 
-/** Detaches the probe and clears both accessors, in the reverse order of install. */
+/** Clears both accessors, in the reverse order of install. */
 void uninstall() noexcept {
     uninstall_lifetime_gate_probe();
     spawn::uninstall_targets();
@@ -32,7 +33,7 @@ void uninstall() noexcept {
     g_installed.store(false, std::memory_order_release);
 }
 
-/** @return True while at least one accessor or the probe is installed. */
+/** @return True while at least one accessor is found. */
 bool is_installed() noexcept {
     return g_installed.load(std::memory_order_acquire);
 }

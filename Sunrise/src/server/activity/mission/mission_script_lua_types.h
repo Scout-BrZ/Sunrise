@@ -23,11 +23,6 @@ struct LifetimeHandle final {
     std::uint8_t marker{};
 };
 
-/** Read-only view of the config of the mod that supplied the program. */
-struct ModConfigHandle final {
-    std::uint8_t marker{};
-};
-
 struct EventHandle final {
     host::Event value{};
 };
@@ -120,10 +115,6 @@ inline void push_activity(lua_State* state) {
 
 inline void push_lifetime(lua_State* state) {
     push_handle(state, kLifetimeMetatable, LifetimeHandle{});
-}
-
-inline void push_mod_config(lua_State* state) {
-    push_handle(state, kModConfigMetatable, ModConfigHandle{});
 }
 
 inline void push_activity_binding_tag_collection(lua_State* state, ActivityBindingTagKind kind) {

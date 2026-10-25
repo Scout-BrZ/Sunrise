@@ -5,8 +5,11 @@
 #include <cstdint>
 #include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <span>
 
+#include "../../core/settings/settings.h"
+#include "../../state/activity/bubble_authority/ambassadors.h"
 #include "../../state/build_data/runtime.h"
 #include "../activity/host_runtime.h"
 #include "internal.h"
@@ -311,7 +314,8 @@ squad_override_available_locked(const Session& session,
 
 } // namespace
 
-/** Queues a squad placement only while exactly one authenticated link owns the binding. */
+/** Queues a squad placement only while the requested authenticated client generation owns the
+ * binding. */
 bool request_activity_squad_override(
     const state::activity::SessionBinding& binding,
     const activity::host::ScriptableTarget& target,
@@ -328,7 +332,8 @@ bool request_activity_squad_override(
     std::optional<middleware::bap::activity_message::squad_auth::SpawnRule> spawnRule) noexcept {
     const std::lock_guard lock(session_lock());
     std::size_t linkCount = 0;
-    const Session* const session = unique_activity_link_locked(binding, linkCount);
+    const Session* const session =
+        activity_link_for_generation_locked(binding, expectedGeneration, linkCount);
     const std::int32_t region = session != nullptr ? selected_region_index_locked(*session) : -1;
     const bool queued = expectedRegion >= 0 && expectedGeneration != 0 && session != nullptr
                         && session->activity.bindingGeneration == expectedGeneration
@@ -348,6 +353,68 @@ bool request_activity_squad_override(
                                                                   destination,
                                                                   spawnRule);
     return queued;
+}
+
+/** Picks the ActivityClient generation a squad body goes to in a shared activity. */
+SquadRoute squad_route(const state::activity::SessionBinding& binding,
+                       std::uint64_t ownerGeneration,
+                       std::uint32_t registryKey,
+                       std::uint16_t slotIndex,
+                       std::int32_t bubble) noexcept {
+    SquadRoute route{ownerGeneration, SquadRouteReason::owner};
+    if (ownerGeneration == 0 || !core::settings::get().server.activation.singlePrivateAmbassador) {
+        return route;
+    }
+    const std::shared_lock lock(session_lock());
+    const auto live = [&](const Session& session) noexcept {
+        return session.id != 0 && session.authenticated
+               && session.activity.role == ActivityClientRole::privateCurrent
+               && session.activity.bindingGeneration != 0
+               && state::activity::same_binding(session.activity.session, binding);
+    };
+    // A squad a link already retains stays on that link: its later bodies are composed onto the
+    // one that link holds, and a second link would spawn the squad again. Only that squad stays:
+    // the other squads of its object belong to whoever simulates the bubble now.
+    for (const Session& session : sessions()) {
+        const SquadOverrideLease& lease = session.activitySquadOverride;
+        if (registryKey == 0 || !live(session) || !lease.active
+            || lease.bindingGeneration != session.activity.bindingGeneration) {
+            continue;
+        }
+        for (std::size_t index = 0; index < lease.authCount; ++index) {
+            const RetainedSquadAuth& retained = lease.authBodies[index];
+            if (retained.groupIndex < lease.groupCount && retained.slotIndex == slotIndex
+                && lease.groups[retained.groupIndex].scopeTarget.registryKey == registryKey) {
+                return {session.activity.bindingGeneration, SquadRouteReason::retained};
+            }
+        }
+    }
+    std::uint64_t ambassador = 0;
+    if (bubble < 0 || bubble >= static_cast<std::int32_t>(
+                                    state::activity::bubble_authority::kAmbassadorBubbleCount)
+        || !state::activity::bubble_authority::bubble_ambassador(
+            binding.sessionId, static_cast<std::uint8_t>(bubble), ambassador)
+        || ambassador == 0) {
+        return route;
+    }
+    std::size_t matches = 0;
+    std::size_t privateLinks = 0;
+    std::uint64_t generation = 0;
+    for (const Session& session : sessions()) {
+        privateLinks += live(session) ? 1U : 0U;
+        if (live(session) && session.activityMemberKey == ambassador) {
+            generation = session.activity.bindingGeneration;
+            ++matches;
+        }
+    }
+    if (matches == 1) {
+        return {generation, SquadRouteReason::ambassador};
+    }
+    // A public activity is served on public-target links only, so it has no member link to pick
+    // and its squads simply stay on the owner's link.
+    route.reason =
+        privateLinks == 0 ? SquadRouteReason::owner : SquadRouteReason::ambassadorUnlinked;
+    return route;
 }
 
 } // namespace sunrise::server::bap

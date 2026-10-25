@@ -97,6 +97,8 @@ inline constexpr std::size_t kLiveTagCapacity = 1'024;
  * Packages register during the boot, so an early attempt reads fewer of them.
  */
 inline constexpr std::uint64_t kResolveWindowMs = 15'000;
+// Limita a coleta a seis janelas, preservando os resultados entre elas.
+inline constexpr std::uint32_t kResolveMaxRounds = 6;
 /** Tag reads one collection call may spend, for the same reason the roster walk is bounded. */
 inline constexpr std::size_t kResolveReadBudget = 150;
 
@@ -122,14 +124,16 @@ struct Storage {
     std::size_t liveRowCount{};
     /** Where the next resolve pass starts, so every pending row is retried in turn. */
     std::size_t resolveCursor{};
-    /** Tick after which the collection stops waiting for the rows that have not read. */
+    /** Prazo da janela atual; leituras pendentes podem abrir outra janela limitada. */
     std::uint64_t resolveDeadlineTick{};
     std::vector<std::byte> blob{};
     RosterStorage roster{};
     /** Resolved rows, moved to the front. The roster walk runs over exactly these. */
     std::size_t keptCount{};
-    /** Retried rounds of the resolve window, so a boot that never reads reports it once. */
+    /** Quantidade de janelas adicionais ja abertas, sem descartar resultados. */
     std::uint32_t resolveRounds{};
+    // Falha explicita: nao publica um catalogo parcial como concluido.
+    bool resolveFailed{};
     /** Set once the sweep and the name match are done, so they run once per boot. */
     bool collected{};
     /** Set once the resolved rows are compacted and the roster walk may start. */
@@ -151,18 +155,10 @@ collect_rows(const reader::Source& source, Storage& storage, const char*& reason
  * @param source Package directory and borrowed block keys.
  * @param scratch Lock-owned block storage.
  * @param storage Pass storage carrying the resolve cursor.
- * @return True when the collection has settled and may be compacted.
+ * @return True ao recuperar todos os candidatos ou encerrar a janela; o chamador verifica a contagem.
  */
 [[nodiscard]] bool
 resolve_pending(const reader::Source& source, reader::Scratch& scratch, Storage& storage) noexcept;
-
-/**
- * Reads the bubble layout of every row once, with no budget and no retry window.
- * @param source Package directory and block keys, which must already be known.
- * @param scratch Lock-owned block storage.
- * @param storage Pass storage whose rows are marked as they read.
- */
-void resolve_all(const reader::Source& source, reader::Scratch& scratch, Storage& storage) noexcept;
 
 /**
  * Moves every resolved row to the front of the row array.
@@ -171,8 +167,8 @@ void resolve_all(const reader::Source& source, reader::Scratch& scratch, Storage
 void compact_rows(Storage& storage) noexcept;
 
 /**
- * Re-arms the resolve window so a pass that read nothing tries the whole row set again.
- * @param storage Pass storage whose resolve state is cleared.
+ * Abre outra janela para as leituras pendentes, preservando as linhas recuperadas.
+ * @param storage Estado da coleta com os resultados ja recuperados.
  */
 void rearm_resolve(Storage& storage) noexcept;
 
@@ -227,6 +223,12 @@ struct Candidate {
     bool bindsPlayer{};
     bool reportsLifetime{};
     bool primaryRegistry{};
+};
+
+/** One group a destination publishes per bubble, and the bubbles it is published in. */
+struct BubbleCandidate {
+    std::uint16_t group{};
+    std::uint64_t mask{};
 };
 
 /** @return True when both groups carry the same registry key and full wire slot layout. */

@@ -45,7 +45,6 @@ inline constexpr std::size_t kRecordHashOffset = 0x28;
  * A collectible row carries the same field at the same offset, which joins the two.
  */
 inline constexpr std::size_t kLoreRowOffset = 0x2C;
-// TODO: read the lore table so incident grants stop authoring their lore ordinal ranges.
 /** Investment root slot of the lore table. */
 inline constexpr std::size_t kLoreTableSlot = 52;
 /** One lore row, and the definition hash inside it. */
@@ -82,6 +81,8 @@ inline constexpr std::uint32_t kRecordRewardRowClass = 0x80805A9BU;
 inline constexpr std::size_t kRecordRewardStride = 24;
 inline constexpr std::size_t kRecordRewardItemIndexOffset = 0;
 inline constexpr std::size_t kRecordRewardQuantityOffset = 4;
+/** One item index table row. Row +0 is the item's definition hash. */
+inline constexpr std::size_t kItemIndexRowStride = 24;
 /** Nonzero when the record's completion grants a character-equippable title. */
 inline constexpr std::size_t kRecordHasTitleOffset = 0xB8;
 /** Investment root slot of the four unlock value mapping tables. */
@@ -95,18 +96,22 @@ inline constexpr std::size_t kUnlockInstructionOperandOffset = 4;
 /** An expression field is a 64-bit count then a 64-bit self-relative offset. */
 inline constexpr std::size_t kUnlockExpressionFieldSize = 16;
 inline constexpr std::size_t kUnlockExpressionPointerOffset = 8;
-/** The evaluator's opcodes run to 27; anything wider means the field is not an expression. */
-inline constexpr std::uint32_t kUnlockOpcodeCeiling = 27;
+/** Opcodes run to fifteen; anything wider means the field is not an expression. */
+inline constexpr std::uint32_t kUnlockOpcodeCeiling = 20;
 /** The opcode that reads a value slot. */
 inline constexpr std::uint32_t kUnlockReadValueOpcode = 10;
 /** The opcode that tests a flag. */
 inline constexpr std::uint32_t kUnlockReadFlagOpcode = 1;
 /** The opcode that pushes a literal. */
 inline constexpr std::uint32_t kUnlockLiteralOpcode = 11;
-/** The opcode that expands a shared expression row. Its operand is the row index. */
-inline constexpr std::uint32_t kUnlockExpressionOpcode = 12;
 /** The opcode that tests greater than or equal. */
 inline constexpr std::uint32_t kUnlockGreaterEqualOpcode = 14;
+/** The opcode that inverts the value on top of the stack. Its operand is unused. */
+inline constexpr std::uint32_t kUnlockNotOpcode = 2;
+/** The opcode that folds the top two values with logical and. */
+inline constexpr std::uint32_t kUnlockAndOpcode = 4;
+/** The opcode that tests the top two values for equality. */
+inline constexpr std::uint32_t kUnlockEqualOpcode = 8;
 /** High half every installed array marker and element class carries. */
 inline constexpr std::uint32_t kDefinitionClassHigh = 0x8080U;
 /** Shift that leaves `kDefinitionClassHigh` from a marker or element class. */
@@ -125,11 +130,6 @@ inline constexpr std::size_t kNodeExpressionFieldAlternate = 48;
 /** Records a node owns, four bytes each as a row then a gate. */
 inline constexpr std::size_t kNodeChildRecordField = 136;
 inline constexpr std::size_t kNodeChildRecordStride = 4;
-/**
- * Array descriptor of the profile flag mapping table, between the account (+8) and character (+40)
- * maps. Profile flags are account-wide but saved in their own bank, not the account flag bank.
- */
-inline constexpr std::size_t kProfileFlagMapDescriptor = 24;
 /** Array descriptor of the character object's flag mapping table, sized to that bank. */
 inline constexpr std::size_t kCharacterFlagMapDescriptor = 40;
 /** Array descriptor of the character object's value mapping table, sized to that bank. */
@@ -223,9 +223,10 @@ inline constexpr std::size_t kProgressionRewardItemIndexOffset = 4;
 inline constexpr std::size_t kProgressionRewardQuantityOffset = 8;
 /** Unlock flag slot a reward's claim sets. The slots run dense in reward order. */
 inline constexpr std::size_t kProgressionRewardClaimSlotOffset = 20;
-/** Eligibility expressions and socket overrides carried by one progression reward. */
-inline constexpr std::size_t kProgressionRewardConditionsOffset = 24;
-inline constexpr std::size_t kProgressionRewardSocketsOffset = 40;
+/** Items a wrapper item opens into, two bytes each as an item-definition index. */
+inline constexpr std::size_t kGearsetItemField = 392;
+inline constexpr std::uint32_t kGearsetItemRowClass = 0x808087DBU;
+inline constexpr std::size_t kGearsetItemStride = 2;
 
 /** Expression that makes one collectible acquired, which a purchase or a grant sets. */
 inline constexpr std::size_t kCollectibleAcquiredExpressionField = 112;
@@ -255,7 +256,6 @@ struct IndexRow {
     std::uint32_t targetTag{};
 };
 
-// TODO: visit_index_rows has no caller yet; the open runtime extraction sources need it.
 /** Visitor called once per index-table row. */
 using RowVisitor = bool (*)(void* context, std::uint32_t index, const IndexRow& row) noexcept;
 
@@ -282,13 +282,6 @@ using RowVisitor = bool (*)(void* context, std::uint32_t index, const IndexRow& 
 [[nodiscard]] bool find_optional_array_at(std::span<const std::byte> blob,
                                           std::size_t descriptorOffset,
                                           Array& output) noexcept;
-
-/** Reads an optional typed array and checks every fixed-stride row lies in its blob. */
-[[nodiscard]] bool read_array(std::span<const std::byte> blob,
-                              std::size_t at,
-                              std::uint32_t elementClass,
-                              std::size_t stride,
-                              Array& rows) noexcept;
 
 /**
  * Finds the first array whose header names one element class.
@@ -335,8 +328,6 @@ slot_tag(std::span<const std::byte> blob, std::size_t index, std::uint32_t& tag)
 
 /** The investment root holds the item index table at this slot. */
 inline constexpr std::size_t kItemTableSlot = 48;
-/** The investment root holds the new-character table, one row of items per class, here. */
-inline constexpr std::size_t kStarterSetTableSlot = 15;
 /** The investment root holds the shared reusable/randomized plug-set table at this slot. */
 inline constexpr std::size_t kPlugSetTableSlot = 51;
 /** The investment root holds the dense ordinary socket-type table at this slot. */

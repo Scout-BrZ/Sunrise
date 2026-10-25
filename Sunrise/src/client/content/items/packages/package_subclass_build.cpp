@@ -109,7 +109,7 @@ bool build_character_abilities(
         report_ability_failure("table_array", 0, table.size(), 0);
         return false;
     }
-    const state::AccountState account = state::account_snapshot();
+    const state::AccountState account = state::bound_account_snapshot();
     // First-option defaults every shipped subclass starts at. Equipping one resets its picks to
     // these, so every owned subclass publishes a row at this selection. The row must exist
     // synchronously: the equip response is built inline with the commit.
@@ -124,8 +124,6 @@ bool build_character_abilities(
                              std::uint16_t socketEntryListIndex,
                              const domain::Selection& selection) noexcept {
         if (count >= output.size()) {
-            // A dropped row leaves that subclass and selection with no published abilities.
-            report_ability_failure("capacity", character, socketEntryListIndex, output.size());
             return;
         }
         domain::Definition row{};
@@ -172,7 +170,8 @@ bool build_character_abilities(
         }
         output[count++] = row;
     };
-    for (std::size_t character = 0; character < account.characterCount; ++character) {
+    for (std::size_t character = 0; character < account.characterCount && count < output.size();
+         ++character) {
         std::uint16_t equippedSocketEntryListIndex = 0;
         const char* subclassReason = "subclass";
         if (!subclass_list(

@@ -7,10 +7,6 @@
 #include "../../../state/build_data/scriptables/definition.h"
 #include "scriptable_catalog_container_index.h"
 
-namespace sunrise::client::content::scenarios {
-class LayoutSet;
-} // namespace sunrise::client::content::scenarios
-
 namespace sunrise::client::content::activity::scriptables::internal {
 
 using SpatialCancelCheck = bool (*)() noexcept;
@@ -33,29 +29,21 @@ private:
     friend struct StaticSpatialCacheAccess;
 };
 
-/**
- * Appends package spatial candidates whose stem and bubble mask match this scenario.
- * @param layouts Destination layouts to read the stem from, or null for the ones State publishes.
- */
+/** Appends package spatial candidates whose stem and bubble mask match this scenario. */
 [[nodiscard]] bool
 append_static_spatial_candidates(const middleware::content::packages::reader::Source& source,
                                  middleware::content::packages::reader::Scratch& scratch,
                                  const ContainerIndex& containers,
-                                 const ::sunrise::client::content::scenarios::LayoutSet* layouts,
                                  std::string_view scenarioName,
                                  state::build_data::scriptables::Snapshot& output,
                                  SpatialCancelCheck cancel) noexcept;
 
-/**
- * Appends static-spatial rows while reusing complete tables from this package pass.
- * @param layouts Destination layouts to read the stem from, or null for the ones State publishes.
- */
+/** Appends static-spatial rows while reusing complete tables from this package pass. */
 [[nodiscard]] bool
 append_static_spatial_candidates(const middleware::content::packages::reader::Source& source,
                                  middleware::content::packages::reader::Scratch& scratch,
                                  StaticSpatialCache& cache,
                                  const ContainerIndex& containers,
-                                 const ::sunrise::client::content::scenarios::LayoutSet* layouts,
                                  std::string_view scenarioName,
                                  state::build_data::scriptables::Snapshot& output,
                                  SpatialCancelCheck cancel) noexcept;

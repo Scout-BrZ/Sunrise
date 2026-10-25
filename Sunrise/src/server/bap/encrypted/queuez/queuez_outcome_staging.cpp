@@ -24,7 +24,7 @@ namespace {
     std::copy(existing.begin(), existing.end(), output.begin());
     std::size_t used = existing.size();
 
-    const state::AccountState account = state::account_snapshot();
+    const state::AccountState account = state::bound_account_snapshot();
     middleware::datagen::family4::loadout::ResolvedLoadout loadout{};
     if (!mutation.prepared || mutation.characterIndex >= account.characterCount
         || account.characters[mutation.characterIndex].soid != mutation.characterSoid
@@ -98,6 +98,8 @@ bool stage_service_outcome(Scratch& scratch,
     publication = {};
     SessionState after{};
     bool armsRepush = false;
+    bool armsBannerRepush = false;
+    std::uint64_t bannerRoot = 0;
     std::uint64_t socialRosterRoot = 0;
     bool armsAbilityRefresh = false;
     const auto* changeCharacter = transaction_if<ChangeCharacter>(outcome);
@@ -127,7 +129,9 @@ bool stage_service_outcome(Scratch& scratch,
                                          written,
                                          after,
                                          armsRepush,
+                                         armsBannerRepush,
                                          outcome.subscriptionAnswered);
+        bannerRoot = outcome.subscription.familyRootSoid;
         // The subscribe is the only moment a family-two root arrives. Recorded rather than acted
         // on: the inline answer to this subscribe lands, so nothing is owed until an equip makes
         // what it published stale.
@@ -310,7 +314,7 @@ bool stage_service_outcome(Scratch& scratch,
         }
         middleware::secure_channel::advance_nonce(nonce);
         after = selection.after;
-        // Family zero and Family three no longer fit beside the enlarged upstream Family-four
+        // Family zero and Family three do not fit beside the enlarged upstream Family-four
         // selection notification in this bounded reply. Publish them through the already-proven
         // deferred refresh channel after the primary mutation commits.
         armsAbilityRefresh = true;
@@ -361,7 +365,7 @@ bool stage_service_outcome(Scratch& scratch,
             return false;
         }
     } else if (outcome.hasArtifactReset) {
-        const state::AccountState account = state::account_snapshot();
+        const state::AccountState account = state::bound_account_snapshot();
         std::uint64_t selectedCharacter = 0;
         for (std::size_t index = 0; index < account.characterCount; ++index) {
             if (account.characters[index].selected) {
@@ -457,11 +461,24 @@ bool stage_service_outcome(Scratch& scratch,
             held.familyRootSoid = after.pendingBannerRoot;
             SessionState heldAfter{};
             bool heldRepush = false;
+            bool heldBannerRepush = false;
             const SessionState heldBefore = after;
-            push::append_queuez_notification(
-                scratch, heldBefore, held, key, nonce, response, written, heldAfter, heldRepush);
+            push::append_queuez_notification(scratch,
+                                             heldBefore,
+                                             held,
+                                             key,
+                                             nonce,
+                                             response,
+                                             written,
+                                             heldAfter,
+                                             heldRepush,
+                                             heldBannerRepush);
             if (valid(heldAfter)) {
                 after = heldAfter;
+            }
+            if (heldBannerRepush) {
+                armsBannerRepush = true;
+                bannerRoot = held.familyRootSoid;
             }
         }
     } else {
@@ -479,6 +496,8 @@ bool stage_service_outcome(Scratch& scratch,
     }
     publication.armsFamily4Repush = armsRepush;
     publication.family4RepushRoot = armsRepush ? outcome.subscription.familyRootSoid : 0;
+    publication.armsBannerRepush = armsBannerRepush && bannerRoot != 0;
+    publication.bannerRepushRoot = publication.armsBannerRepush ? bannerRoot : 0;
     publication.socialRosterRepushRoot = socialRosterRoot;
     publication.armsAbilityRefresh = armsAbilityRefresh;
     return true;

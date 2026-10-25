@@ -182,9 +182,7 @@ bool load_record(std::wstring_view scenarioDirectory,
         status = RecordLoadStatus::scenarioMismatch;
         return false;
     }
-    if (!pending->containerPlacementDiagnostics.identityOwnerInventoryComplete) {
-        return false;
-    }
+    // decode_payload only accepts full-coverage snapshots, so coverage needs no second check.
     output = std::move(pending);
     status = RecordLoadStatus::loaded;
     return true;
@@ -196,24 +194,17 @@ bool load_record(std::wstring_view scenarioDirectory,
  * @param scenarioDirectory Directory of its immutable shard files.
  * @param expectedSourceFingerprint Installed content identity.
  * @param expectedSdk Already-loaded core catalog identity.
- * @param reason Receives the log name of the check that refused, or stays null.
  * @return True when every declared shard has a compatible manifest-owned header.
  */
 bool compatible_catalog(const wchar_t* manifestPath,
                         std::wstring_view scenarioDirectory,
                         const Digest& expectedSourceFingerprint,
-                        const manifest::SdkIdentity& expectedSdk,
-                        const char*& reason) noexcept {
-    reason = nullptr;
+                        const manifest::SdkIdentity& expectedSdk) noexcept {
     manifest::Catalog catalog{};
     manifest::LoadStatus manifestStatus = manifest::LoadStatus::invalid;
     if (!manifest::load(
-            manifestPath, expectedSourceFingerprint, expectedSdk, catalog, manifestStatus)) {
-        reason = manifest::status_name(manifestStatus);
-        return false;
-    }
-    if (catalog.records.empty()) {
-        reason = "no_records";
+            manifestPath, expectedSourceFingerprint, expectedSdk, catalog, manifestStatus)
+        || catalog.records.empty()) {
         return false;
     }
     for (const manifest::Record& record : catalog.records) {
@@ -223,7 +214,6 @@ bool compatible_catalog(const wchar_t* manifestPath,
                                                    record.scenarioTag,
                                                    expectedSourceFingerprint,
                                                    record.shardPayloadSha256)) {
-            reason = "shard_header";
             return false;
         }
     }

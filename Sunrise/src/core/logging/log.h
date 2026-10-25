@@ -26,8 +26,6 @@ enum class Level : unsigned char {
     warn,
     info,
     debug,
-    /** Per-row dumps, such as every roster Auth on every push. Off at the default threshold. */
-    trace,
     off,
 };
 
@@ -36,6 +34,7 @@ struct Settings {
     std::array<Level, static_cast<std::size_t>(Channel::count)> levels{};
     bool debuggerSink{true};
     bool fileSink{false};
+    bool clearOnMissionComplete{false};
 };
 
 /** Returns logging defaults with persistent output disabled. */
@@ -46,6 +45,9 @@ struct Settings {
 
 /** Closes active sinks and clears the bounded in-memory log view. */
 void shutdown() noexcept;
+
+/** Clears the bounded in-memory log view without changing active sinks. */
+void clear_history() noexcept;
 
 /** @return True while the channel threshold admits this severity. */
 [[nodiscard]] bool accepts(Channel channel, Level level) noexcept;

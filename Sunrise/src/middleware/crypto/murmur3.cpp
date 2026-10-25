@@ -3,8 +3,6 @@
 #include <cstdint>
 #include <vector>
 
-#include "../encoding/byte_order.h"
-
 namespace sunrise::middleware::crypto::murmur3 {
 
 namespace {
@@ -54,7 +52,11 @@ constexpr unsigned kFinalShift = 33;
  */
 [[nodiscard]] std::uint64_t read_word(std::span<const std::byte> input,
                                       std::size_t offset) noexcept {
-    return encoding::read_u64_le(input.subspan(offset).first<encoding::kU64Size>());
+    std::uint64_t value = 0;
+    for (std::size_t index = 0; index < sizeof(std::uint64_t); ++index) {
+        value |= std::to_integer<std::uint64_t>(input[offset + index]) << (index * kByteBits);
+    }
+    return value;
 }
 
 } // namespace

@@ -31,7 +31,8 @@ dispatch_actor_command(const RuntimeInstance& instance, const lua_vm::Intent& in
     }
     const auto squads = published->squads();
     if (intent.firstRow >= squads.size()
-        || !format::squad_runnable(squads[intent.firstRow].flags)) {
+        || (squads[intent.firstRow].flags & format::kSquadRunnableMask)
+               != format::kSquadRunnableMask) {
         return ActorCommandPolicyStatus::refused;
     }
     const auto commands = published->actor_command_definitions();

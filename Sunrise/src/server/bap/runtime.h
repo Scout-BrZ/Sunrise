@@ -18,6 +18,9 @@
 
 namespace sunrise::server::bap {
 
+/** Services shared-service links under the same lock as native request and nonce publication. */
+void service(std::uint64_t now) noexcept;
+
 /** Makes the next investment refresh pump take one more slice. */
 using InvestmentSliceConsumer = void (*)() noexcept;
 
@@ -51,6 +54,8 @@ struct ActivityLinkView final {
     bool publicTarget{};
     /** Last roster-build outcome reported on this link, for atomic diagnostics. */
     std::uint8_t rosterReason{};
+    /** SOID real do personagem para progresso persistente, independente da chave de replicacao. */
+    std::uint64_t characterSoid{};
     /** The player key this link's message 5 binds, which the client matches on its own datum. */
     std::uint64_t playerKey{};
 };
@@ -140,6 +145,37 @@ activity_link_count(const state::activity::SessionBinding& binding) noexcept;
 [[nodiscard]] bool activity_link_view(const state::activity::SessionBinding& binding,
                                       ActivityLinkView& output) noexcept;
 
+/** Resolves one native client generation without requiring other players to leave the activity. */
+[[nodiscard]] bool activity_link_view(const state::activity::SessionBinding& binding,
+                                      std::uint64_t generation,
+                                      ActivityLinkView& output) noexcept;
+
+/** Resolves the native member that owns a new mission program to one exact live generation. */
+[[nodiscard]] bool activity_link_view_for_member(const state::activity::SessionBinding& binding,
+                                                 std::uint64_t memberKey,
+                                                 ActivityLinkView& output) noexcept;
+
+/** One member's private ActivityClient in a shared activity. */
+struct ActivityMemberLink final {
+    std::uint64_t activityClientGeneration{};
+    std::uint64_t memberKey{};
+};
+
+/**
+ * Lists the private ActivityClients bound to one activity, one per member playing it.
+ * @param binding Exact activity session.
+ * @param output Receives the first links found; the rest are left out.
+ * @return How many were written.
+ */
+[[nodiscard]] std::size_t activity_member_links(const state::activity::SessionBinding& binding,
+                                                std::span<ActivityMemberLink> output) noexcept;
+
+/** Checks whether one exact ActivityClient can change its SDK selected-state roster lease. */
+[[nodiscard]] ActivityMissionSeedLeaseStatus
+activity_mission_seed_available(const state::activity::SessionBinding& binding,
+                                std::uint32_t scenarioRow,
+                                std::uint64_t expectedGeneration) noexcept;
+
 /** Reads one exact ActivityClient's connection-scoped SDK selected-state roster lease. */
 [[nodiscard]] ActivityMissionSeedLeaseStatus
 activity_mission_seed_lease(const state::activity::SessionBinding& binding,
@@ -168,6 +204,10 @@ activity_type23_override_available(const state::activity::SessionBinding& bindin
 [[nodiscard]] bool current_activity_link_view(std::int32_t localSliceSet,
                                               CurrentActivityLinkView& output) noexcept;
 
+/** Reads the exact ActivityClient inputs needed by the gameplay common root. */
+[[nodiscard]] bool activity_replication_view(const state::activity::SessionBinding& binding,
+                                             ActivityReplicationView& output) noexcept;
+
 /** Reads the unique ActivityClient whose activity session is the supplied view token. */
 [[nodiscard]] bool activity_replication_view_for_session(std::uint64_t activitySessionId,
                                                          ActivityReplicationView& output) noexcept;
@@ -175,16 +215,23 @@ activity_type23_override_available(const state::activity::SessionBinding& bindin
 /** Reads the unique ActivityClient bound to one gameplay group session. */
 [[nodiscard]] bool activity_replication_view_for_group(std::uint64_t groupSessionId,
                                                        ActivityReplicationView& output) noexcept;
+/** Exact native player ownership resolves a view when several accounts share its session. */
+[[nodiscard]] bool activity_replication_view_for_session(std::uint64_t activitySessionId,
+                                                         std::uint64_t accountSoid,
+                                                         std::uint64_t characterSoid,
+                                                         ActivityReplicationView& output) noexcept;
+/** Exact native player ownership resolves a view when several accounts share its group. */
+[[nodiscard]] bool activity_replication_view_for_group(std::uint64_t groupSessionId,
+                                                       std::uint64_t accountSoid,
+                                                       std::uint64_t characterSoid,
+                                                       ActivityReplicationView& output) noexcept;
 
 /** Queues activity message 44 on one exact ActivityClient generation. */
 [[nodiscard]] bool request_replication_epoch(const state::activity::SessionBinding& binding,
                                              std::uint64_t expectedGeneration,
                                              std::uint8_t requestedEpoch) noexcept;
 
-/**
- * Queues one msg-30 readback on an exact unique ActivityClient link.
- * TODO: no caller until fireteam departure cleanup lands; this and the three below wait on it.
- */
+/** Queues one msg-30 readback on an exact unique ActivityClient link. */
 [[nodiscard]] ActivityAuthorityQueryStatus
 request_activity_authority_query(const state::activity::SessionBinding& binding,
                                  std::uint64_t expectedGeneration,
@@ -208,7 +255,8 @@ activity_authority_reset_snapshot(const state::activity::SessionBinding& binding
                                   std::uint64_t expectedGeneration,
                                   ActivityAuthorityResetSnapshot& output) noexcept;
 
-/** Queues a type-23 override only while exactly one authenticated link owns the binding. */
+/** Queues a type-23 override only while the requested authenticated client generation owns the
+ * binding. */
 [[nodiscard]] bool request_activity_type23_override(
     const state::activity::SessionBinding& binding,
     const activity::host::ScriptableTarget& target,
@@ -219,7 +267,8 @@ activity_authority_reset_snapshot(const state::activity::SessionBinding& binding
     std::uint64_t expectedGeneration,
     const activity::host::ScriptableOutputReservation* reservation = nullptr) noexcept;
 
-/** Queues one activity lifetime change while exactly one authenticated link owns the binding. */
+/** Queues one activity lifetime change while the requested authenticated client generation owns the
+ * binding. */
 [[nodiscard]] bool request_activity_lifetime_override(
     const state::activity::SessionBinding& binding,
     std::uint8_t lifetimeState,
@@ -252,11 +301,13 @@ activity_authority_reset_snapshot(const state::activity::SessionBinding& binding
     activity::host::ScriptableOverrideKind kind =
         activity::host::ScriptableOverrideKind::sdkAuth) noexcept;
 
-/** Queues a type-31 arm or disarm only while exactly one authenticated link owns the binding. */
+/** Queues a type-31 arm or disarm only while the requested authenticated client generation owns the
+ * binding. */
 [[nodiscard]] bool request_activity_type31_override(
     const state::activity::SessionBinding& binding,
     const activity::host::ScriptableTarget& target,
     std::int32_t expectedRegion,
+    std::uint64_t expectedGeneration,
     const activity::host::ScriptableOutputReservation* reservation = nullptr,
     bool enabled = true) noexcept;
 
@@ -341,7 +392,8 @@ activity_authority_reset_snapshot(const state::activity::SessionBinding& binding
     std::uint64_t expectedGeneration,
     const activity::host::ScriptableOutputReservation* reservation = nullptr) noexcept;
 
-/** Queues a squad placement only while exactly one authenticated link owns the binding. */
+/** Queues a squad placement only while the requested authenticated client generation owns the
+ * binding. */
 [[nodiscard]] bool request_activity_squad_override(
     const state::activity::SessionBinding& binding,
     const activity::host::ScriptableTarget& target,
@@ -359,10 +411,51 @@ activity_authority_reset_snapshot(const state::activity::SessionBinding& binding
     std::optional<middleware::bap::activity_message::squad_auth::SpawnRule> spawnRule =
         std::nullopt) noexcept;
 
+/** Why a squad body goes to the link it goes to. */
+enum class SquadRouteReason : std::uint8_t {
+    /** The mission owner's link: a lone member, the switch is off, or no other link qualifies. */
+    owner,
+    /** The link that already retains this exact squad. */
+    retained,
+    /** The link of the member that simulates the squad's bubble. */
+    ambassador,
+    /** The bubble has an ambassador, but no single live link carries its member key. */
+    ambassadorUnlinked,
+};
+
+/** One routing decision for a squad body. */
+struct SquadRoute final {
+    std::uint64_t generation{};
+    SquadRouteReason reason{};
+};
+
+/**
+ * Picks the ActivityClient generation a squad body goes to in a shared activity.
+ * Only the game that simulates a bubble spawns its squads, so a squad goes to the link of its
+ * bubble's ambassador. A squad one link already retains keeps that link, so a later objective
+ * or placement composes onto the body that link holds; the other squads of its object follow
+ * the ambassador of the moment.
+ * @param binding Exact activity session.
+ * @param ownerGeneration Generation of the mission owner's link, the answer when nothing else is.
+ * @param registryKey Generated object key of the squad, or zero when it is not resolved yet.
+ * @param slotIndex Wire slot of the squad inside that object.
+ * @param bubble Bubble of the squad's authored occurrence, or -1 when unknown.
+ * @return The generation to address and why.
+ */
+[[nodiscard]] SquadRoute squad_route(const state::activity::SessionBinding& binding,
+                                     std::uint64_t ownerGeneration,
+                                     std::uint32_t registryKey,
+                                     std::uint16_t slotIndex,
+                                     std::int32_t bubble) noexcept;
+
 /** Cancels one exact typed override revision while excluding activity-link publication. */
 [[nodiscard]] bool
 cancel_activity_scriptable_override(const state::activity::SessionBinding& binding,
                                     std::uint64_t expectedRevision) noexcept;
+
+/** Cancels a pending raw incident while excluding activity-link publication. */
+[[nodiscard]] bool
+cancel_activity_host_incident(const state::activity::SessionBinding& binding) noexcept;
 
 #if defined(SUNRISE_BAP_FRAME_TEST)
 /**

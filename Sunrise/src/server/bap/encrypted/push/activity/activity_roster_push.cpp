@@ -1,8 +1,10 @@
+#include "activity_mission_seed_roster.h"
 #include "activity_roster_push.h"
 
 #include <Windows.h>
 
 #include <algorithm>
+#include <bit>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -11,15 +13,19 @@
 #include <string_view>
 
 #include "../../../../../core/logging/log.h"
+#include "../../../../../core/settings/settings.h"
 #include "../../../../../middleware/bap/activity_message/activity_host_control.h"
 #include "../../../../../middleware/bap/activity_message/sensor_auth_update.h"
 #include "../../../../../middleware/secure_channel/runtime.h"
+#include "../../../../../state/activity/bubble_authority/ambassadors.h"
 #include "../../../../../state/activity/bubble_authority/runtime.h"
 #include "../../../../../state/activity/membership/activity_membership_query.h"
 #include "../../../../../state/activity/runtime.h"
 #include "../../../../activity/host_runtime.h"
 #include "../../../../gameplay/peer/peer_transport.h"
 #include "../../../../gameplay/squad_entity_retirement.h"
+#include "activity_member_departure_push.h"
+#include "activity_member_roster.h"
 #include "activity_notification_frame.h"
 #include "activity_roster_device_publication.h"
 #include "internal.h"
@@ -63,6 +69,32 @@ host_output_status(RosterOutcome outcome) noexcept {
         }
     }
     return false;
+}
+
+/**
+ * Reports one bubble grant held back because another member simulates the bubble.
+ * @param session Link whose body goes out without the grant.
+ * @param region Region the grant would have named.
+ */
+void report_grant_withheld(const Session& session, std::int32_t region) noexcept {
+    const auto bubble = static_cast<std::uint8_t>(
+        region >> state::activity::bubble_authority::kSliceSetToBubbleShift);
+    std::uint64_t ambassador = 0;
+    static_cast<void>(state::activity::bubble_authority::bubble_ambassador(
+        session.activity.session.sessionId, bubble, ambassador));
+    std::array<char, core::log::kLineCapacity> line{};
+    const int written = std::snprintf(line.data(),
+                                      line.size(),
+                                      "ev=activity stage=grant result=withheld reason=ambassador "
+                                      "bubble=%u key=0x%llX ambassador=0x%llX",
+                                      static_cast<unsigned>(bubble),
+                                      static_cast<unsigned long long>(session.activityMemberKey),
+                                      static_cast<unsigned long long>(ambassador));
+    if (written > 0) {
+        core::log::write(core::log::Channel::server,
+                         core::log::Level::debug,
+                         {line.data(), static_cast<std::size_t>(written)});
+    }
 }
 
 } // namespace
@@ -113,6 +145,10 @@ bool append_roster_notification(
     if (written > response.size() || left) {
         return false;
     }
+    // Read before the body copies the estate: a change landing mid-build only makes the link
+    // look stale once more, never current while it is not.
+    const std::uint64_t estateRevision =
+        server::activity::host::scriptable_estate_revision(session.activity.session);
     const auto initialLeases = session.activityRosterGroupLeases;
     const bool initialRosterOwedForEpoch = session.activityRosterOwedForEpoch;
     const std::uint8_t initialRosterSends = session.activityRosterSends;
@@ -132,7 +168,9 @@ bool append_roster_notification(
         server::activity::host::pending_scriptable_override_for_activity_client(
             session.activity.session, session.activity.bindingGeneration, scriptablePending);
     const bool singleScriptableLink =
-        !hasScriptablePending || activity_link_count_locked(session.activity.session) == 1;
+        !hasScriptablePending
+        || activity_link_count_locked(session.activity.session, session.activity.bindingGeneration)
+               == 1;
     // A leave delta retires every group, so it carries no host state and no typed body. Both stay
     // owed and neither is spent on it.
     const bool ownsPending = hasScriptablePending && singleScriptableLink && !peerLeave;
@@ -150,7 +188,11 @@ bool append_roster_notification(
     // No unsolicited msg 5 while the client loads: with no slice set current it rewrites the live
     // presence mask and relinks sense records. The region report is answered solicited. Only the
     // private link's session sees the placement, so only it holds.
-    if (clientLoading && !solicited && !peerLeave
+    // As cinematics finais precisam publicar seus dados antes de fechar a chegada.
+    // A excecao exige estado, slot, destino e geracao validados pelo mesmo builder.
+    const bool cinematicArrivalPublication = clientLoading
+        && cinematic_arrival_publication_allowed(session, refresh);
+    if (clientLoading && !solicited && !peerLeave && !cinematicArrivalPublication
         && session.activity.role == ActivityClientRole::privateCurrent) {
         report_roster_deferral(session,
                                hostStatePending ? hostState.revision : 0,
@@ -235,7 +277,7 @@ bool append_roster_notification(
             destinationLength,
             epoch,
             lifetimePending ? scriptablePending.lifetimeState
-            : clientLoading ? server::activity::host::kLoadingLifetimeState
+            : (clientLoading && !cinematicArrivalPublication) ? server::activity::host::kLoadingLifetimeState
             : hasHostState  ? hostState.lifetimeState
                             : server::activity::host::kDefaultLifetimeState,
             bodyPending ? &authOverride : nullptr,
@@ -273,12 +315,8 @@ bool append_roster_notification(
     // then deactivates each row while its owner is still valid and unregisters it cleanly.
     std::size_t retiredGroups = 0;
     if (peerLeave) {
-        for (std::size_t index = 0; index < snapshot.roster.groupCount; ++index) {
-            snapshot.roster.groups[index].retired = true;
-        }
+        retire_member_roster(snapshot);
         retiredGroups = snapshot.roster.groupCount;
-        snapshot.authOverrides = {};
-        snapshot.senseOverrides = {};
     }
     // The grant is picked here and committed only once the frame reaches the caller, so a
     // discarded body leaves the bubble ungranted and the next push retries it.
@@ -294,48 +332,114 @@ bool append_roster_notification(
         enteringBubble
             ? static_cast<std::int32_t>(snapshot.region)
             : (pendingRegion >= 0 ? pendingRegion : static_cast<std::int32_t>(snapshot.region));
-    if (!peerLeave && !placedRetirementPending
-        && state::activity::bubble_authority::select_grant(
-            session.activity.session.sessionId,
-            grantRegion,
-            grant,
-            enteringBubble || client_region_ready(session, refresh))) {
+    // In a shared activity a private bubble's authority belongs to its ambassador's link alone.
+    const auto requester = [&session](std::int32_t region) noexcept -> std::uint64_t {
+        return core::settings::get().server.activation.singlePrivateAmbassador
+                       && session.activity.role == ActivityClientRole::privateCurrent
+                       && private_region(session, region)
+                   ? session.activityMemberKey
+                   : 0;
+    };
+    const auto bubble_of = [](std::int32_t region) noexcept {
+        return region >> state::activity::bubble_authority::kSliceSetToBubbleShift;
+    };
+    // A client leaving a bubble gives it up and releases its entities, then reports the bubble
+    // behind it as its pending leg, which the roster's own region follows. Granting from either
+    // handed a bubble back to a client standing outside it, and the entities it had released
+    // found no client to take them up: they stood still and respawned, and the bubble's vehicles
+    // and objects stopped answering. The bubble the client holds comes from its current leg.
+    const state::activity::membership::ClientPlacement placement =
+        state::activity::membership::reported_placement(session.activity.session.sessionId);
+    const std::int32_t heldRegion = placement.currentRegion >= 0
+                                        ? placement.currentRegion
+                                        : static_cast<std::int32_t>(snapshot.region);
+    // The bubble the client stands in: granted when it was never granted, or granted again once
+    // a bubble given up has settled with the client still there.
+    if (!peerLeave && !placedRetirementPending && heldRegion >= 0) {
+        bool heldWithheld = false;
+        if (state::activity::bubble_authority::select_grant(session.activity.session.sessionId,
+                                                            heldRegion,
+                                                            grant,
+                                                            client_region_ready(session, refresh),
+                                                            requester(heldRegion),
+                                                            &heldWithheld)) {
+            snapshot.hasGrant = true;
+            snapshot.grant.bubble = grant.bubble;
+            snapshot.grant.token = grant.token;
+        }
+    }
+    // The bubble ahead: granted before the slice-set switch only when it was never granted. A
+    // bubble given up is granted again only from the client's current leg, once it stands there.
+    bool grantWithheld = false;
+    if (!snapshot.hasGrant && !peerLeave && !placedRetirementPending && grantRegion >= 0
+        && (heldRegion < 0 || bubble_of(grantRegion) != bubble_of(heldRegion))
+        && state::activity::bubble_authority::select_grant(session.activity.session.sessionId,
+                                                           grantRegion,
+                                                           grant,
+                                                           false,
+                                                           requester(grantRegion),
+                                                           &grantWithheld)) {
         snapshot.hasGrant = true;
         snapshot.grant.bubble = grant.bubble;
         snapshot.grant.token = grant.token;
+    }
+    if (grantWithheld) {
+        report_grant_withheld(session, grantRegion);
     }
 
     const std::size_t initialWritten = written;
     auto initialNonce = nonce;
     server::gameplay::squad_entity_retirement::RetirementPlan entityRetirement{};
+    std::uint64_t retirementSequence{};
+    const bool epochCurrent =
+        state::activity::replication_sequence(session.activity.session, retirementSequence)
+        && retirementSequence == session.activity.replicationSequence
+        && retirementSequence != (std::numeric_limits<std::uint64_t>::max)();
     const auto retirementPriorEpoch = session.activity.replicationEpoch;
-    const auto& epochRequest = session.activityReplicationEpoch;
-    const auto retirementBaseEpoch =
-        epochRequest.staged && epochRequest.bindingGeneration == session.activity.bindingGeneration
-            ? epochRequest.generation
-            : retirementPriorEpoch;
+    const auto retirementBaseEpoch = retirementPriorEpoch;
     const auto retirementEpoch = static_cast<std::uint8_t>(retirementBaseEpoch + 1U);
     std::size_t messageSize = 0;
     RosterDecodeMap decodeMap{};
     const MissionSeedLease& stagedMissionSeed = session.activityMissionSeed;
-    // During the region-arrival window the pending revision's content is deliberately not in
-    // this body, so the pending revision neither forces a send nor commits as published.
+    // A chegada comum ainda publica o plano anterior. A excecao de cinematic so
+    // confirma a revisao se o builder materializou o novo plano inteiro neste corpo.
     const bool missionSeedPending =
         stagedMissionSeed.configured
         && stagedMissionSeed.bindingGeneration == session.activity.bindingGeneration
         && stagedMissionSeed.revision != stagedMissionSeed.publishedRevision
-        && !stagedMissionSeed.regionArrivalPending;
+        && (!stagedMissionSeed.regionArrivalPending
+            || stagedMissionSeed.cinematicArrivalPublicationRevision == stagedMissionSeed.revision);
     bool encoded = message::encode_sensor_auth_update(snapshot, scratch.responseBody, messageSize);
     const bool hasRetirement =
-        encoded && allowEntityRetirement
-        && (placedRetirementPending || (snapshot.hasGrant && enteringBubble))
+        encoded && (placedRetirementPending || (snapshot.hasGrant && enteringBubble))
         && server::gameplay::squad_entity_retirement::prepare_retirement(
             session.activity.session,
             session.activity.bindingGeneration,
             static_cast<std::uint8_t>(snapshot.region
                                       >> state::activity::bubble_authority::kSliceSetToBubbleShift),
             entityRetirement);
+    // A retirement-bearing roster must keep its grant and region cursor owed until the
+    // keepalive can atomically advance shared State immediately before copying the frame.
+    // Sending the roster alone would spend the entering-bubble trigger and strand its purge.
+    if (hasRetirement && (!allowEntityRetirement || !epochCurrent)) {
+        encoded = false;
+    }
     if (placedRetirementPending && allowEntityRetirement && !hasRetirement && !solicited) {
+        encoded = false;
+    }
+    // The bubble the client stands in, granted to it, takes back the entities given up there.
+    // Nothing else hands them to a client: without this they stand still and respawn, and the
+    // bubble's vehicles, altars and mines stop answering. A claim spends a replication epoch the
+    // way a purge does, so it waits for the same keepalive that may advance the shared sequence.
+    namespace control = middleware::bap::activity_message::host_control;
+    control::ClaimAuthorityBody claim{};
+    const bool hasClaim =
+        encoded && !hasRetirement && snapshot.hasGrant && heldRegion >= 0
+        && grant.bubble == bubble_of(heldRegion)
+        && core::settings::get().server.activation.claimReleasedEntities
+        && state::activity::bubble_authority::snapshot_released_entities(
+            session.activity.session.sessionId, grant.bubble, claim.slots);
+    if (hasClaim && (!allowEntityRetirement || !epochCurrent)) {
         encoded = false;
     }
     // An unsolicited body identical to the last delivered one is skipped. A solicited one never
@@ -367,12 +471,18 @@ bool append_roster_notification(
         session.activityRosterState = initialRosterState;
         session.activityRosterRegionEpoch = initialRegionEpoch;
         session.activityRosterRegionBubble = initialRegionBubble;
+        // The client already holds this exact body, estate included, so nothing is owed. A body
+        // left unchanged carried no replayed line, so one it passed over is settled as well.
+        if (!peerLeave) {
+            session.activityEstateRevision = estateRevision;
+            session.activityDialogueSerial =
+                (std::max)(session.activityDialogueSerial, session.activityDialogueSerialBuilt);
+        }
         report_roster_push(
             session, snapshot, name, 0, kNoGrant, RosterOutcome::unchanged, bodyHash, forced);
         return false;
     }
-    if (hasRetirement) {
-        namespace control = middleware::bap::activity_message::host_control;
+    if (encoded && hasRetirement) {
         const control::PurgeAuthorityBody retirement{
             .slots = entityRetirement.entities, .epoch = retirementEpoch, .reason = 0};
         std::array<std::byte, control::kPurgeAuthorityByteCount> retirementBytes{};
@@ -406,6 +516,23 @@ bool append_roster_notification(
         encoded
         && build_roster_decode_map(snapshot.roster, session.activity.bindingGeneration, decodeMap);
     encoded = encoded && stage_roster_device_publications(session, scratch, snapshot);
+    // The claim follows the body that grants its bubble. The roster's nonce is spent here, and the
+    // advance below spends the claim's.
+    if (encoded && hasClaim) {
+        middleware::secure_channel::advance_nonce(nonce);
+        claim.epoch = retirementEpoch;
+        std::array<std::byte, control::kClaimAuthorityByteCount> claimBytes{};
+        std::size_t claimSize{};
+        encoded = control::encode_claim_authority(claim, claimBytes, claimSize)
+                  && append_notification_frame(scratch,
+                                               session.activity.session.sessionId,
+                                               control::kClaimAuthorityMessageType,
+                                               std::span(claimBytes).first(claimSize),
+                                               key,
+                                               nonce,
+                                               response,
+                                               written);
+    }
     if (encoded) {
         middleware::secure_channel::advance_nonce(nonce);
         // The deferred answer is discharged by the body that carries it.
@@ -415,9 +542,13 @@ bool append_roster_notification(
         // `discard_staged_roster`.
         session.activityRosterStaged.grant = grant;
         session.activityRosterStaged.entityRetirement = entityRetirement;
+        session.activityRosterStaged.retirementSequence = retirementSequence;
         session.activityRosterStaged.retirementPriorEpoch = retirementPriorEpoch;
         session.activityRosterStaged.retirementBaseEpoch = retirementBaseEpoch;
         session.activityRosterStaged.retirementEpoch = retirementEpoch;
+        session.activityRosterStaged.claimEntities = claim.slots;
+        session.activityRosterStaged.claimBubble = grant.bubble;
+        session.activityRosterStaged.hasClaim = hasClaim;
         session.activityRosterStaged.decodeMap = decodeMap;
         session.activityRosterStaged.bindingGeneration = session.activity.bindingGeneration;
         session.activityRosterStaged.priorLeases = initialLeases;
@@ -427,6 +558,8 @@ bool append_roster_notification(
         session.activityRosterStaged.priorRegionEpoch = initialRegionEpoch;
         session.activityRosterStaged.priorRegionBubble = initialRegionBubble;
         session.activityRosterStaged.hostStateRevision = hostState.revision;
+        session.activityRosterStaged.estateRevision = estateRevision;
+        session.activityRosterStaged.dialogueSerial = session.activityDialogueSerialBuilt;
         session.activityRosterStaged.hostLifetimeState = snapshot.lifetime;
         // A link whose body has no participation record never held the spawn, so owes no answer.
         session.activityRosterStaged.awaitClientSync =
@@ -442,7 +575,8 @@ bool append_roster_notification(
             !peerLeave && missionSeed.configured
             && missionSeed.bindingGeneration == session.activity.bindingGeneration
             && missionSeed.revision != missionSeed.publishedRevision
-            && !missionSeed.regionArrivalPending;
+            && (!missionSeed.regionArrivalPending
+                || missionSeed.cinematicArrivalPublicationRevision == missionSeed.revision);
         session.activityRosterStaged.hasScriptableOverride = ownsPending;
         session.activityRosterStaged.stateLocalRegion = scriptablePending.target.stateLocalRegion;
         session.activityRosterStaged.activatesSquadOverride = squadPending;
@@ -516,6 +650,10 @@ bool append_roster_notification(
 
 bool validate_staged_roster(const Session& session) noexcept {
     const auto& staged = session.activityRosterStaged;
+    if (staged.staged && staged.hasClaim) {
+        return staged.bindingGeneration == session.activity.bindingGeneration
+               && staged.retirementPriorEpoch == session.activity.replicationEpoch;
+    }
     return !staged.staged || !staged.entityRetirement.pending
            || (staged.bindingGeneration == session.activity.bindingGeneration
                && staged.retirementPriorEpoch == session.activity.replicationEpoch
@@ -529,6 +667,11 @@ bool validate_staged_roster(const Session& session) noexcept {
 bool begin_staged_roster_publication(
     const Session& session, server::gameplay::entity_identities::PublicationLease& lease) noexcept {
     const auto& staged = session.activityRosterStaged;
+    // A claim pins no retained identity, only the epoch it was built on.
+    if (staged.staged && staged.hasClaim) {
+        return staged.bindingGeneration == session.activity.bindingGeneration
+               && staged.retirementPriorEpoch == session.activity.replicationEpoch;
+    }
     return !staged.staged || !staged.entityRetirement.pending
            || (staged.bindingGeneration == session.activity.bindingGeneration
                && staged.retirementPriorEpoch == session.activity.replicationEpoch
@@ -567,6 +710,54 @@ void note_client_entered(const Session& session) noexcept {
     }
 }
 
+/**
+ * A dialogue line plays for every member present in the activity at the moment it plays, and
+ * for no one else. An unfiltered line plays as it is sent, so a member still loading its region,
+ * or not yet bound, moves past it and never hears it; members already present get it on their own
+ * link at once. A filtered line plays only when a player enters its volume, so every member of the
+ * activity keeps it owed, and a member's client holds it until that member enters the volume too.
+ * @param owner Link whose delivered roster just carried the line.
+ * @param latest Serial of the newest line that delivery retained.
+ * @param filtered True when a line that delivery retained waits for its filter volume.
+ */
+void drop_dialogue_for_absent_members(const Session& owner,
+                                      std::uint64_t latest,
+                                      bool filtered) noexcept {
+    for (Session& member : sessions()) {
+        if (&member == &owner || !member.id || !member.authenticated
+            || member.activity.role == ActivityClientRole::none
+            || !state::activity::same_binding(member.activity.session, owner.activity.session)) {
+            continue;
+        }
+        const bool present =
+            member.activityRosterSends != 0 && member.activityPatchEpoch.seen
+            && member.activityPatchEpoch.bindingGeneration == member.activity.bindingGeneration
+            && client_region_ready(member, nullptr);
+        const bool missed = !present && !filtered;
+        if (missed) {
+            member.activityDialogueSerial = (std::max)(member.activityDialogueSerial, latest);
+        }
+        std::array<char, core::log::kLineCapacity> line{};
+        const int written =
+            std::snprintf(line.data(),
+                          line.size(),
+                          "ev=activity stage=dialogue_broadcast result=%s serial=%llu "
+                          "join=0x%016llX sends=%u epoch=%u region_ready=%u",
+                          missed ? "missed_absent" : present ? "owed" : "owed_filtered",
+                          static_cast<unsigned long long>(latest),
+                          static_cast<unsigned long long>(member.activityMemberKey),
+                          static_cast<unsigned>(member.activityRosterSends),
+                          member.activityPatchEpoch.seen ? 1U : 0U,
+                          client_region_ready(member, nullptr) ? 1U : 0U);
+        if (written > 0) {
+            core::log::write(core::log::Channel::server,
+                             core::log::Level::info,
+                             {line.data(),
+                              (std::min)(static_cast<std::size_t>(written), line.size() - 1)});
+        }
+    }
+}
+
 } // namespace
 
 /** Settles a staged roster body that reached the caller. */
@@ -583,6 +774,13 @@ void commit_staged_roster(Session& session) noexcept {
     // The BAP lock serializes publication and incoming activity messages, so replacing the whole
     // fixed map here exposes either the prior delivered roster or this complete delivered roster.
     session.activityRosterDecode = session.activityRosterStaged.decodeMap;
+    // A leave delta retires every group and carries no Auth body, so it settles no estate debt.
+    if (!session.activityRosterStaged.peerLeave) {
+        session.activityEstateRevision = session.activityRosterStaged.estateRevision;
+        // The lines this body replayed are heard now; no later roster may carry them again.
+        session.activityDialogueSerial =
+            (std::max)(session.activityDialogueSerial, session.activityRosterStaged.dialogueSerial);
+    }
     if (!session.activityRosterStaged.peerLeave) {
         const bool answeredArrival =
             session.activityRosterAwaitClientSync && !session.activityRosterStaged.awaitClientSync;
@@ -595,19 +793,7 @@ void commit_staged_roster(Session& session) noexcept {
         server::gameplay::squad_entity_retirement::commit_retirement(
             session.activityRosterStaged.entityRetirement);
         const auto& staged = session.activityRosterStaged;
-        session.activity.replicationEpoch = staged.retirementEpoch;
-        if (staged.retirementBaseEpoch != staged.retirementPriorEpoch) {
-            static_cast<void>(
-                server::gameplay::peer::commit_replication_epoch(session.activity.session,
-                                                                 session.activity.bindingGeneration,
-                                                                 staged.retirementPriorEpoch,
-                                                                 staged.retirementBaseEpoch));
-        }
-        static_cast<void>(
-            server::gameplay::peer::commit_replication_epoch(session.activity.session,
-                                                             session.activity.bindingGeneration,
-                                                             staged.retirementBaseEpoch,
-                                                             staged.retirementEpoch));
+        commit_replication_steps(session, staged.retirementSequence + 1);
         state::activity::bubble_authority::record_purge(session.activity.session.sessionId,
                                                         staged.entityRetirement.entities);
         auto& request = session.activityReplicationEpoch;
@@ -621,6 +807,29 @@ void commit_staged_roster(Session& session) noexcept {
     if (session.activityRosterStaged.hasGrant) {
         state::activity::bubble_authority::record_grant(session.activity.session.sessionId,
                                                         session.activityRosterStaged.grant);
+    }
+    if (session.activityRosterStaged.hasClaim) {
+        const auto& staged = session.activityRosterStaged;
+        commit_replication_steps(session, staged.retirementSequence + 1);
+        state::activity::bubble_authority::record_claim(
+            session.activity.session.sessionId, staged.claimBubble, staged.claimEntities);
+        unsigned slots = 0;
+        for (const std::byte byte : staged.claimEntities) {
+            slots += static_cast<unsigned>(std::popcount(std::to_integer<unsigned>(byte)));
+        }
+        std::array<char, core::log::kLineCapacity> line{};
+        const int count = std::snprintf(line.data(),
+                                        line.size(),
+                                        "ev=activity stage=claim result=published bubble=%u "
+                                        "slots=%u epoch=%u",
+                                        static_cast<unsigned>(staged.claimBubble),
+                                        slots,
+                                        static_cast<unsigned>(session.activity.replicationEpoch));
+        if (count > 0) {
+            core::log::write(core::log::Channel::server,
+                             core::log::Level::info,
+                             {line.data(), static_cast<std::size_t>(count)});
+        }
     }
     if (session.activityRosterStaged.hasHostState) {
         session.activityHostStateRevision = session.activityRosterStaged.hostStateRevision;
@@ -643,10 +852,21 @@ void commit_staged_roster(Session& session) noexcept {
         scriptableCommitReady = activate_staged_squad_override(session);
     }
     if (scriptableCommitReady) {
+        const std::uint64_t dialogueBefore =
+            server::activity::host::latest_dialogue_serial(session.activity.session);
         server::activity::host::note_scriptable_transport_staged(
             session.activity.session,
             session.activity.bindingGeneration,
             session.activityRosterStaged.scriptableOverride);
+        const std::uint64_t dialogueAfter =
+            server::activity::host::latest_dialogue_serial(session.activity.session);
+        if (dialogueAfter != dialogueBefore) {
+            drop_dialogue_for_absent_members(
+                session,
+                dialogueAfter,
+                server::activity::host::dialogue_filtered_after(session.activity.session,
+                                                                dialogueBefore));
+        }
     } else if (session.activityRosterStaged.hasScriptableOverride) {
         server::activity::host::note_scriptable_attempt(
             session.activity.session,

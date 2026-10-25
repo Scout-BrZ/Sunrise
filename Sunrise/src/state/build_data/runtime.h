@@ -23,14 +23,12 @@
 #include "nodes/definition.h"
 #include "progressions/definition.h"
 #include "records/definition.h"
-#include "rewards/definition.h"
 #include "scenarios/definition.h"
 #include "season_pass/definition.h"
 #include "sobjects/sobject_catalog.h"
 #include "socket_entry_buckets/definition.h"
 #include "socket_entry_lists/definition.h"
 #include "spawn_sets/definition.h"
-#include "starter_sets/definition.h"
 #include "vendors/definition.h"
 
 namespace sunrise::state::build_data::items::catalysts {
@@ -42,19 +40,12 @@ namespace sunrise::state::build_data {
 void invalidate_cache() noexcept;
 
 /**
- * Names the package content the mappings come from, so a changed mod set rebuilds the cache.
- * Call before initialize; zero stands for a host with no content manifest.
- * @param contentHash Leading bytes of the combined installed and mod fingerprint.
- */
-void bind_content(std::uint64_t contentHash) noexcept;
-
-/**
  * Loads the one build-data cache next to the module, when there is one.
  * Once a snapshot is on disk, later replacements are refused until State restarts. A failed first
  * commit withdraws that publication and restores nothing. Keep readers out until this returns.
  * @param module Loaded Sunrise DLL module, or null to turn off disk saving.
  * @param configuredEquipmentHash Hash of the authored equipment. Not a secret.
- * @return True when a valid cache loads or extraction can safely rebuild it.
+ * @return True when the cache is missing, stale, or passes every check.
  */
 [[nodiscard]] bool initialize(void* module, std::uint64_t configuredEquipmentHash) noexcept;
 
@@ -399,14 +390,13 @@ publish_progression_definitions(std::span<const progressions::Definition> defini
 [[nodiscard]] bool season_pass_ready() noexcept;
 
 /**
- * Publishes the season pass reward list with its fixed socket overrides.
+ * Publishes the season pass reward list and the wrapper items it grants, in one step.
  * @param rewards Complete reward rows in native reward order.
+ * @param packages Complete wrapper packages.
  * @return True when the rows pass the checks and any needed cache write succeeds.
  */
-[[nodiscard]] bool publish_season_pass(std::span<const season_pass::Reward> rewards) noexcept;
-
-/** Checks rows against the rules publish_season_pass applies to the whole list. */
-[[nodiscard]] bool valid_season_pass_rewards(std::span<const season_pass::Reward> rewards) noexcept;
+[[nodiscard]] bool publish_season_pass(std::span<const season_pass::Reward> rewards,
+                                       std::span<const season_pass::Package> packages) noexcept;
 
 /**
  * Reads one season pass reward row.
@@ -417,38 +407,17 @@ publish_progression_definitions(std::span<const progressions::Definition> defini
 [[nodiscard]] bool find_season_pass_reward(std::uint16_t rewardIndex,
                                            season_pass::Reward& reward) noexcept;
 
-/** @return Season pass reward rows in State, including unavailable rows. */
+/**
+ * Finds the item set one season pass wrapper opens into.
+ * @param definitionHash Authored wrapper item hash.
+ * @param package Receives the wrapper and its items.
+ * @return True when the catalog is ready and a wrapper carries that hash.
+ */
+[[nodiscard]] bool find_season_pass_package(std::uint32_t definitionHash,
+                                            season_pass::Package& package) noexcept;
+
+/** @return Season pass reward rows in State. */
 [[nodiscard]] std::size_t season_pass_reward_count() noexcept;
-
-/** @return True when the reward pools and item wrappers are in State. */
-[[nodiscard]] bool reward_definitions_ready() noexcept;
-
-/**
- * Publishes the complete reward graph in one step.
- * @param definitions Pools, entries, item rows, conditions, modifiers and socket overrides.
- * @return True when the graph passes the checks and any needed cache write succeeds.
- */
-[[nodiscard]] bool publish_reward_definitions(rewards::View definitions) noexcept;
-
-/** Checks a reward graph against the rules publish_reward_definitions applies. */
-[[nodiscard]] bool valid_reward_definitions(rewards::View definitions) noexcept;
-
-/**
- * Reads one item's reward row.
- * @param itemIndex Native item-definition index.
- * @param item Receives the row.
- * @return True when the catalog holds an extracted row for that item.
- */
-[[nodiscard]] bool find_reward_item(std::uint16_t itemIndex, rewards::Item& item) noexcept;
-
-/**
- * Lends the complete reward graph to one callback under the catalog's read lock.
- * @param context Caller state passed through unchanged.
- * @param consume Receives the graph, which stays valid only during the call.
- * @return The callback's result, or false when no graph is published.
- */
-[[nodiscard]] bool read_reward_definitions(void* context,
-                                           bool (*consume)(void*, rewards::View) noexcept) noexcept;
 
 /** @return True when the repeatable bounty table is in State. */
 [[nodiscard]] bool repeatable_bounties_ready() noexcept;
@@ -581,26 +550,6 @@ publish_investment_constants(const constants::InvestmentConstants& value) noexce
  * @return True when the constants are in State.
  */
 [[nodiscard]] bool find_investment_constants(constants::InvestmentConstants& value) noexcept;
-
-/** @return True once the new-character table, empty or not, is in State. */
-[[nodiscard]] bool starter_sets_ready() noexcept;
-
-/**
- * Publishes the new-character table. It is read every boot and never joins the disk cache.
- * @param definitions One row per class; empty when the installed table did not read.
- * @return True when every row names a distinct playable class and fits its storage.
- */
-[[nodiscard]] bool
-publish_starter_sets(std::span<const starter_sets::Definition> definitions) noexcept;
-
-/**
- * Finds the items the packages give a new character of one class.
- * @param characterClass Class byte: 0 Titan, 1 Hunter, 2 Warlock.
- * @param definition Receives the class row.
- * @return True when the published table holds that class.
- */
-[[nodiscard]] bool find_starter_set(std::uint8_t characterClass,
-                                    starter_sets::Definition& definition) noexcept;
 
 /** @return True when the whole inventory-bucket descriptor table is in State. */
 [[nodiscard]] bool inventory_bucket_descriptors_ready() noexcept;

@@ -8,7 +8,9 @@
 
 #include "../../middleware/datagen/family4/loadout/loadout_resolver.h"
 #include "../build_data/runtime.h"
+#include "../build_data/quests/red_war_quest_catalog.h"
 #include "../investment/store_internal.h"
+#include "../account/red_war_objective_completion.h"
 #include "runtime.h"
 #include "state_account_transaction_helpers.h"
 #include "storage/internal.h"
@@ -47,6 +49,8 @@ using Quest = build_data::items::QuestInitialization;
         || !build_data::items::valid(mutation.questInitialization)) {
         return false;
     }
+    // Revalida o acompanhamento: ele pode mudar entre o preparo da resposta e o commit.
+    if (!account::red_war::acquisition_matches(mutation.beforeCharacter, mutation.acquiredDefinitionHash)) { return false; }
     if (mutation.questInitialization.scope == Quest::Scope::none) {
         return mutation.previousQuestValue == build_data::items::kUnsetQuestValue;
     }
@@ -89,6 +93,8 @@ using Quest = build_data::items::QuestInitialization;
     }
 
     const CharacterState& before = account.characters[characterIndex];
+    // Recusa duplicatas e concessoes de uma etapa diferente da que esta salva.
+    if (!account::red_war::acquisition_matches(before, definitionHash)) { return false; }
     if (before.inventory.count >= before.inventory.values.size()
         || before.nextInventorySerial
                >= static_cast<std::uint32_t>((std::numeric_limits<std::int32_t>::max)())) {
@@ -161,42 +167,22 @@ using Quest = build_data::items::QuestInitialization;
 
 } // namespace runtime::detail
 
-namespace {
-
-/** A vendor row pays its own price; a Collections pull pays the collectible's materials. */
-[[nodiscard]] bool
-charge_acquisition(const AccountState& account,
-                   std::optional<std::span<const build_data::vendors::SaleCost>> price,
-                   const build_data::collectibles::Definition* collectible,
-                   AccountState& charged,
-                   bool& changed) noexcept {
-    if (price.has_value()) {
-        return apply_sale_price(account, *price, charged, changed);
-    }
-    return collectible == nullptr
-           || apply_collection_materials(account, *collectible, charged, changed);
-}
-
-} // namespace
-
 /**
  * Inventory and quest state must come from the same locked save view.
  * @param collectibleIndex Collections row, or kNoCollectibleIndex for an item-only grant.
  * @param definitionHash Item definition to grant.
- * @param price A vendor row's cost, spent in place of the collectible's materials; or absent.
  * @param mutation Receives a pending grant; prepared is set only on success.
  * @return False when identity, costs, capacity, or saved state prevent the grant.
  */
 bool prepare_item_acquisition(std::uint16_t collectibleIndex,
                               std::uint32_t definitionHash,
-                              std::optional<std::span<const build_data::vendors::SaleCost>> price,
                               PendingItemAcquisition& mutation) noexcept {
     const std::lock_guard lock(investment::store::g_mutex);
     mutation = {};
-    const AccountState account = account_snapshot();
+    const AccountState account = bound_account_snapshot();
     build_data::collectibles::Definition collectible{};
     build_data::items::Definition grantedDefinition{};
-    // A vendor row may name an item with no collectible, so the collectible steps are skipped
+    // A vendor purchase names an item, not a collectible, so the collectible steps are skipped
     // rather than faked. The item is still validated, just by its own hash.
     const bool hasCollectible = collectibleIndex != build_data::collectibles::kNoCollectibleIndex;
     if (definitionHash == authored_inventory::kNoDefinitionHash || !account::valid(account)
@@ -219,15 +205,13 @@ bool prepare_item_acquisition(std::uint16_t collectibleIndex,
 
     AccountState chargedAccount = account;
     bool profileChanged = false;
-    if (!charge_acquisition(account,
-                            price,
-                            hasCollectible ? &collectible : nullptr,
-                            chargedAccount,
-                            profileChanged)) {
+    // Nothing is charged without a collectible: the cost lives on the collectible's material
+    // requirements, and a sale row's own cost fields are still role-open.
+    if (hasCollectible
+        && !apply_collection_materials(account, collectible, chargedAccount, profileChanged)) {
         return false;
     }
 
-    // Commit re-checks the collectible's cost fields; a sale price is proven by the profile images.
     return finalize_item_acquisition(
         account,
         chargedAccount,
@@ -249,7 +233,7 @@ bool prepare_item_acquisition_for_item(std::uint16_t itemDefinitionIndex,
                                        PendingItemAcquisition& mutation) noexcept {
     const std::lock_guard lock(investment::store::g_mutex);
     mutation = {};
-    const AccountState account = account_snapshot();
+    const AccountState account = bound_account_snapshot();
     build_data::items::Definition grantedDefinition{};
     if (!account::valid(account) || !valid_profile_inventory(account)
         || !build_data::find_item_definition_index(itemDefinitionIndex, grantedDefinition)
@@ -259,6 +243,100 @@ bool prepare_item_acquisition_for_item(std::uint16_t itemDefinitionIndex,
 
     return finalize_item_acquisition(
         account, account, grantedDefinition.definitionHash, false, {.direct = true}, mutation);
+}
+
+/** Prepares a fixed Season wrapper expansion without exposing a partial package. */
+bool prepare_direct_item_bundle(std::uint32_t sourceDefinitionHash,
+                                std::span<const std::uint16_t> itemDefinitionIndices,
+                                PendingDirectItemBundle& mutation) noexcept {
+    mutation = {};
+    build_data::season_pass::Package package{};
+    if (!build_data::find_season_pass_package(sourceDefinitionHash, package)
+        || itemDefinitionIndices.size() != package.itemCount) {
+        return false;
+    }
+
+    std::array<std::uint32_t, build_data::season_pass::kPackageItemCapacity> hashes{};
+    for (std::size_t index = 0; index < itemDefinitionIndices.size(); ++index) {
+        const std::uint16_t definitionIndex = itemDefinitionIndices[index];
+        build_data::items::Definition definition{};
+        item_details::Definition detail{};
+        inventory_buckets::Descriptor bucket{};
+        if (!build_data::find_item_definition_index(definitionIndex, definition)
+            || definition.definitionHash != package.items[index]
+            || !build_data::find_configured_item_detail(definitionIndex, detail)
+            || detail.definitionIndex != definition.definitionIndex
+            || detail.definitionHash != definition.definitionHash
+            || detail.bucketId != definition.bucketId
+            || detail.instancedDefinitionState != item_details::InstancedDefinitionState::instanced
+            || !detail.equipmentSlot.has_value()
+            || !build_data::find_inventory_bucket_descriptor(detail.bucketId, bucket)
+            || bucket.arraySelector != inventory_buckets::ArraySelector::character) {
+            return false;
+        }
+        hashes[index] = definition.definitionHash;
+    }
+
+    const AccountState account = bound_account_snapshot();
+    const std::size_t characterIndex = selected_character_index(account);
+    if (!account::valid(account) || characterIndex >= account.characterCount) {
+        return false;
+    }
+    const CharacterState& before = account.characters[characterIndex];
+    if (before.nextInventorySerial
+            > static_cast<std::uint32_t>((std::numeric_limits<std::int32_t>::max)())
+        || itemDefinitionIndices.size() > before.inventory.values.size() - before.inventory.count
+        || itemDefinitionIndices.size()
+               > static_cast<std::size_t>((std::numeric_limits<std::int32_t>::max)())
+                     - before.nextInventorySerial) {
+        return false;
+    }
+
+    std::uint64_t firstSoid = 0;
+    if (!next_item_instance_soid(account, firstSoid)
+        || itemDefinitionIndices.size() - 1U
+               > (std::numeric_limits<std::uint64_t>::max)() - firstSoid) {
+        return false;
+    }
+
+    CharacterState after = before;
+    const std::int32_t level = acquisition_level(before);
+    for (std::size_t index = 0; index < itemDefinitionIndices.size(); ++index) {
+        authored_inventory::Item granted{};
+        granted.instanceSoid = firstSoid + index;
+        granted.definitionHash = hashes[index];
+        granted.level = level;
+        granted.quantity = 1;
+        granted.mutationSerial = static_cast<std::int32_t>(after.nextInventorySerial++);
+        after.inventory.values[after.inventory.count++] = granted;
+    }
+
+    AccountState candidate = account;
+    candidate.characters[characterIndex] = after;
+    family4_loadout::ResolvedLoadout resolved{};
+    if (!account::valid(candidate)
+        || !family4_loadout::resolve(candidate, characterIndex, resolved)) {
+        return false;
+    }
+    for (std::size_t index = 0; index < itemDefinitionIndices.size(); ++index) {
+        std::uint16_t row = 0;
+        std::uint8_t slot = 0;
+        if (!find_unequipped_row(resolved, firstSoid + index, row, slot)) {
+            return false;
+        }
+    }
+
+    mutation.beforeCharacter = before;
+    mutation.afterCharacter = after;
+    mutation.accountSoid = account.primarySoid;
+    mutation.characterSoid = before.soid;
+    mutation.firstInstanceSoid = firstSoid;
+    mutation.sourceDefinitionHash = sourceDefinitionHash;
+    mutation.characterIndex = characterIndex;
+    mutation.expectedInventoryCount = before.inventory.count;
+    mutation.itemCount = itemDefinitionIndices.size();
+    mutation.prepared = true;
+    return true;
 }
 
 /**
@@ -289,6 +367,93 @@ bool reserve_selected_character_inventory_serial(std::int32_t& mutationSerial) n
 }
 
 namespace runtime::detail {
+
+/** Resolves the expected held Red War step and its native successor, refusing stale claims. */
+[[nodiscard]] static bool red_war_claim_successor(const CharacterState& before,
+                                                   std::uint16_t expectedOrdinal,
+                                                   build_data::quests::Step& current,
+                                                   build_data::quests::Step& next,
+                                                   std::size_t& inventoryIndex) noexcept {
+    current = {};
+    next = {};
+    inventoryIndex = 0;
+    if (before.inventory.count > before.inventory.values.size()) { return false; }
+    bool found{};
+    for (std::size_t index = 0; index < before.inventory.count; ++index) {
+        const auto& held = before.inventory.values[index];
+        // CharacterState::inventory stores carried character items only; postmaster items live
+        // in the separate profile inventory and cannot represent the held Red War quest step.
+        if (held.quantity != 1) { continue; }
+        build_data::quests::Step candidate{}, successor{};
+        bool terminal{};
+        if (!build_data::quests::transition(held.definitionHash, candidate, successor, terminal)
+            || candidate.ordinal != expectedOrdinal || terminal
+            || successor.ordinal != static_cast<std::uint16_t>(expectedOrdinal + 1U)) { continue; }
+        if (found) { return false; }
+        const auto bank = candidate.bank == 0 ? investment::store::Bank::objectiveValues
+                                                : investment::store::Bank::characterObjectValues;
+        std::int32_t tracked{};
+        if (!investment::store::read_unlock(bank, candidate.row, tracked)
+            || tracked != candidate.value) { return false; }
+        current = candidate;
+        next = successor;
+        inventoryIndex = index;
+        found = true;
+    }
+    if (!found) { return false; }
+    for (std::size_t index = 0; index < before.inventory.count; ++index) {
+        const auto& held = before.inventory.values[index];
+        if (held.quantity > 0 && held.definitionHash == next.itemHash) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/** Applies the accepted journey successor, or replaces the old step when a separate gift is granted. */
+[[nodiscard]] static bool apply_red_war_claim_successor(const PendingItemAcquisition& mutation,
+                                                        CharacterState& after,
+                                                        build_data::quests::Step& current,
+                                                        build_data::quests::Step& next) noexcept {
+    std::size_t sourceIndex{};
+    if (!red_war_claim_successor(mutation.beforeCharacter,
+                                 mutation.redWarExpectedStepOrdinal,
+                                 current,
+                                 next,
+                                 sourceIndex)
+        || mutation.afterCharacter.inventory.count > mutation.afterCharacter.inventory.values.size()) {
+        return false;
+    }
+    // Se a recompensa for o próprio item da etapa seguinte, mantém ambos no inventário;
+    // a projeção da jornada escolhe o ordinal mais alto como etapa ativa.
+    if (mutation.acquiredDefinitionHash == next.itemHash) {
+        after = mutation.afterCharacter;
+        return true;
+    }
+    // As recompensas da Tyra e da Hawthorne são itens separados. Atualiza o item da jornada
+    // já carregado para a etapa seguinte, sem substituir a recompensa recebida.
+    if ((mutation.redWarExpectedStepOrdinal != 4 && mutation.redWarExpectedStepOrdinal != 5)
+        || mutation.afterCharacter.nextInventorySerial == 0
+        || mutation.afterCharacter.nextInventorySerial >= static_cast<std::uint32_t>(
+               (std::numeric_limits<std::int32_t>::max)())) { return false; }
+    const auto& source = mutation.beforeCharacter.inventory.values[sourceIndex];
+    std::size_t targetIndex = mutation.afterCharacter.inventory.count;
+    for (std::size_t index = 0; index < mutation.afterCharacter.inventory.count; ++index) {
+        const auto& item = mutation.afterCharacter.inventory.values[index];
+        if (item.instanceSoid == source.instanceSoid && item.definitionHash == current.itemHash) {
+            if (targetIndex != mutation.afterCharacter.inventory.count) { return false; }
+            targetIndex = index;
+        }
+    }
+    if (targetIndex >= mutation.afterCharacter.inventory.count) { return false; }
+    after = mutation.afterCharacter;
+    auto& questItem = after.inventory.values[targetIndex];
+    questItem.definitionHash = next.itemHash;
+    questItem.sockets = {};
+    questItem.seen = false;
+    questItem.mutationSerial = static_cast<std::int32_t>(after.nextInventorySerial++);
+    return true;
+}
 
 /**
  * Checks that a prepared insertion still agrees with its Collections row or direct grant.
@@ -371,7 +536,13 @@ valid_item_acquisition_source(const PendingItemAcquisition& mutation) noexcept {
     after = current;
     after.profileItems = mutation.afterProfileItems;
     after.profileItemCount = mutation.afterProfileItemCount;
-    after.characters[mutation.characterIndex] = mutation.afterCharacter;
+    CharacterState afterCharacter = mutation.afterCharacter;
+    build_data::quests::Step tyraCurrent{}, tyraNext{};
+    if (mutation.redWarJourneyStepClaim
+        && !apply_red_war_claim_successor(mutation, afterCharacter, tyraCurrent, tyraNext)) {
+        return false;
+    }
+    after.characters[mutation.characterIndex] = afterCharacter;
     family4_loadout::ResolvedLoadout resolved{};
     std::uint16_t row = 0;
     std::uint8_t slot = 0;
@@ -379,6 +550,80 @@ valid_item_acquisition_source(const PendingItemAcquisition& mutation) noexcept {
            && family4_loadout::resolve(after, mutation.characterIndex, resolved)
            && find_unequipped_row(resolved, mutation.acquiredInstanceSoid, row, slot)
            && row == mutation.inventoryRow && slot == mutation.equipmentSlot;
+}
+
+/** Rebuilds one package from installed policy and rejects any altered after-image. */
+[[nodiscard]] bool materialize_direct_item_bundle(const AccountState& current,
+                                                  const PendingDirectItemBundle& mutation,
+                                                  AccountState& after) noexcept {
+    build_data::season_pass::Package package{};
+    std::uint64_t firstSoid = 0;
+    if (!mutation.prepared
+        || !build_data::find_season_pass_package(mutation.sourceDefinitionHash, package)
+        || mutation.itemCount != package.itemCount || mutation.accountSoid == 0
+        || mutation.characterSoid == 0 || mutation.firstInstanceSoid == 0
+        || mutation.characterIndex >= current.characterCount
+        || mutation.expectedInventoryCount >= authored_inventory::kCharacterItemCapacity
+        || current.primarySoid != mutation.accountSoid
+        || !same_character(current.characters[mutation.characterIndex], mutation.beforeCharacter)
+        || !current.characters[mutation.characterIndex].selected
+        || current.characters[mutation.characterIndex].soid != mutation.characterSoid
+        || mutation.beforeCharacter.inventory.count != mutation.expectedInventoryCount
+        || mutation.itemCount
+               > mutation.beforeCharacter.inventory.values.size() - mutation.expectedInventoryCount
+        || mutation.beforeCharacter.nextInventorySerial
+               > static_cast<std::uint32_t>((std::numeric_limits<std::int32_t>::max)())
+        || mutation.itemCount > static_cast<std::size_t>((std::numeric_limits<std::int32_t>::max)())
+                                    - mutation.beforeCharacter.nextInventorySerial
+        || !next_item_instance_soid(current, firstSoid) || firstSoid != mutation.firstInstanceSoid
+        || mutation.itemCount - 1U > (std::numeric_limits<std::uint64_t>::max)() - firstSoid) {
+        return false;
+    }
+
+    CharacterState canonical = mutation.beforeCharacter;
+    const std::int32_t level = acquisition_level(canonical);
+    for (std::size_t index = 0; index < mutation.itemCount; ++index) {
+        build_data::items::Definition definition{};
+        item_details::Definition detail{};
+        inventory_buckets::Descriptor bucket{};
+        if (!build_data::find_item_definition_hash(package.items[index], definition)
+            || !build_data::find_configured_item_detail(definition.definitionIndex, detail)
+            || detail.definitionHash != definition.definitionHash
+            || detail.definitionIndex != definition.definitionIndex
+            || detail.bucketId != definition.bucketId
+            || detail.instancedDefinitionState != item_details::InstancedDefinitionState::instanced
+            || !detail.equipmentSlot.has_value()
+            || !build_data::find_inventory_bucket_descriptor(detail.bucketId, bucket)
+            || bucket.arraySelector != inventory_buckets::ArraySelector::character) {
+            return false;
+        }
+        authored_inventory::Item granted{};
+        granted.instanceSoid = firstSoid + index;
+        granted.definitionHash = package.items[index];
+        granted.level = level;
+        granted.quantity = 1;
+        granted.mutationSerial = static_cast<std::int32_t>(canonical.nextInventorySerial++);
+        canonical.inventory.values[canonical.inventory.count++] = granted;
+    }
+    if (!same_character(canonical, mutation.afterCharacter)) {
+        return false;
+    }
+
+    after = current;
+    after.characters[mutation.characterIndex] = canonical;
+    family4_loadout::ResolvedLoadout resolved{};
+    if (!account::valid(after)
+        || !family4_loadout::resolve(after, mutation.characterIndex, resolved)) {
+        return false;
+    }
+    for (std::size_t index = 0; index < mutation.itemCount; ++index) {
+        std::uint16_t row = 0;
+        std::uint8_t slot = 0;
+        if (!find_unequipped_row(resolved, firstSoid + index, row, slot)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 } // namespace runtime::detail
@@ -396,7 +641,7 @@ bool preview_item_acquisition(const PendingItemAcquisition& mutation,
     const std::lock_guard lock(investment::store::g_mutex);
     after = {};
     afterUnlocks = {};
-    if (!materialize_item_acquisition(account_snapshot(), mutation, after)
+    if (!materialize_item_acquisition(bound_account_snapshot(), mutation, after)
         || !investment::store::read_unlocks(afterUnlocks,
                                             static_cast<int>(mutation.characterIndex))) {
         return false;
@@ -408,7 +653,30 @@ bool preview_item_acquisition(const PendingItemAcquisition& mutation,
     } else if (quest.scope == Quest::Scope::character) {
         afterUnlocks.characterObjectValues[quest.row] = value;
     }
+    if (mutation.redWarJourneyStepClaim) {
+        build_data::quests::Step current{}, next{};
+        std::size_t ignored{};
+        if (!red_war_claim_successor(mutation.beforeCharacter,
+                                     mutation.redWarExpectedStepOrdinal,
+                                     current,
+                                     next,
+                                     ignored)) { return false; }
+        if (current.bank == 0) {
+            if (next.row >= afterUnlocks.objectiveValues.size()) { return false; }
+            afterUnlocks.objectiveValues[next.row] = next.value;
+        } else {
+            if (next.row >= afterUnlocks.characterObjectValues.size()) { return false; }
+            afterUnlocks.characterObjectValues[next.row] = next.value;
+        }
+    }
     return true;
+}
+
+/** Produces the full account after-image while a prepared package remains current. */
+bool preview_direct_item_bundle(const PendingDirectItemBundle& mutation,
+                                AccountState& after) noexcept {
+    after = {};
+    return materialize_direct_item_bundle(bound_account_snapshot(), mutation, after);
 }
 
 /**
@@ -431,6 +699,18 @@ bool commit_item_acquisition(PendingItemAcquisition& mutation) noexcept {
         && prepared.previousQuestValue == build_data::items::kUnsetQuestValue
         && !investment::store::write_unlock(quest_bank(quest), quest.row, quest.value)) {
         return false;
+    }
+    if (prepared.redWarJourneyStepClaim) {
+        build_data::quests::Step current{}, next{};
+        std::size_t ignored{};
+        if (!red_war_claim_successor(prepared.beforeCharacter,
+                                     prepared.redWarExpectedStepOrdinal,
+                                     current,
+                                     next,
+                                     ignored)) { return false; }
+        const auto trackingBank = current.bank == 0 ? investment::store::Bank::objectiveValues
+                                                     : investment::store::Bank::characterObjectValues;
+        if (!investment::store::write_unlock(trackingBank, next.row, next.value)) { return false; }
     }
     return transaction.commit();
 }
@@ -558,17 +838,12 @@ finalize_profile_item_acquisition(const AccountState& account,
 
 } // namespace runtime::detail
 
-/**
- * Prepares one checked profile-stack increment or append.
- * @param price A vendor row's cost, spent in place of the collectible's materials; or absent.
- */
-bool prepare_profile_item_acquisition(
-    std::uint16_t collectibleIndex,
-    std::uint32_t definitionHash,
-    std::optional<std::span<const build_data::vendors::SaleCost>> price,
-    PendingProfileItemAcquisition& mutation) noexcept {
+/** Prepares one checked profile-stack increment or append for a Collections pull. */
+bool prepare_profile_item_acquisition(std::uint16_t collectibleIndex,
+                                      std::uint32_t definitionHash,
+                                      PendingProfileItemAcquisition& mutation) noexcept {
     mutation = {};
-    const AccountState account = account_snapshot();
+    const AccountState account = bound_account_snapshot();
     build_data::collectibles::Definition collectible{};
     build_data::items::Definition item{};
     item_details::Definition detail{};
@@ -588,18 +863,16 @@ bool prepare_profile_item_acquisition(
     }
     AccountState chargedAccount = account;
     bool materialsChanged = false;
-    const bool hasCollectible = collectibleIndex != build_data::collectibles::kNoCollectibleIndex;
-    if (!charge_acquisition(account,
-                            price,
-                            hasCollectible ? &collectible : nullptr,
-                            chargedAccount,
-                            materialsChanged)) {
+    // Nothing is charged without a collectible: the cost lives on the collectible's material
+    // requirements, and a sale row's own cost fields are still role-open.
+    if (collectibleIndex != build_data::collectibles::kNoCollectibleIndex
+        && !apply_collection_materials(account, collectible, chargedAccount, materialsChanged)) {
         return false;
     }
+    (void)materialsChanged;
     const bool actionSource =
         build_data::is_profile_action_source(item.definitionIndex, item.bucketId);
 
-    // Commit re-checks the collectible's cost fields; a sale price is proven by the profile images.
     return finalize_profile_item_acquisition(
         account,
         chargedAccount,
@@ -618,7 +891,7 @@ bool prepare_profile_item_acquisition_for_item(std::uint16_t itemDefinitionIndex
                                                std::int32_t quantity,
                                                PendingProfileItemAcquisition& mutation) noexcept {
     mutation = {};
-    const AccountState account = account_snapshot();
+    const AccountState account = bound_account_snapshot();
     build_data::items::Definition item{};
     item_details::Definition detail{};
     if (quantity <= 0 || !account::valid(account) || !valid_profile_inventory(account)
@@ -642,12 +915,11 @@ bool prepare_profile_item_acquisition_for_item(std::uint16_t itemDefinitionIndex
 bool preview_profile_item_acquisition(const PendingProfileItemAcquisition& mutation,
                                       AccountState& after) noexcept {
     after = {};
-    const AccountState current = account_snapshot();
+    const AccountState current = bound_account_snapshot();
     return materialize_profile_acquisition(current, mutation, after);
 }
 
-/** Commits one profile-stack after-image only while its exact prepare-time view remains
- * current. */
+/** Commits one profile-stack after-image only while its exact prepare-time view remains current. */
 bool commit_profile_item_acquisition(PendingProfileItemAcquisition& mutation) noexcept {
     const PendingProfileItemAcquisition& prepared = mutation;
     const PendingConsumption consume{mutation};
